@@ -34,5 +34,12 @@ return [
             'channel' => env('SLACK_BOT_USER_DEFAULT_CHANNEL'),
         ],
     ],
+    'hotsms' => [
+        'base_url' => env('HOTSMS_BASE_URL', 'https://www.hotsms.ps'),
+        'username' => env('HOTSMS_USERNAME'),
+        'password' => env('HOTSMS_PASSWORD'),
+        'sender' => env('HOTSMS_SENDER'),
+        'enabled' => env('HOTSMS_ENABLED', false),
+    ],
 
 ];

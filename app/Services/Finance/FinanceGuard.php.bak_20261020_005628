@@ -1,0 +1,38 @@
+<?php
+namespace App\Services\Finance;
+use App\Models\User;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+final class FinanceGuard {
+    public function allows(?User $user, string $permission): bool {
+        if (!$user || !$user->is_active) return false;
+        // System administrators can inspect the finance dashboard without being
+        // assigned an accounting specialty.  This is VIEW-ONLY and deliberately
+        // does not grant approvals, cash execution, stock actions, or exports.
+        if ($permission === 'finance.view' && $user->isSystemAdmin()) {
+            return true;
+        }
+        // Finance authorization must be explicit. System admins can configure roles,
+        // but never acquire approval, stock movement or payment execution by implication.
+        $hasRolePermission=$user->roleAssignments()->whereHas('role.permissions', fn($q)=>$q->where('code',$permission))->exists();
+        if(!$hasRolePermission)return false;
+        if($permission === 'finance.procurement.board_approve'){
+            return DB::table('finance_board_approvers')->where('user_id',$user->id)->where('is_active',true)->exists();
+        }
+        if(in_array($permission,['finance.procurement.director_approve','finance.transaction.approve','finance.budget.approve','finance.payroll.approve','finance.fund.approve','finance.transfer.approve','finance.reversal.approve'],true)){
+            return DB::table('finance_staff_assignments')->where('user_id',$user->id)->where('specialization','director_approver')->where('is_active',true)->exists();
+        }
+        return DB::table('finance_staff_assignments')->where('user_id',$user->id)->where('is_active',true)->exists();
+    }
+    public function assert(?User $user,string $permission): void {
+        abort_unless($this->allows($user,$permission),403,'لا تملك صلاحية هذه العملية');
+    }
+    public function audit(string $entity,int|string $id,int $actor,string $action,array $detail=[]):void {
+        DB::table('finance_audit_events')->insert([
+            'entity_type'=>$entity,'entity_id'=>(string)$id,'actor_id'=>$actor,
+            'action'=>$action,'detail'=>json_encode($detail,JSON_UNESCAPED_UNICODE),
+            'created_at'=>now(),'updated_at'=>now()
+        ]);
+    }
+}

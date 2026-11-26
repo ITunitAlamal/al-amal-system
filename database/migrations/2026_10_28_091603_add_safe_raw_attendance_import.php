@@ -1,0 +1,93 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('attendance_devices', function (Blueprint $table): void {
+            $table->string('driver', 30)->default('pyzk');
+            $table->string('timezone', 80)->nullable();
+            $table->text('communication_password')->nullable();
+            $table->unsignedSmallInteger('connection_timeout')->default(6);
+            $table->unsignedInteger('sync_interval_seconds')->default(300);
+            $table->timestampTz('sync_requested_at')->nullable();
+            $table->string('sync_request_mode', 20)->nullable();
+            $table->timestampTz('import_approved_at')->nullable();
+            $table->foreignId('import_approved_by')->nullable()->constrained('users');
+            $table->string('firmware', 150)->nullable();
+            $table->string('platform', 80)->nullable();
+            $table->integer('clock_drift_seconds')->nullable();
+            $table->timestampTz('last_failure_at')->nullable();
+            $table->string('last_failure_code', 60)->nullable();
+        });
+        Schema::table('attendance_sync_runs', function (Blueprint $table): void {
+            $table->unsignedInteger('duplicates')->default(0);
+            $table->unsignedInteger('unmatched')->default(0);
+            $table->unsignedInteger('failed')->default(0);
+            $table->string('configuration_digest', 64)->nullable();
+            $table->boolean('dry_run')->default(false);
+        });
+        Schema::table('attendance_punches', function (Blueprint $table): void {
+            $table->unsignedBigInteger('employee_id')->nullable()->change();
+            $table->jsonb('raw_payload')->nullable();
+            $table->string('raw_user_id', 100)->nullable();
+            $table->string('device_local_time', 26)->nullable();
+            $table->string('device_timezone', 80)->nullable();
+            $table->unsignedInteger('occurrence')->nullable();
+            $table->foreignId('sync_run_id')->nullable()->constrained('attendance_sync_runs');
+            $table->string('match_status', 30)->nullable()->index();
+        });
+        if (DB::getDriverName() === 'pgsql') {
+            DB::unprepared(<<<'SQL'
+CREATE FUNCTION attendance_raw_immutable() RETURNS trigger AS $$
+BEGIN
+    -- A DELETE has OLD but no valid NEW row. Handle it independently.
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.raw_payload IS NOT NULL THEN
+            RAISE EXCEPTION 'Raw attendance evidence is immutable';
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    -- On UPDATE, only protect previously imported raw evidence.
+    -- Employee mapping and match_status may still be corrected by authorized workflows.
+    IF TG_OP = 'UPDATE' AND OLD.raw_payload IS NOT NULL THEN
+        IF NEW.raw_payload IS DISTINCT FROM OLD.raw_payload
+            OR NEW.source_key IS DISTINCT FROM OLD.source_key
+            OR NEW.device_id IS DISTINCT FROM OLD.device_id
+            OR NEW.occurred_at IS DISTINCT FROM OLD.occurred_at
+            OR NEW.device_local_time IS DISTINCT FROM OLD.device_local_time
+            OR NEW.device_timezone IS DISTINCT FROM OLD.device_timezone
+            OR NEW.raw_user_id IS DISTINCT FROM OLD.raw_user_id
+            OR NEW.occurrence IS DISTINCT FROM OLD.occurrence
+            OR NEW.sync_run_id IS DISTINCT FROM OLD.sync_run_id
+            OR NEW.created_at IS DISTINCT FROM OLD.created_at
+            OR NEW.direction IS DISTINCT FROM OLD.direction
+            OR NEW.source IS DISTINCT FROM OLD.source THEN
+            RAISE EXCEPTION 'Raw attendance evidence is immutable';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER attendance_raw_immutable BEFORE UPDATE OR DELETE ON attendance_punches FOR EACH ROW EXECUTE FUNCTION attendance_raw_immutable();
+SQL);
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        throw new RuntimeException('Raw attendance evidence and encrypted configuration must be retained; use a reviewed forward migration.');
+    }
+};

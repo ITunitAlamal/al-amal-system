@@ -1,3 +1,0 @@
-@extends('layouts.app')
-@section('title','تسجيل الدخول | AIMS')
-@section('content')<div class="card" style="max-width:430px;margin:70px auto"><h1>تسجيل الدخول</h1><p class="muted">المنصة الإدارية لجمعية معهد الأمل للأيتام</p><form method="post" action="{{ route('login') }}">@csrf<label for="email">البريد الإلكتروني</label><input id="email" type="email" name="email" value="{{ old('email') }}" required autofocus autocomplete="username"><label for="password">كلمة المرور</label><input id="password" type="password" name="password" required autocomplete="current-password">@error('email')<p class="danger">{{ $message }}</p>@enderror<button style="margin-top:20px;width:100%">دخول</button></form></div>@endsection

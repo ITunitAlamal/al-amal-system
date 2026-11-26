@@ -1,0 +1,3 @@
+@import '../../../resources/css/aims.css';
+/* The isolated Vite root is under tests; include the production template utilities. */
+@source '../../../resources/js';

@@ -1,0 +1,421 @@
+{
+    "source": "Published MAINTENANCE configuration, read-only export on 2026-10-22; no requests or users",
+    "steps": [
+        {
+            "code": "requester",
+            "name": "إنشاء وإرسال الطلب",
+            "sort_order": 1,
+            "step_type": "start",
+            "assignment_type": "requester",
+            "assigned_role_code": null,
+            "assignment_config": [],
+            "is_required": true
+        },
+        {
+            "code": "department_head",
+            "name": "مراجعة رئيس قسم مقدم الطلب",
+            "sort_order": 2,
+            "step_type": "task",
+            "assignment_type": "department_head",
+            "assigned_role_code": null,
+            "assignment_config": {
+                "fallback_role_code": "executive_director"
+            },
+            "is_required": true
+        },
+        {
+            "code": "executive_director",
+            "name": "التوجيه الأولي للمدير التنفيذي",
+            "sort_order": 3,
+            "step_type": "task",
+            "assignment_type": "role",
+            "assigned_role_code": "executive_director",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "hr_head",
+            "name": "تكليف الفني من الموارد البشرية",
+            "sort_order": 4,
+            "step_type": "task",
+            "assignment_type": "department_head_of",
+            "assigned_role_code": null,
+            "assignment_config": {
+                "department_id": "HR",
+                "fallback_role_code": "executive_director"
+            },
+            "is_required": true
+        },
+        {
+            "code": "technician",
+            "name": "الفحص الفني وتحديد اللوازم",
+            "sort_order": 5,
+            "step_type": "task",
+            "assignment_type": "pick",
+            "assigned_role_code": "maintenance_technician",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "accounting",
+            "name": "المراجعة المالية",
+            "sort_order": 6,
+            "step_type": "task",
+            "assignment_type": "role",
+            "assigned_role_code": "finance_accountant",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "stores",
+            "name": "فحص توفر المواد",
+            "sort_order": 7,
+            "step_type": "decision",
+            "assignment_type": "role",
+            "assigned_role_code": "finance_warehouse",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "procurement",
+            "name": "تقدير تكلفة المشتريات",
+            "sort_order": 8,
+            "step_type": "task",
+            "assignment_type": "role",
+            "assigned_role_code": "finance_procurement",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "financial_approval",
+            "name": "الاعتماد المالي للمدير التنفيذي",
+            "sort_order": 9,
+            "step_type": "decision",
+            "assignment_type": "role",
+            "assigned_role_code": "executive_director",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "higher_approval",
+            "name": "اعتماد الجهة الأعلى صلاحية",
+            "sort_order": 10,
+            "step_type": "task",
+            "assignment_type": "role",
+            "assigned_role_code": "finance_board_treasurer",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "purchase",
+            "name": "تنفيذ الشراء واستلام المواد",
+            "sort_order": 11,
+            "step_type": "task",
+            "assignment_type": "role",
+            "assigned_role_code": "finance_procurement",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "materials",
+            "name": "تجهيز وصرف اللوازم",
+            "sort_order": 12,
+            "step_type": "task",
+            "assignment_type": "role",
+            "assigned_role_code": "finance_warehouse",
+            "assignment_config": {
+                "department_scope": "any"
+            },
+            "is_required": true
+        },
+        {
+            "code": "execution",
+            "name": "تنفيذ أعمال الصيانة",
+            "sort_order": 13,
+            "step_type": "task",
+            "assignment_type": "actor_of_step",
+            "assigned_role_code": null,
+            "assignment_config": {
+                "step_code": "technician"
+            },
+            "is_required": true
+        },
+        {
+            "code": "verification",
+            "name": "التحقق من إنجاز الصيانة",
+            "sort_order": 14,
+            "step_type": "task",
+            "assignment_type": "requester",
+            "assigned_role_code": null,
+            "assignment_config": [],
+            "is_required": true
+        },
+        {
+            "code": "completed",
+            "name": "إغلاق طلب الصيانة",
+            "sort_order": 15,
+            "step_type": "end",
+            "assignment_type": null,
+            "assigned_role_code": null,
+            "assignment_config": {
+                "outcome": "completed"
+            },
+            "is_required": true
+        },
+        {
+            "code": "rejected",
+            "name": "رفض الطلب",
+            "sort_order": 16,
+            "step_type": "end",
+            "assignment_type": null,
+            "assigned_role_code": null,
+            "assignment_config": {
+                "outcome": "rejected"
+            },
+            "is_required": true
+        }
+    ],
+    "transitions": [
+        {
+            "from": "requester",
+            "to": "department_head",
+            "action_code": "submit",
+            "name": "إرسال إلى رئيس القسم",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "department_head",
+            "to": "executive_director",
+            "action_code": "forward",
+            "name": "رفع إلى المدير التنفيذي",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "department_head",
+            "to": "requester",
+            "action_code": "return",
+            "name": "إرجاع للموظف",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "department_head",
+            "to": "rejected",
+            "action_code": "reject",
+            "name": "رفض الطلب",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "executive_director",
+            "to": "hr_head",
+            "action_code": "assign",
+            "name": "توجيه إلى الموارد البشرية",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "executive_director",
+            "to": "department_head",
+            "action_code": "return",
+            "name": "إرجاع لرئيس القسم",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "executive_director",
+            "to": "rejected",
+            "action_code": "reject",
+            "name": "رفض من المدير التنفيذي",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "hr_head",
+            "to": "technician",
+            "action_code": "assign",
+            "name": "تكليف الفني",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "technician",
+            "to": "hr_head",
+            "action_code": "return",
+            "name": "إرجاع التقييم للاستكمال",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "technician",
+            "to": "accounting",
+            "action_code": "submit_assessment",
+            "name": "إرسال التقييم إلى الحسابات",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "accounting",
+            "to": "technician",
+            "action_code": "return",
+            "name": "إرجاع التقييم للفني",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "accounting",
+            "to": "stores",
+            "action_code": "check_stock",
+            "name": "فحص المخزون",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "stores",
+            "to": "materials",
+            "action_code": "available",
+            "name": "اللوازم متوفرة",
+            "conditions": "{\"stock_status\":\"available\"}",
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "stores",
+            "to": "procurement",
+            "action_code": "unavailable",
+            "name": "اللوازم غير متوفرة أو ناقصة",
+            "conditions": "{\"stock_status\":[\"unavailable\",\"partial\"]}",
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "procurement",
+            "to": "financial_approval",
+            "action_code": "request_approval",
+            "name": "إرسال التكلفة للاعتماد",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "financial_approval",
+            "to": "procurement",
+            "action_code": "return",
+            "name": "إرجاع للمشتريات",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "higher_approval",
+            "to": "purchase",
+            "action_code": "approve",
+            "name": "اعتماد الجهة الأعلى",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "higher_approval",
+            "to": "procurement",
+            "action_code": "return",
+            "name": "إرجاع للمشتريات",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "purchase",
+            "to": "materials",
+            "action_code": "received",
+            "name": "استلام المواد",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "materials",
+            "to": "execution",
+            "action_code": "issue",
+            "name": "صرف المواد للفني",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "execution",
+            "to": "verification",
+            "action_code": "finish",
+            "name": "إتمام الصيانة",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "verification",
+            "to": "completed",
+            "action_code": "complete",
+            "name": "إغلاق الطلب",
+            "conditions": null,
+            "requires_comment": false,
+            "is_active": true
+        },
+        {
+            "from": "verification",
+            "to": "execution",
+            "action_code": "return",
+            "name": "إرجاع لاستكمال الصيانة",
+            "conditions": null,
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "financial_approval",
+            "to": "higher_approval",
+            "action_code": "escalate",
+            "name": "تصعيد للجهة الأعلى",
+            "conditions": "{\"estimated_cost\":{\"gt\":500}}",
+            "requires_comment": true,
+            "is_active": true
+        },
+        {
+            "from": "financial_approval",
+            "to": "purchase",
+            "action_code": "approve",
+            "name": "اعتماد الشراء (حتى 500 ₪)",
+            "conditions": "{\"estimated_cost\":{\"lte\":500}}",
+            "requires_comment": false,
+            "is_active": true
+        }
+    ]
+}

@@ -1,0 +1,59 @@
+%% Solid nodes/edges reflect repository code. Dashed items are assumptions or unknown deployment facts.
+flowchart LR
+    subgraph Human_Boundary["حدود المستخدمين"]
+        Employee["موظف / رئيس قسم / مدير تنفيذي"]
+        TechnicalAdmin["مدير نظام تقني<br/>حدوده تختلف حسب الوحدة"]
+        Guardian["وصي"]
+    end
+
+    subgraph Device_Boundary["حد الأجهزة الميدانية"]
+        FieldDevice["عميل Windows ميداني"]
+        DeviceSession["جلسة bearer مرتبطة بجهاز<br/>+ fingerprint"]
+    end
+
+    subgraph Application_Boundary["حد التطبيق — Laravel 13 monolith"]
+        Browser["متصفح"]
+        InertiaVue["Inertia + Vue<br/>Arabic RTL"]
+        WebRoutes["مسارات web<br/>auth / guardian guard"]
+        DomainServices["خدمات المجالات<br/>workflow / RBAC / business"]
+        FieldAPI["/api/field/v1<br/>جلسة جهاز + توقيع"]
+        Scheduler["تعريفات scheduler<br/>cron/worker غير متحقق"]
+        Audit["AuditService وأحداث مجال مختارة"]
+
+        Browser --> InertiaVue --> WebRoutes --> DomainServices
+        FieldAPI --> DomainServices
+        DomainServices --> Scheduler
+        DomainServices --> Audit
+    end
+
+    subgraph Data_Boundary["حد البيانات — التشغيل غير متحقق"]
+        SQL[("SQL database<br/>driver/schema/version UNKNOWN")]
+        PrivateStorage[("Local private / S3 config<br/>disk الفعلي UNKNOWN")]
+    end
+
+    subgraph External_Boundary["خدمات وأجهزة خارجية"]
+        SMS["HotSMS<br/>مشروط بالإعداد"]
+        CivilRegistry["سجل مدني<br/>Unavailable implementation"]
+        AttendanceDevices["أجهزة حضور ZK<br/>الاتصال UNKNOWN"]
+        PythonBridge["جسر Python read-only + pyzk"]
+    end
+
+    subgraph Assumed_Deployment["ASSUMPTION — البنية الفعلية غير مثبتة"]
+        InternalServer["خادم داخلي / VPS replication<br/>غير موثق في هذا المستودع"]
+        PublicSite["al-amal.ps<br/>موقع عام غير مثبت"]
+        PortalDomain["portal.al-amal.ps<br/>نطاق منفصل غير مثبت"]
+        ReverseProxy["TLS / reverse proxy<br/>إعداد التشغيل UNKNOWN"]
+    end
+
+    Employee --> Browser
+    TechnicalAdmin --> Browser
+    Guardian --> WebRoutes
+    FieldDevice --> DeviceSession --> FieldAPI
+    DomainServices --> SQL
+    DomainServices --> PrivateStorage
+    DomainServices -.->|"اتصال مشروط"| SMS
+    DomainServices -.->|"لا يوجد موصل فعلي"| CivilRegistry
+    AttendanceDevices -.-> PythonBridge -.-> DomainServices
+    InternalServer -.-> ReverseProxy -.-> Application_Boundary
+    PublicSite -.->|"نية/استضافة غير متحققة"| WebRoutes
+    PortalDomain -.->|"بوابة داخلية موجودة؛ نشر النطاق غير متحقق"| WebRoutes

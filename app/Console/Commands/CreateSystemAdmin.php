@@ -11,7 +11,7 @@ use Illuminate\Validation\Rules\Password;
 
 class CreateSystemAdmin extends Command
 {
-    protected $signature = 'aims:create-admin';
+    protected $signature = 'aims:create-admin {--employee-number= : Unique employee number used for login}';
 
     protected $description = 'Create the first AIMS system administrator';
 
@@ -21,8 +21,9 @@ class CreateSystemAdmin extends Command
         // through this bootstrap command.
         $role = Role::where('code', 'system_admin')->first();
 
-        if (!$role) {
+        if (! $role) {
             $this->error('Run AimsCoreSeeder first.');
+
             return self::FAILURE;
         }
 
@@ -30,10 +31,12 @@ class CreateSystemAdmin extends Command
             ->where('role_id', $role->id)
             ->exists()) {
             $this->error('A system administrator already exists.');
+
             return self::FAILURE;
         }
 
         $name = trim((string) $this->ask('Administrator name'));
+        $employeeNumber = trim((string) ($this->option('employee-number') ?: $this->ask('Administrator employee number')));
         $email = strtolower(trim(
             (string) $this->ask('Administrator email')
         ));
@@ -42,10 +45,12 @@ class CreateSystemAdmin extends Command
         $confirmation = $this->secret('Confirm password');
 
         $data = compact('name', 'email', 'password');
+        $data['employee_number'] = $employeeNumber;
         $data['password_confirmation'] = $confirmation;
 
         $validator = Validator::make($data, [
             'name' => ['required', 'string', 'max:255'],
+            'employee_number' => ['required', 'string', 'max:50', 'regex:/^[A-Za-z0-9_-]+$/D', 'unique:users,employee_number', 'unique:employees,employee_number'],
             'email' => ['required', 'email', 'max:255', 'unique:users,email'],
             'password' => [
                 'required',
@@ -58,6 +63,7 @@ class CreateSystemAdmin extends Command
             foreach ($validator->errors()->all() as $error) {
                 $this->error($error);
             }
+
             return self::FAILURE;
         }
 
@@ -65,6 +71,7 @@ class CreateSystemAdmin extends Command
             $user = User::create([
                 'name' => $data['name'],
                 'email' => $data['email'],
+                'employee_number' => $data['employee_number'],
                 'password' => $data['password'],
                 'is_active' => true,
             ]);

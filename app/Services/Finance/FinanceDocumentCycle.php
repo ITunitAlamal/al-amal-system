@@ -1,0 +1,157 @@
+<?php
+
+namespace App\Services\Finance;
+
+use App\Models\User;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * The documentary cycle of Accounts (owner decision 2026-10-23): purchase request → reviews and approvals →
+ * quotes → purchase order → receipt into stores → supplier invoice → payment voucher number from the external
+ * accounting software → order closed. Read-side only: stage counts, the work waiting for one user (by the
+ * finance permissions they hold), and the archive of closed documents.
+ */
+final class FinanceDocumentCycle
+{
+    public function __construct(private readonly FinanceGuard $guard) {}
+
+    /**
+     * Every stage of the cycle with its count, in order. Counts only, no amounts or parties.
+     *
+     * @return list<array{key: string, label: string, owner: string, count: int, module: string, area: string}>
+     */
+    public function stages(): array
+    {
+        $requests = DB::table('finance_purchase_requests')->selectRaw('state, count(*) as c')->groupBy('state')->pluck('c', 'state');
+        // Functional area of each stage, for the department overview: المشتريات / المخازن / المحاسب العام.
+        $areas = ['draft' => 'procurement', 'pending_finance_head' => 'procurement', 'pending_director' => 'procurement', 'pending_board_treasurer' => 'procurement',
+            'awaiting_order' => 'procurement', 'ready_to_close' => 'procurement', 'awaiting_receipt' => 'stores', 'counts_pending' => 'stores',
+            'awaiting_invoice' => 'accountant', 'awaiting_voucher' => 'accountant', 'closed' => 'archive'];
+        $stage = fn (string $key, string $label, string $owner, int $count, string $module): array => compact('key', 'label', 'owner', 'count', 'module') + ['area' => $areas[$key]];
+
+        return [
+            $stage('draft', 'طلبات شراء قيد الإعداد', 'المشتريات', (int) ($requests['draft'] ?? 0), 'purchases'),
+            $stage('pending_finance_head', 'بانتظار مراجعة رئيس الحسابات', 'رئيس الحسابات', (int) ($requests['pending_finance_head'] ?? 0), 'purchases'),
+            $stage('pending_director', 'بانتظار اعتماد المدير التنفيذي', 'المدير التنفيذي', (int) ($requests['pending_director'] ?? 0), 'purchases'),
+            $stage('pending_board_treasurer', 'بانتظار أمين الصندوق', 'أمين صندوق المجلس', (int) ($requests['pending_board_treasurer'] ?? 0), 'purchases'),
+            $stage('awaiting_order', 'معتمدة بانتظار عروض الأسعار وأمر الشراء', 'المشتريات', $this->approvedWithoutOrder()->count(), 'quotes'),
+            $stage('awaiting_receipt', 'أوامر شراء بانتظار الاستلام', 'أمين المخزن', $this->ordersInState(['issued', 'partial_received'])->count(), 'orders'),
+            $stage('awaiting_invoice', 'مستلمة بانتظار فاتورة المورد', 'المحاسب', $this->receivedWithoutInvoice()->count(), 'orders'),
+            $stage('awaiting_voucher', 'فواتير بانتظار رقم سند الصرف من '.$this->guard->externalSystemName(), 'المحاسب', $this->unpaidInvoices()->count(), 'invoices'),
+            $stage('ready_to_close', 'جاهزة للإغلاق', 'المشتريات', $this->readyToClose()->count(), 'orders'),
+            $stage('closed', 'دورات مستندية مغلقة', '—', DB::table('finance_purchase_orders')->where('state', 'closed')->count(), 'archive'),
+            $stage('counts_pending', 'محاضر جرد بانتظار الاعتماد', 'رئيس الحسابات', DB::table('finance_inventory_counts')->where('state', 'pending')->count(), 'counts'),
+        ];
+    }
+
+    /**
+     * Documents waiting for this user now, by the finance permissions they hold. Never their own requests for a
+     * review or approval (separation of duties, as in the actions themselves).
+     *
+     * @return list<array{kind: string, action: string, reference: string, detail: string, module: string, id: int, since: ?string}>
+     */
+    public function pendingFor(User $user): array
+    {
+        $allows = fn (string $permission): bool => $this->guard->allows($user, $permission);
+        $items = [];
+        $add = function (string $kind, string $action, string $module, iterable $rows, callable $reference, callable $detail) use (&$items): void {
+            foreach ($rows as $row) {
+                $items[] = ['kind' => $kind, 'action' => $action, 'reference' => (string) $reference($row), 'detail' => (string) $detail($row), 'module' => $module, 'id' => (int) $row->id, 'since' => $row->updated_at ?? $row->created_at ?? null];
+            }
+        };
+        $purchaseDetail = fn (object $row): string => trim(($row->total_amount ?? '').' '.($row->currency ?? ''));
+
+        if ($allows('finance.procurement.manage')) {
+            $add('submit', 'إرسال طلب الشراء للمراجعة', 'purchases', DB::table('finance_purchase_requests')->where('state', 'draft')->where('created_by', $user->id)->orderBy('id')->limit(100)->get(),
+                fn ($row) => $row->number, $purchaseDetail);
+            $add('order', 'تسجيل عروض الأسعار وإصدار أمر الشراء', 'purchases', $this->approvedWithoutOrder()->orderBy('p.id')->limit(100)->get(['p.*']),
+                fn ($row) => $row->number, $purchaseDetail);
+            $add('close', 'إغلاق أمر الشراء بعد الاستلام والسداد', 'orders', $this->readyToClose()->orderBy('o.id')->limit(100)->get(['o.*']),
+                fn ($row) => $row->number, fn ($row) => (string) $row->amount);
+        }
+        if ($allows('finance.procurement.review')) {
+            $add('review', 'مراجعة رئيس الحسابات', 'purchases', DB::table('finance_purchase_requests')->where('state', 'pending_finance_head')->where('created_by', '<>', $user->id)->orderBy('id')->limit(100)->get(),
+                fn ($row) => $row->number, $purchaseDetail);
+        }
+        if ($allows('finance.procurement.director_approve')) {
+            $add('director', 'اعتماد المدير التنفيذي', 'purchases', DB::table('finance_purchase_requests')->where('state', 'pending_director')->where('created_by', '<>', $user->id)
+                ->where(fn ($query) => $query->whereNull('reviewed_by')->orWhere('reviewed_by', '<>', $user->id))->orderBy('id')->limit(100)->get(),
+                fn ($row) => $row->number, $purchaseDetail);
+        }
+        if ($allows('finance.procurement.board_approve') && DB::table('finance_board_approvers')->where('user_id', $user->id)->where('is_active', true)->exists()) {
+            $add('board', 'موافقة أمين الصندوق', 'purchases', DB::table('finance_purchase_requests')->where('state', 'pending_board_treasurer')->where('created_by', '<>', $user->id)->orderBy('id')->limit(100)->get(),
+                fn ($row) => $row->number, $purchaseDetail);
+        }
+        if ($allows('finance.purchase.receive')) {
+            $add('receive', 'استلام أصناف أمر الشراء', 'orders', $this->ordersInState(['issued', 'partial_received'])->where('o.created_by', '<>', $user->id)->orderBy('o.id')->limit(100)->get(['o.*']),
+                fn ($row) => $row->number, fn ($row) => $row->state === 'partial_received' ? 'استلام جزئي سابق' : 'لم يُستلم شيء بعد');
+        }
+        if ($allows('finance.purchase.invoice')) {
+            $add('invoice', 'تسجيل فاتورة المورد', 'orders', $this->receivedWithoutInvoice()->orderBy('o.id')->limit(100)->get(['o.*']),
+                fn ($row) => $row->number, fn ($row) => (string) $row->amount);
+            $add('voucher', 'تسجيل رقم سند الصرف من '.$this->guard->externalSystemName(), 'invoices', $this->unpaidInvoices()->orderBy('id')->limit(100)->get(),
+                fn ($row) => $row->invoice_no, fn ($row) => trim($row->amount.' '.$row->currency));
+        }
+        if ($allows('finance.stock.count.approve')) {
+            $add('count', 'اعتماد محضر الجرد', 'counts', DB::table('finance_inventory_counts')->where('state', 'pending')->where('counted_by', '<>', $user->id)->orderBy('id')->limit(100)->get(),
+                fn ($row) => 'جرد #'.$row->id, fn ($row) => 'المسجل '.$row->recorded_qty.' · الفعلي '.$row->physical_qty);
+        }
+
+        return $items;
+    }
+
+    /**
+     * Closed purchase cycles, newest first, searchable by request, order, invoice or voucher number.
+     */
+    public function archive(?string $search, int $perPage = 30): LengthAwarePaginator
+    {
+        return DB::table('finance_purchase_orders as o')
+            ->join('finance_purchase_requests as p', 'p.id', '=', 'o.purchase_request_id')
+            ->leftJoin('finance_suppliers as s', 's.id', '=', 'o.supplier_id')
+            ->leftJoin('departments as d', 'd.id', '=', 'p.department_id')
+            ->where('o.state', 'closed')
+            ->when($search !== null && trim($search) !== '', function ($query) use ($search): void {
+                $term = '%'.trim((string) $search).'%';
+                $query->where(fn ($inner) => $inner->where('o.number', 'ilike', $term)->orWhere('p.number', 'ilike', $term)
+                    ->orWhereExists(fn ($invoice) => $invoice->from('finance_purchase_invoices as i')->whereColumn('i.order_id', 'o.id')
+                        ->where(fn ($match) => $match->where('i.invoice_no', 'ilike', $term)->orWhere('i.external_voucher_no', 'ilike', $term))));
+            })
+            ->orderByDesc('o.updated_at')
+            ->select(['o.id', 'p.number as request_number', 'o.number as order_number', 'd.name as department', 's.name as supplier', 'o.amount', 'p.currency', 'o.updated_at as closed_at'])
+            ->selectSub(DB::table('finance_purchase_invoices as i')->whereColumn('i.order_id', 'o.id')->selectRaw("string_agg(i.invoice_no || COALESCE(' ← ' || i.external_voucher_no, ''), '، ')"), 'invoices')
+            ->paginate($perPage);
+    }
+
+    private function approvedWithoutOrder()
+    {
+        return DB::table('finance_purchase_requests as p')->where('p.state', 'approved')
+            ->whereNotExists(fn ($query) => $query->from('finance_purchase_orders as o')->whereColumn('o.purchase_request_id', 'p.id'));
+    }
+
+    /**
+     * @param  list<string>  $states
+     */
+    private function ordersInState(array $states)
+    {
+        return DB::table('finance_purchase_orders as o')->whereIn('o.state', $states);
+    }
+
+    private function receivedWithoutInvoice()
+    {
+        return $this->ordersInState(['partial_received', 'received'])
+            ->whereNotExists(fn ($query) => $query->from('finance_purchase_invoices as i')->whereColumn('i.order_id', 'o.id'));
+    }
+
+    private function unpaidInvoices()
+    {
+        return DB::table('finance_purchase_invoices')->where('state', '<>', 'paid');
+    }
+
+    private function readyToClose()
+    {
+        return $this->ordersInState(['received'])
+            ->whereExists(fn ($query) => $query->from('finance_purchase_invoices as i')->whereColumn('i.order_id', 'o.id'))
+            ->whereNotExists(fn ($query) => $query->from('finance_purchase_invoices as i')->whereColumn('i.order_id', 'o.id')->where('i.state', '<>', 'paid'));
+    }
+}
