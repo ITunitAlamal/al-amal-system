@@ -195,14 +195,21 @@ class NavigationPrioritiesTest extends TestCase
         return ['code' => $code, 'label' => $code, 'icon' => 'calendar', 'url' => $url ?? '/'.$code, 'children' => []];
     }
 
-    public function test_hr_head_lands_at_my_workspace_and_legacy_link_keeps_filters(): void
+    public function test_hr_head_lands_at_compact_home_and_can_open_filtered_details(): void
     {
         $user = User::factory()->make(['id' => 10, 'is_active' => true, 'department_id' => 1]);
         DB::table('departments')->insert(['id' => 1, 'code' => 'HR', 'head_user_id' => 10, 'is_active' => true]);
         $this->assign($user, 'department_head', 1);
         $this->withoutMiddleware(HandleInertiaRequests::class);
         $this->actingAs($user)->get('/dashboard')->assertRedirect(route('ui.preview'));
-        $this->get('/hr-services?date=2026-09-01&attendance_page=2')->assertRedirect(route('ui.preview', ['date' => '2026-09-01', 'attendance_page' => 2]));
+        $this->getJson('/ui-preview', ['X-Inertia' => 'true'])->assertOk()
+            ->assertJsonPath('component', 'Hr/Home')->assertJsonMissingPath('props.home')->assertJsonMissingPath('props.boards')
+            ->assertJsonPath('deferredProps.hr-summary', ['hrSummary'])
+            ->assertJsonPath('deferredProps.hr-actions', ['hrActions'])
+            ->assertJsonPath('deferredProps.hr-follow-up', ['hrFollowUp']);
+        $this->getJson('/hr-services?date=2026-09-01&attendance_page=2', ['X-Inertia' => 'true'])->assertOk()
+            ->assertJsonPath('component', 'Hr/Dashboard')->assertJsonPath('props.filters.date', '2026-09-01')
+            ->assertJsonPath('props.pages.attendance_page', 2);
     }
 
     public function test_hr_sidebar_entry_is_removed_without_exposing_hr_data_to_staff(): void

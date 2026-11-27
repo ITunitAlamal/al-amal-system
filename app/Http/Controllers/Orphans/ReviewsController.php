@@ -3,6 +3,8 @@
 namespace App\Http\Controllers\Orphans;
 
 use App\Http\Controllers\Controller;
+use App\Models\Guardian;
+use App\Models\User;
 use App\Services\AuditService;
 use App\Services\Notifications\NotificationCenter;
 use App\Services\Orphans\Identity;
@@ -14,6 +16,9 @@ use App\Services\Orphans\Registration\FamilyRegistrations;
 use App\Services\Orphans\Registration\RegistrationForm;
 use App\Services\Orphans\Registry;
 use App\Services\Orphans\RegistryQueries;
+use App\Services\Orphans\SensitiveChanges;
+use App\Services\Portal\ChangeRequests;
+use App\Services\Portal\PortalNotifier;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -26,6 +31,12 @@ use Inertia\Response;
 /** «الطلبات والمراجعات»: portal applications in one assignable queue, the review workspace, and appeals. */
 final class ReviewsController extends Controller
 {
+    /** @var list<int>|null */
+    private ?array $heads = null;
+
+    /** @var list<int>|null */
+    private ?array $executives = null;
+
     public function __construct(private readonly OrphanAccess $access, private readonly PortalApplications $applications, private readonly Persons $persons,
         private readonly RegistryQueries $queries, private readonly AuditService $audit, private readonly NotificationCenter $notifications) {}
 
@@ -44,8 +55,47 @@ final class ReviewsController extends Controller
             'counts' => ['open' => DB::table('portal_applications')->whereIn('status', ['submitted', 'under_review', 'resubmitted'])->count(),
                 'mine' => DB::table('portal_applications')->where('assigned_to', $user->id)->whereNotIn('status', ['draft', 'completed', 'rejected', 'withdrawn'])->count(),
                 'unassigned' => DB::table('portal_applications')->whereNull('assigned_to')->whereNotIn('status', ['draft', 'completed', 'rejected', 'withdrawn'])->count(),
-                'appeals' => DB::table('orphan_appeals')->whereIn('status', ['open', 'under_review'])->count()],
+                'appeals' => DB::table('orphan_appeals')->whereIn('status', ['open', 'under_review'])->count(),
+                'sensitive' => app(SensitiveChanges::class)->pendingCount()],
         ]);
+    }
+
+    /** «التعديلات الحساسة»: staff changes to approved files, old and new values, decided by the head (ORP-18). */
+    public function sensitive(Request $request, SensitiveChanges $changes): Response
+    {
+        $this->access->assertView($request->user());
+        $status = in_array($request->query('status'), ['pending', 'approved', 'rejected', 'all'], true) ? $request->query('status') : 'pending';
+        $rows = DB::table('orphan_sensitive_changes as c')->leftJoin('orphans as o', 'o.id', '=', 'c.orphan_id')
+            ->leftJoin('persons as p', fn ($j) => $j->on('p.id', '=', DB::raw('COALESCE(c.person_id, o.person_id)')))
+            ->leftJoin('users as r', 'r.id', '=', 'c.requested_by')->leftJoin('users as d', 'd.id', '=', 'c.decided_by')
+            ->when($status !== 'all', fn ($q) => $q->where('c.status', $status))
+            ->orderByRaw("CASE c.status WHEN 'pending' THEN 0 ELSE 1 END")->orderByDesc('c.id')
+            ->select(['c.*', 'p.full_name as subject_name', 'r.name as requester', 'd.name as decider'])
+            ->selectSub(DB::table('orphans as x')->whereColumn('x.person_id', 'p.id')->select('x.public_id')->limit(1), 'child_public_id')
+            ->selectSub(DB::table('orphan_guardians as g')->whereColumn('g.person_id', 'p.id')->select('g.public_id')->limit(1), 'guardian_public_id')
+            ->addSelect(['o.public_id as file_public_id', 'o.reference_no as orphan_reference'])
+            ->paginate(20)->withQueryString();
+        $rows->through(function ($row) use ($changes, $request): array {
+            $row->orphan_public_id = $row->file_public_id ?? $row->child_public_id;
+
+            return $changes->present($row, $request->user());
+        });
+
+        return Inertia::render('Orphans/Reviews/Sensitive', ['rows' => $rows, 'status' => $status, 'abilities' => $this->access->abilities($request->user())]);
+    }
+
+    /** Full identity numbers of one sensitive change on explicit request («identity»); every reveal is logged. */
+    public function revealSensitiveId(Request $request, string $publicId, SensitiveChanges $changes): JsonResponse
+    {
+        return response()->json($changes->revealIdentity($publicId, $request->user()));
+    }
+
+    public function decideSensitive(Request $request, string $publicId, SensitiveChanges $changes): RedirectResponse
+    {
+        $data = $request->validate(['decision' => ['required', Rule::in(['approve', 'reject'])], 'note' => 'nullable|string|max:2000'], [], ['note' => 'سبب القرار']);
+        $row = $changes->decide($publicId, $data['decision'], $data['note'] ?? null, $request->user());
+
+        return back()->with('success', $data['decision'] === 'approve' ? 'اعتُمد الطلب '.$row->reference_no.' وطُبّق التعديل على السجل.' : 'رُفض الطلب '.$row->reference_no.' وبقي السجل كما هو.');
     }
 
     public function show(Request $request, string $publicId): Response
@@ -97,6 +147,8 @@ final class ReviewsController extends Controller
             'events' => DB::table('portal_application_events as e')->leftJoin('users as u', 'u.id', '=', 'e.actor_user_id')->where('e.application_id', $app->id)->orderByDesc('e.id')
                 ->get(['e.action', 'e.note', 'e.created_at', 'e.child_id', 'u.name as actor', 'e.actor_guardian_id'])->map(fn ($e) => (array) $e),
             'me' => $request->user()->id, 'abilities' => $this->access->abilities($request->user()), 'staff' => $this->access->staff(), 'options' => ['authority' => $this->queries->values('guardian_authority_kinds')],
+            // Set when this user entered the request or is its applicant/guardian: the page then offers no review action.
+            'reviewConflict' => $this->applications->reviewConflict($app, $request->user()),
         ]);
     }
 
@@ -112,18 +164,18 @@ final class ReviewsController extends Controller
                 'o.reference_no as orphan_reference', 'p.full_name as child', 'u.name as decided_by_name'])->withQueryString();
         $mayHealth = $this->access->allows($request->user(), 'health');
         $rows->through(fn ($c) => ['public_id' => $c->public_id, 'reference_no' => $c->reference_no, 'account' => $c->account_name, 'child' => $c->child, 'orphan_public_id' => $c->orphan_public_id,
-            'orphan_reference' => $c->orphan_reference, 'group' => $c->field_group, 'group_label' => \App\Services\Portal\ChangeRequests::GROUPS[$c->field_group] ?? $c->field_group,
-            'status' => $c->status, 'status_label' => \App\Services\Portal\ChangeRequests::STATUS[$c->status] ?? $c->status, 'reason' => $c->reason, 'created_at' => $c->created_at,
+            'orphan_reference' => $c->orphan_reference, 'group' => $c->field_group, 'group_label' => ChangeRequests::GROUPS[$c->field_group] ?? $c->field_group,
+            'status' => $c->status, 'status_label' => ChangeRequests::STATUS[$c->status] ?? $c->status, 'reason' => $c->reason, 'created_at' => $c->created_at,
             'restricted' => $c->field_group === 'health' && ! $mayHealth,
-            'proposed' => $c->field_group === 'health' && ! $mayHealth ? [] : \App\Services\Portal\ChangeRequests::proposed($c), 'current' => \App\Services\Portal\ChangeRequests::snapshot($c),
-            'auto' => in_array($c->field_group, \App\Services\Portal\ChangeRequests::AUTO_APPLY, true), 'public_note' => $c->public_note, 'internal_note' => $c->internal_note,
+            'proposed' => $c->field_group === 'health' && ! $mayHealth ? [] : ChangeRequests::proposed($c), 'current' => ChangeRequests::snapshot($c),
+            'auto' => in_array($c->field_group, ChangeRequests::AUTO_APPLY, true), 'public_note' => $c->public_note, 'internal_note' => $c->internal_note,
             'decided_by' => $c->decided_by_name, 'decided_at' => $c->decided_at, 'applied_at' => $c->applied_at,
             'documents' => DB::table('registry_documents')->where('change_request_id', $c->id)->when(! $mayHealth, fn ($q) => $q->where('is_restricted', false))->get(['public_id', 'original_name'])->map(fn ($d) => (array) $d)]);
 
         return Inertia::render('Orphans/Reviews/Changes', ['rows' => $rows, 'status' => $status, 'abilities' => $this->access->abilities($request->user())]);
     }
 
-    public function decideChange(Request $request, string $publicId, \App\Services\Portal\ChangeRequests $changes): RedirectResponse
+    public function decideChange(Request $request, string $publicId, ChangeRequests $changes): RedirectResponse
     {
         $row = DB::table('portal_change_requests')->where('public_id', $publicId)->firstOrFail();
         $data = $request->validate(['action' => ['required', Rule::in(['review', 'needs_info', 'approve', 'reject'])], 'public_note' => 'nullable|string|max:2000', 'internal_note' => 'nullable|string|max:3000'],
@@ -131,7 +183,7 @@ final class ReviewsController extends Controller
         $changes->decide($row, $data['action'], $data['public_note'] ?? null, $data['internal_note'] ?? null, $request->user());
 
         return back()->with('success', match ($data['action']) {
-            'approve' => in_array($row->field_group, \App\Services\Portal\ChangeRequests::AUTO_APPLY, true) ? 'اعتُمد الطلب وطُبق التعديل على السجل.' : 'اعتُمد الطلب. طبّق التعديل من ملف اليتيم أو الأسرة.',
+            'approve' => in_array($row->field_group, ChangeRequests::AUTO_APPLY, true) ? 'اعتُمد الطلب وطُبق التعديل على السجل.' : 'اعتُمد الطلب. طبّق التعديل من ملف اليتيم أو الأسرة.',
             'reject' => 'رُفض الطلب مع إبلاغ الوصي بالسبب.', 'needs_info' => 'أُرسل طلب الاستكمال للوصي.', default => 'استلمت الطلب للمراجعة.',
         });
     }
@@ -145,7 +197,7 @@ final class ReviewsController extends Controller
         $this->access->assert($request->user(), 'portal');
         $app = DB::table('portal_applications')->where('public_id', $publicId)->where('source', 'portal')->firstOrFail();
         $data = $request->validate(['action' => ['required', Rule::in(['verify_phone', 'temporary_password'])]]);
-        $account = \App\Models\Guardian::findOrFail($app->guardian_account_id);
+        $account = Guardian::findOrFail($app->guardian_account_id);
         if ($data['action'] === 'verify_phone') {
             $account->forceFill(['phone_verified_at' => now(), 'phone_verification_method' => 'manual', 'phone_verified_by' => $request->user()->id])->save();
             $this->audit->recordRow('orphans.portal.phone_verified_manually', 'guardians', $account->id, null, ['application' => $app->reference_no], $request->user()->id, $request->ip());
@@ -265,23 +317,87 @@ final class ReviewsController extends Controller
 
     public function decideAppeal(Request $request, string $publicId): RedirectResponse
     {
-        $this->access->assertEdit($request->user());
-        $appeal = DB::table('orphan_appeals')->where('public_id', $publicId)->whereIn('status', ['open', 'under_review'])->firstOrFail();
-        $data = $request->validate(['action' => ['required', Rule::in(['review', 'accept', 'reject', 'assign'])], 'note' => 'nullable|string|max:3000', 'user_id' => 'nullable|integer|exists:users,id']);
-        $update = match ($data['action']) {
-            'review' => ['status' => 'under_review', 'assigned_to' => $appeal->assigned_to ?? $request->user()->id],
-            'assign' => $this->access->canAssign($request->user()) ? ['assigned_to' => $data['user_id'] ?? null] : abort(403, 'الإسناد لرئيس القسم.'),
-            default => blank($data['note'] ?? null) ? abort(422, 'نص القرار مطلوب.') : ['status' => $data['action'] === 'accept' ? 'accepted' : 'rejected', 'decision_note' => $data['note'],
-                'decided_by' => $request->user()->id, 'decided_at' => now()],
-        };
-        DB::table('orphan_appeals')->where('id', $appeal->id)->update([...$update, 'updated_at' => now()]);
+        $user = $request->user();
+        // The executive director reads the department (no edit role) yet decides an appeal the head escalated to him.
+        $this->access->assertView($user);
+        $data = $request->validate(['action' => ['required', Rule::in(['review', 'accept', 'reject', 'assign', 'escalate'])], 'note' => 'nullable|string|max:3000', 'user_id' => 'nullable|integer|exists:users,id']);
+        $result = DB::transaction(function () use ($publicId, $data, $user): array {
+            $appeal = DB::table('orphan_appeals')->where('public_id', $publicId)->whereIn('status', ['open', 'under_review'])->lockForUpdate()->firstOrFail();
+            $executive = null;
+            $update = match ($data['action']) {
+                // Taking an appeal for review records the reviewer; it gives no right to decide it.
+                'review' => $this->access->canEdit($user) ? ['status' => 'under_review', ...($appeal->assigned_to ? [] : ['assigned_to' => $user->id, 'assigned_by' => $user->id])]
+                    : abort(403, 'مراجعة الاعتراض لموظفي القسم.'),
+                'assign' => $this->access->canAssign($user) ? ['assigned_to' => $data['user_id'] ?? null, 'assigned_by' => ($data['user_id'] ?? null) ? $user->id : null] : abort(403, 'الإسناد لرئيس القسم.'),
+                'escalate' => $this->escalation($user, $data['note'] ?? null, $executive),
+                default => $this->decision($appeal, $user, $data['action'], $data['note'] ?? null),
+            };
+            DB::table('orphan_appeals')->where('id', $appeal->id)->update([...$update, 'updated_at' => now()]);
+
+            return [$appeal, $executive];
+        });
+        [$appeal, $executive] = $result;
         if ($appeal->filed_by_guardian && in_array($data['action'], ['accept', 'reject'], true)) {
             // The decision text is the reply shown to the beneficiary in «طلباتي».
-            app(\App\Services\Portal\PortalNotifier::class)->notify((int) $appeal->filed_by_guardian, 'decision', 'صدر قرار في اعتراضك '.$appeal->reference_no, '/guardian/requests');
+            app(PortalNotifier::class)->notify((int) $appeal->filed_by_guardian, 'decision', 'صدر قرار في اعتراضك '.$appeal->reference_no, '/guardian/requests');
         }
-        $this->audit->recordRow('orphans.appeal.'.$data['action'], 'orphan_appeals', $appeal->id, null, ['note' => $data['note'] ?? null], $request->user()->id, $request->ip());
+        if ($executive) {
+            $this->notifications->notifyMany([$executive], 'orphans_appeal_update', ['title' => 'اعتراض صعّده إليك رئيس قسم الأيتام: '.$appeal->reference_no, 'body' => (string) $data['note'],
+                'url' => '/orphans/reviews?tab=appeals&assigned=me', 'dedupe' => 'appeal-escalated-'.$appeal->id]);
+        }
+        $this->audit->recordRow('orphans.appeal.'.$data['action'], 'orphan_appeals', $appeal->id, null, ['note' => $data['note'] ?? null,
+            ...($executive ? ['escalated_to' => $executive] : [])], $user->id, $request->ip());
 
-        return back()->with('success', $data['action'] === 'accept' ? 'قُبل الاعتراض. أي تعديل على كشف معتمد يحتاج طلب تعديل يعتمده المدير التنفيذي.' : 'تم تحديث الاعتراض.');
+        return back()->with('success', match ($data['action']) {
+            'accept' => 'قُبل الاعتراض. أي تعديل على كشف معتمد يحتاج طلب تعديل يعتمده المدير التنفيذي.',
+            'escalate' => 'صُعّد الاعتراض إلى المدير التنفيذي ليفصل فيه.', default => 'تم تحديث الاعتراض.',
+        });
+    }
+
+    /** The head hands the appeal to the designated executive director, with the reason. */
+    private function escalation(User $user, ?string $note, ?int &$executive): array
+    {
+        $this->access->assertDecide($user, 'تصعيد الاعتراض إلى المدير التنفيذي لرئيس القسم.');
+        abort_if(blank($note), 422, 'اكتب سبب التصعيد.');
+        $executive = $this->access->executiveUserIds()[0] ?? null;
+        abort_unless($executive, 409, 'لا يوجد مدير تنفيذي معيّن لتصعيد الاعتراض إليه.');
+
+        return ['status' => 'under_review', 'assigned_to' => $executive, 'assigned_by' => $user->id];
+    }
+
+    private function decision(object $appeal, User $user, string $action, ?string $note): array
+    {
+        $who = $this->appealDecider($appeal, $user);
+        abort_if($who['conflict'] !== null, 403, $who['conflict'] ?? '');
+        abort_unless($who['may'], 403, 'يفصل في الاعتراض رئيس القسم، أو من أسنده إليه رئيس القسم (ومنهم المدير التنفيذي عند التصعيد).');
+        abort_if(blank($note), 422, 'نص القرار مطلوب.');
+
+        return ['status' => $action === 'accept' ? 'accepted' : 'rejected', 'decision_note' => $note, 'decided_by' => $user->id, 'decided_at' => now()];
+    }
+
+    /**
+     * Who may accept or reject an appeal (req-04 §12): the head, or the person the head assigned it to (the executive
+     * director when the head escalated it). Nobody decides an appeal against a campaign list they prepared or an
+     * orphan file they entered by hand; the head escalates such an appeal instead.
+     *
+     * @return array{may: bool, conflict: ?string}
+     */
+    private function appealDecider(object $appeal, User $user): array
+    {
+        $assignedBy = (int) ($appeal->assigned_by ?? 0);
+        $byHead = (int) $appeal->assigned_to === (int) $user->id && $assignedBy > 0 && $assignedBy !== (int) $user->id
+            && in_array($assignedBy, $this->heads ??= $this->access->headUserIds(), true);
+        if (! $this->access->canDecide($user) && ! $byHead) {
+            return ['may' => false, 'conflict' => null];
+        }
+        $conflict = null;
+        if ($appeal->campaign_id && DB::table('campaign_lists')->where('campaign_id', $appeal->campaign_id)->where('prepared_by', $user->id)->exists()) {
+            $conflict = 'أعددتَ كشف الحملة موضوع الاعتراض، فلا تفصل فيه؛ يصعّده رئيس القسم إلى المدير التنفيذي.';
+        } elseif ($appeal->orphan_id && DB::table('orphans')->where('id', $appeal->orphan_id)->where('registration_source', 'staff')->where('created_by', $user->id)->exists()) {
+            $conflict = 'أدخلتَ ملف اليتيم موضوع الاعتراض، فلا تفصل فيه؛ يصعّده رئيس القسم إلى المدير التنفيذي.';
+        }
+
+        return ['may' => $conflict === null, 'conflict' => $conflict];
     }
 
     private function applicationQuery(array $filters, $user)
@@ -312,13 +428,22 @@ final class ReviewsController extends Controller
         $query = DB::table('orphan_appeals as a')->leftJoin('orphans as o', 'o.id', '=', 'a.orphan_id')->leftJoin('persons as op', 'op.id', '=', 'o.person_id')
             ->leftJoin('orphan_guardians as g', 'g.id', '=', 'a.guardian_id')->leftJoin('persons as gp', 'gp.id', '=', 'g.person_id')->leftJoin('users as u', 'u.id', '=', 'a.assigned_to')
             ->select(['a.public_id', 'a.reference_no', 'a.kind', 'a.status', 'a.reason', 'a.decision_note', 'a.campaign_id', 'a.created_at', 'u.name as assignee',
+                'a.assigned_to', 'a.assigned_by', 'a.orphan_id',
                 DB::raw('COALESCE(op.full_name, gp.full_name) as subject_name'), 'o.public_id as orphan_public_id', 'g.public_id as guardian_public_id']);
         $status = $filters['status'] ?? 'open';
         $status === 'open' ? $query->whereIn('a.status', ['open', 'under_review']) : ($status === 'all' ? null : $query->where('a.status', $status));
         if (($filters['assigned'] ?? null) === 'me') {
             $query->where('a.assigned_to', $user->id);
         }
+        $head = $this->access->canDecide($user);
 
-        return $query->orderBy('a.id')->paginate(25)->withQueryString()->through(fn ($r) => (array) $r);
+        // Per-row flags so the page offers only what the server accepts (decisions, conflicts, escalation by the head).
+        return $query->orderBy('a.id')->paginate(25)->withQueryString()->through(function ($r) use ($user, $head): array {
+            $open = in_array($r->status, ['open', 'under_review'], true);
+            $who = $open ? $this->appealDecider($r, $user) : ['may' => false, 'conflict' => null];
+
+            return [...collect((array) $r)->except(['assigned_by', 'orphan_id'])->all(), 'can_decide' => $who['may'], 'conflict' => $who['conflict'],
+                'can_escalate' => $open && $head, 'escalated' => $r->assigned_to && in_array((int) $r->assigned_to, $this->executives ??= $this->access->executiveUserIds(), true)];
+        });
     }
 }

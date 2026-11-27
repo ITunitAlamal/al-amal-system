@@ -16,6 +16,10 @@ const props = defineProps({
   prefill: { type: Object, default: null },
   lookups: { type: Object, default: () => ({}) },
   leaveOnboarding: { type: Object, default: () => ({}) },
+  // A new file prepared by HR staff and returned for completion: its data fill the form again.
+  draft: { type: Object, default: null },
+  // The open prepared change of this file or draft (status, note), shown above the form.
+  fileChange: { type: Object, default: null },
 });
 
 const base = '/admin/employee-profiles';
@@ -24,6 +28,8 @@ const step = ref(0);
 const steps = ['البيانات الأساسية', 'بيانات التعليم', 'بيانات العمل', 'بيانات العائلة', 'الإجازات'];
 const wizardError = ref('');
 const reviewConfirmed = ref(false);
+// HR staff: what they save goes to the HR head for approval instead of the file.
+const reviewMode = computed(() => Boolean(props.lookups?.submitsForReview));
 
 // Constants lists from «ثوابت النظام». Values the employee already holds stay listed even if deactivated.
 const masterOptions = type => (props.lookups?.masterData ?? []).filter(x => x.type_code === type);
@@ -36,53 +42,54 @@ const commonDegrees = ['ثانوية عامة', 'دبلوم متوسط', 'بكا
 const defaultValue = (type, code) => (props.employee ? '' : (masterOptions(type).find(x => x.code === code)?.id ?? ''));
 
 const yesNo = value => (value === null || value === undefined ? '' : (Boolean(value) ? 'yes' : 'no'));
+const src = props.employee ?? props.draft;
 const form = useForm({
-  employee_number: props.employee?.employee_number ?? props.prefill?.employee_number ?? '',
-  link_existing_account: Boolean(props.prefill),
+  employee_number: src?.employee_number ?? props.prefill?.employee_number ?? '',
+  link_existing_account: props.draft ? Boolean(props.draft.link_existing_account) : Boolean(props.prefill),
   activation_method: 'sms',
   temporary_password: '',
   temporary_password_confirmation: '',
-  first_name_ar: props.employee?.first_name_ar ?? props.prefill?.first_name_ar ?? '',
-  father_name_ar: props.employee?.father_name_ar ?? '',
-  grandfather_name_ar: props.employee?.grandfather_name_ar ?? '',
-  family_name_ar: props.employee?.family_name_ar ?? props.prefill?.family_name_ar ?? '',
-  full_name_en: props.employee?.full_name_en ?? '',
-  full_name_ar: props.employee?.full_name_ar ?? '',
-  original_family_name_ar: props.employee?.original_family_name_ar ?? '',
+  first_name_ar: src?.first_name_ar ?? props.prefill?.first_name_ar ?? '',
+  father_name_ar: src?.father_name_ar ?? '',
+  grandfather_name_ar: src?.grandfather_name_ar ?? '',
+  family_name_ar: src?.family_name_ar ?? props.prefill?.family_name_ar ?? '',
+  full_name_en: src?.full_name_en ?? '',
+  full_name_ar: src?.full_name_ar ?? '',
+  original_family_name_ar: src?.original_family_name_ar ?? '',
   name_parts_reviewed: false,
-  children_count: props.employee?.children_count ?? '',
-  landline_phone: props.employee?.landline_phone ?? '',
-  residence_address: props.employee?.residence_address ?? '',
-  attendance_number: props.employee?.attendance_number ?? '',
-  national_id: props.employee?.national_id ?? '',
-  identity_document_type_value_id: props.employee?.identity_document_type_value_id ?? defaultValue('identity_document_types', 'palestinian_id'),
-  nationality_value_id: props.employee?.nationality_value_id ?? defaultValue('nationalities', 'palestinian'),
-  date_of_birth: props.employee?.date_of_birth?.slice(0, 10) ?? '',
-  gender: props.employee?.gender ?? '',
-  place_of_birth: props.employee?.place_of_birth ?? '',
-  marital_status_value_id: props.employee?.marital_status_value_id ?? '',
-  has_qualifications: yesNo(props.employee?.has_qualifications),
-  has_family_members: yesNo(props.employee?.has_family_members),
-  employment_term_value_id: props.employee?.employment_term_value_id ?? '',
-  contract_type_value_id: props.employee?.contract_type_value_id ?? '',
-  work_schedule_value_id: props.employee?.work_schedule_value_id ?? '',
-  administrative_level_value_id: props.employee?.administrative_level_value_id ?? '',
-  confirm_no_opening_balances: false,
-  leave_opening_balances: [],
-  phone: props.employee?.phone ?? '',
-  alternative_phone: props.employee?.alternative_phone ?? '',
-  personal_email: props.employee?.personal_email ?? '',
-  department_id: props.employee?.department_id ?? props.prefill?.department_id ?? '',
-  job_category_id: props.employee?.job_category_id ?? '',
-  job_title_id: props.employee?.job_title_id ?? '',
-  job_grade_id: props.employee?.job_grade_id ?? '',
-  hire_date: props.employee?.hire_date?.slice(0, 10) ?? '',
-  work_start_date: props.employee?.work_start_date?.slice(0, 10) ?? '',
-  employment_status: props.employee?.employment_status ?? 'active',
-  notes: props.employee?.notes ?? '',
-  addresses: (props.employee?.addresses ?? []).map(x => ({ ...x, valid_from: x.valid_from?.slice(0, 10) ?? '', valid_to: x.valid_to?.slice(0, 10) ?? '' })),
-  qualifications: (props.employee?.qualifications ?? []).map(x => ({ ...x, study_start_date: x.study_start_date?.slice(0, 10) ?? '', graduation_date: x.graduation_date?.slice(0, 10) ?? '' })),
-  family_members: (props.employee?.family_members ?? []).map(x => ({ ...x, date_of_birth: x.date_of_birth?.slice(0, 10) ?? '' })),
+  children_count: src?.children_count ?? '',
+  landline_phone: src?.landline_phone ?? '',
+  residence_address: src?.residence_address ?? '',
+  attendance_number: src?.attendance_number ?? '',
+  national_id: src?.national_id ?? '',
+  identity_document_type_value_id: src?.identity_document_type_value_id ?? defaultValue('identity_document_types', 'palestinian_id'),
+  nationality_value_id: src?.nationality_value_id ?? defaultValue('nationalities', 'palestinian'),
+  date_of_birth: src?.date_of_birth?.slice(0, 10) ?? '',
+  gender: src?.gender ?? '',
+  place_of_birth: src?.place_of_birth ?? '',
+  marital_status_value_id: src?.marital_status_value_id ?? '',
+  has_qualifications: yesNo(src?.has_qualifications),
+  has_family_members: yesNo(src?.has_family_members),
+  employment_term_value_id: src?.employment_term_value_id ?? '',
+  contract_type_value_id: src?.contract_type_value_id ?? '',
+  work_schedule_value_id: src?.work_schedule_value_id ?? '',
+  administrative_level_value_id: src?.administrative_level_value_id ?? '',
+  confirm_no_opening_balances: Boolean(props.draft?.confirm_no_opening_balances),
+  leave_opening_balances: (props.draft?.leave_opening_balances ?? []).map(x => ({ ...x })),
+  phone: src?.phone ?? '',
+  alternative_phone: src?.alternative_phone ?? '',
+  personal_email: src?.personal_email ?? '',
+  department_id: src?.department_id ?? props.prefill?.department_id ?? '',
+  job_category_id: src?.job_category_id ?? '',
+  job_title_id: src?.job_title_id ?? '',
+  job_grade_id: src?.job_grade_id ?? '',
+  hire_date: src?.hire_date?.slice(0, 10) ?? '',
+  work_start_date: src?.work_start_date?.slice(0, 10) ?? '',
+  employment_status: src?.employment_status ?? 'active',
+  notes: src?.notes ?? '',
+  addresses: (src?.addresses ?? []).map(x => ({ ...x, valid_from: x.valid_from?.slice(0, 10) ?? '', valid_to: x.valid_to?.slice(0, 10) ?? '' })),
+  qualifications: (src?.qualifications ?? []).map(x => ({ ...x, study_start_date: x.study_start_date?.slice(0, 10) ?? '', graduation_date: x.graduation_date?.slice(0, 10) ?? '' })),
+  family_members: (src?.family_members ?? []).map(x => ({ ...x, date_of_birth: x.date_of_birth?.slice(0, 10) ?? '' })),
 });
 
 const departments = computed(() => props.lookups?.departments ?? []);
@@ -274,6 +281,7 @@ function save() {
       if (step.value !== 1) delete payload.has_qualifications;
       if (step.value !== 3) delete payload.has_family_members;
     } else {
+      if (props.fileChange?.id && props.draft) payload.file_change_id = props.fileChange.id;
       payload.leave_opening_balances = data.leave_opening_balances.map(row => ({ ...row, annual_entitlement_days: Number(row.annual_entitlement_days), opening_balance_days: Number(row.opening_balance_days) }));
     }
     for (const key of Object.keys(relatedFields)) {
@@ -320,6 +328,17 @@ function save() {
       </nav>
       <PageHeader eyebrow="الموارد البشرية" :title="editing ? 'تعديل بيانات الموظف' : 'إضافة ملف موظف'" :description="`الخطوة ${step + 1} من 5 — ${steps[step]}`" />
 
+      <div v-if="reviewMode" role="status" class="alert-warning leading-7">
+        <strong>يُرسل ما تحفظه إلى رئيس الموارد البشرية للاعتماد،</strong> ولا يظهر في الملف قبل اعتماده. تتابعه من
+        <Link href="/admin/employee-file-changes" class="font-semibold underline">تعديلات ملفات الموظفين</Link>.
+        <template v-if="fileChange?.status === 'returned' && fileChange.note"><br><strong>أُعيد إليك للاستكمال:</strong> {{ fileChange.note }}</template>
+        <template v-else-if="fileChange?.own"><br>لهذا الملف تعديل أعددته بانتظار الاعتماد؛ تظهر قيمه في النموذج، وما تحفظه الآن يُضاف إليه.</template>
+        <template v-else-if="fileChange"><br>على هذا الملف تعديل أعده {{ fileChange.preparedBy }} ولم يُبت فيه بعد؛ لا يُرسل تعديل آخر قبل قرار رئيس القسم أو سحبه.</template>
+      </div>
+      <div v-else-if="fileChange" role="status" class="alert-warning leading-7">
+        على هذا الملف تعديل أعده {{ fileChange.preparedBy }} ({{ fileChange.statusLabel }}). ما تحفظه الآن يسري مباشرة، ولن يُعتمد ذلك التعديل إن كان يمس الحقول نفسها.
+        <Link v-if="fileChange.url" :href="fileChange.url" class="font-semibold underline">عرض التعديل</Link>
+      </div>
       <div v-if="prefill" role="status" class="alert-info leading-7">
         <strong>استكمال ملف موظف له حساب دخول:</strong> «{{ prefill.account_name }}» — الرقم الوظيفي <span dir="ltr">{{ prefill.employee_number }}</span>.
         يُربط الملف بحسابه الحالي دون تغيير كلمة مروره أو صلاحياته، ولا تُرسل رسالة تفعيل. أكمل الاسم الرباعي وباقي البيانات، وتأكد من هويته.
@@ -821,8 +840,8 @@ function save() {
             <button v-if="step < 4" type="button" :disabled="form.processing" class="btn btn-accent" @click="nextStep">التالي</button>
           </div>
           <div class="flex flex-wrap gap-2">
-            <button v-if="editing && step < 4" type="submit" :disabled="form.processing" class="btn btn-primary">{{ form.processing ? 'جارٍ الحفظ...' : 'حفظ بيانات هذه الخطوة' }}</button>
-            <button v-if="!editing && step === 4" type="submit" :disabled="form.processing" class="btn btn-primary">{{ form.processing ? 'جارٍ الاعتماد...' : 'اعتماد وتسجيل الموظف' }}</button>
+            <button v-if="editing && step < 4" type="submit" :disabled="form.processing" class="btn btn-primary">{{ form.processing ? 'جارٍ الحفظ...' : (reviewMode ? 'إرسال بيانات هذه الخطوة للاعتماد' : 'حفظ بيانات هذه الخطوة') }}</button>
+            <button v-if="!editing && step === 4" type="submit" :disabled="form.processing" class="btn btn-primary">{{ form.processing ? (reviewMode ? 'جارٍ الإرسال...' : 'جارٍ الاعتماد...') : (reviewMode ? 'إرسال الملف لاعتماد رئيس القسم' : 'اعتماد وتسجيل الموظف') }}</button>
             <Link :href="editing ? `${base}/${employee.id}` : base" class="btn btn-secondary">{{ editing ? 'العودة لملف الموظف' : 'إلغاء والعودة' }}</Link>
           </div>
         </div>

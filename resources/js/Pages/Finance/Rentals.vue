@@ -5,16 +5,17 @@ import AppLayout from '../../Layouts/AppLayout.vue';
 import EmptyState from '../../Components/EmptyState.vue';
 import PageHeader from '../../Components/PageHeader.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
+import { createUuid } from '../../Support/uuid.js';
 
 const props = defineProps({ dues: Array, totals: Array, receipts: Array, paymentMethods: Array, externalSystem: String, filters: Object, filterLabels: Object });
 
 const money = n => Number(n || 0).toLocaleString('ar-u-nu-latn', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const newKey = () => (window.crypto?.randomUUID ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`.replace(/[^0-9a-f-]/g, '0'));
+const newKey = () => createUuid();
 const filter = ref({ ...props.filters });
 const apply = () => router.get('/finance/rentals', filter.value, { preserveState: true, preserveScroll: true, replace: true });
 
 const openDues = computed(() => props.dues.filter(d => Number(d.remaining) > 0));
-const form = useForm({ request_key: newKey(), reference: '', posted_on: '', payment_method_value_id: null, note: '', allocations: [{ due_id: '', amount: '' }] });
+const form = useForm({ request_key: newKey(), reference: '', posted_on: '', voucher_amount: '', payment_method_value_id: null, note: '', allocations: [{ due_id: '', amount: '' }] });
 const dueOf = id => props.dues.find(d => Number(d.id) === Number(id));
 function pick(row) {
     const due = dueOf(row.due_id);
@@ -51,9 +52,10 @@ function reverse(receipt) {
 
     <form class="card space-y-3" @submit.prevent="record">
         <h2 class="card-title">تسجيل سند قبض من البرنامج المحاسبي</h2>
-        <div class="grid gap-2 md:grid-cols-4">
+        <div class="grid gap-2 md:grid-cols-5">
             <input v-model="form.reference" class="field" required placeholder="رقم السند" dir="ltr" aria-label="رقم السند">
             <input v-model="form.posted_on" type="date" class="field" required aria-label="تاريخ السند">
+            <input v-model="form.voucher_amount" type="number" min="0.01" step="0.01" class="field" required placeholder="المبلغ الإجمالي للسند" aria-label="المبلغ الإجمالي للسند">
             <select v-model="form.payment_method_value_id" class="field" aria-label="طريقة الدفع"><option :value="null">طريقة الدفع{{ paymentMethods.length ? '' : ' (لا قيم في الثوابت)' }}</option><option v-for="o in paymentMethods" :key="o.id" :value="o.id">{{ o.name }}</option></select>
             <input v-model="form.note" class="field" placeholder="ملاحظة">
         </div>
@@ -68,7 +70,7 @@ function reverse(receipt) {
         </div>
         <button type="button" class="btn btn-secondary btn-sm" @click="form.allocations.push({ due_id: '', amount: '' })">+ استحقاق آخر من السند نفسه</button>
         <p v-if="currencies.length > 1" class="field-error">السند الواحد بعملة واحدة؛ اختر استحقاقات بالعملة نفسها.</p>
-        <p class="text-xs text-slate-500">لا يتجاوز المبلغ المتبقي على الاستحقاق؛ الزيادة تبقى رصيدًا دائنًا للمستأجر في {{ externalSystem }} وتُخصص لاحقًا أو بتسوية معتمدة.</p>
+        <p class="text-xs text-slate-500">مجموع التوزيع على السند (مع ما وُزّع منه سابقًا) لا يتجاوز مبلغه الإجمالي، ولا يتجاوز المبلغ المتبقي على الاستحقاق؛ الزيادة تبقى رصيدًا دائنًا للمستأجر في {{ externalSystem }} وتُخصص لاحقًا أو بتسوية معتمدة.</p>
         <p v-for="(message, key) in form.errors" :key="key" class="field-error">{{ message }}</p>
         <button class="btn btn-primary" :disabled="form.processing || currencies.length > 1">تسجيل القبض</button>
     </form>

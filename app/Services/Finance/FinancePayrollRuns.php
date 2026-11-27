@@ -305,7 +305,9 @@ final class FinancePayrollRuns
     }
 
     /**
-     * Active users FinanceGuard allows a permission today (candidates: finance staff and per-user grants).
+     * Active users FinanceGuard allows a permission today. Candidates: finance staff, per-user grants, Board
+     * approvers, and the structural holders (the appointed heads of EXEC and of Accounts), who hold
+     * FinanceGuard::EXECUTIVE_PERMISSIONS / HEAD_PERMISSIONS by the structure, not by an assignment.
      *
      * @return Collection<int, int>
      */
@@ -314,6 +316,7 @@ final class FinancePayrollRuns
         $candidates = DB::table('finance_staff_assignments')->where('is_active', true)->pluck('user_id')
             ->merge(DB::table('finance_user_permissions')->where('permission_code', $permission)->where('effect', 'grant')->pluck('user_id'))
             ->merge(DB::table('finance_board_approvers')->where('is_active', true)->pluck('user_id'))
+            ->merge(DB::table('departments')->whereIn('code', ['EXEC', 'FIN', 'ACC'])->whereNull('deleted_at')->whereNotNull('head_user_id')->pluck('head_user_id'))
             ->map(fn ($id): int => (int) $id)->unique();
 
         return User::whereIn('id', $candidates)->where('is_active', true)->get()

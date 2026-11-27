@@ -19,8 +19,12 @@ final class RentalLedger
     /**
      * One row per due with: amount, increased, reduced, paid, net (amount + increased − reduced), remaining,
      * credit (paid above net), payment_state (paid|partial|unpaid|cancelled) and overdue.
+     *
+     * A due is an obligation only once its contract is activated (SRS 3.8.6): by default the custom schedule lines
+     * of a draft, returned, pending, rejected or cancelled contract are left out of balances, arrears, alerts and
+     * receipts. $includePlanned adds them for the contract's own page only; they are never overdue.
      */
-    public function dues(): Builder
+    public function dues(bool $includePlanned = false): Builder
     {
         $receipts = DB::table('aims_rental_receipt_allocations')->whereNull('reversed_at')
             ->groupBy('due_id')->select('due_id')->selectRaw('SUM(amount) AS paid');
@@ -33,6 +37,7 @@ final class RentalLedger
 
         return DB::table('aims_rental_dues as d')
             ->join('aims_rental_contracts as c', 'c.id', '=', 'd.contract_id')
+            ->when(! $includePlanned, fn (Builder $q) => $q->whereNotNull('c.activated_at'))
             ->leftJoinSub($receipts, 'rp', 'rp.due_id', '=', 'd.id')
             ->leftJoinSub($settled, 'st', 'st.due_id', '=', 'd.id')
             ->leftJoinSub($this->finance->paidByDue(), 'lg', 'lg.due_id', '=', DB::raw('CAST(d.id AS VARCHAR)'))
@@ -46,7 +51,15 @@ final class RentalLedger
             ->selectRaw("GREATEST({$paid} - {$net}, 0) AS credit")
             ->selectRaw("CASE WHEN d.status = 'cancelled' THEN 'cancelled' WHEN {$remaining} = 0 THEN 'paid'
                 WHEN {$paid} > 0 OR COALESCE(st.reduced, 0) > 0 THEN 'partial' ELSE 'unpaid' END AS payment_state")
-            ->selectRaw("(d.status <> 'cancelled' AND d.due_on < CURRENT_DATE AND {$remaining} > 0) AS overdue");
+            ->selectRaw('(c.activated_at IS NOT NULL) AS obligated')
+            ->selectRaw("(c.activated_at IS NOT NULL AND d.status <> 'cancelled' AND d.due_on < CURRENT_DATE AND {$remaining} > 0) AS overdue");
+    }
+
+    /** True when the due belongs to an activated contract, so money may be recorded or settled against it. */
+    public function isObligation(int $dueId): bool
+    {
+        return DB::table('aims_rental_dues as d')->join('aims_rental_contracts as c', 'c.id', '=', 'd.contract_id')
+            ->where('d.id', $dueId)->whereNotNull('c.activated_at')->exists();
     }
 
     /** Remaining minor units of one due, read inside the caller's transaction after the due row is locked. */

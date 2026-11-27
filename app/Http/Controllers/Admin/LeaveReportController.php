@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Services\AuditService;
 use App\Services\EmployeeLeaveBalanceService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -17,6 +18,8 @@ final class LeaveReportController extends Controller
         abort_unless($r->user()?->canManageEmployees(), 403);
         $year = (int) $r->query('year', now()->year);
         abort_if($year < 2000 || $year > 2200, 422);
+        app(AuditService::class)->event('leave.report.exported', ['subject_type' => 'employees', 'sensitivity' => 'personal', 'ip' => $r->ip(),
+            'metadata' => ['year' => $year, 'employees' => DB::table('employees')->whereNull('deleted_at')->count(), 'format' => 'csv']]);
 
         return response()->streamDownload(function () use ($year, $balance) {
             $out = fopen('php://output', 'wb');

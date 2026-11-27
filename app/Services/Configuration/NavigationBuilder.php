@@ -50,7 +50,6 @@ final class NavigationBuilder
 
         $items = DB::table('navigation_items')
             ->where('is_active', true)
-            ->where('code', '<>', 'hr_dashboard')
             ->orderBy('sort_order')
             ->orderBy('id')
             ->get(['id', 'code', 'parent_id', 'label_ar', 'icon', 'route_name', 'route_params', 'access_rule', 'audience_roles']);
@@ -129,7 +128,6 @@ final class NavigationBuilder
         $entries = [];
         foreach (DB::table('navigation_items')->get(['code', 'route_name', 'access_rule']) as $item) {
             $reason = match (true) {
-                $item->code === 'hr_dashboard' => 'نُقل محتوى متابعة الموارد البشرية إلى مساحتي لرئيس الموارد البشرية.',
                 $item->route_name !== null && $item->route_name !== self::STARTABLE_WORKFLOWS && ! Route::has($item->route_name) => 'الصفحة غير موجودة في النظام.',
                 ! $this->rules->allows($user, $item->access_rule) => $this->rules->explain($user, $item->access_rule),
                 in_array($item->code, $hidden, true) => 'مخفي بقالب في «تخصيص اللوحات».',

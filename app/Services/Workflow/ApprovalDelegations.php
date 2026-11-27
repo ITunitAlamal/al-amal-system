@@ -5,6 +5,7 @@ namespace App\Services\Workflow;
 use App\Models\User;
 use App\Services\AuditService;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
@@ -18,7 +19,8 @@ use Illuminate\Validation\ValidationException;
  * director role. Only the executive director issues or revokes one; the system admin cannot activate it.
  *
  * When a delegation is revoked or its period ends, the open requests it holds go back to the step's normal
- * holders, with a timeline event, so nothing waits on someone who no longer has the authority.
+ * holders, with a timeline event, so nothing waits on someone who no longer has the authority. When the step has
+ * no other holder, OpenStepRerouter records that it waits with nobody and alerts the administration.
  */
 final class ApprovalDelegations
 {
@@ -51,6 +53,7 @@ final class ApprovalDelegations
                 ->join('users as issuer', 'issuer.id', '=', 'a.user_id')
                 ->whereColumn('a.user_id', 'd.delegator_user_id')
                 ->where('r.code', 'executive_director')
+                ->whereRaw(EffectiveAssignments::sql('a'))
                 ->where('issuer.is_active', true))
             ->value('d.delegate_user_id');
 
@@ -63,6 +66,7 @@ final class ApprovalDelegations
             ->join('roles as r', 'r.id', '=', 'a.role_id')
             ->where('a.user_id', $user->id)
             ->where('r.code', 'executive_director')
+            ->whereRaw(EffectiveAssignments::sql('a'))
             ->exists();
     }
 
@@ -171,6 +175,7 @@ final class ApprovalDelegations
                     ->join('users as u', 'u.id', '=', 'a.user_id')
                     ->whereColumn('a.user_id', 'd.delegator_user_id')
                     ->where('r.code', 'executive_director')
+                    ->whereRaw(EffectiveAssignments::sql('a'))
                     ->where('u.is_active', true)))
             ->pluck('d.id');
 
@@ -236,11 +241,14 @@ final class ApprovalDelegations
 
         $now = now();
         $returned = 0;
+        $unheld = [];
         foreach ($instances as $instance) {
             $step = DB::table('workflow_steps')->where('id', $instance->current_step_id)->first();
             $holders = $assignees->candidates($step, $instance, null, false);
             if ($holders === []) {
-                continue; // nobody else can take it: it stays visible with the delegate rather than vanishing
+                $unheld[] = (int) $instance->id; // nobody else holds the step: recorded and alerted below
+
+                continue;
             }
             $returned++;
             DB::table('workflow_participants')->where('workflow_instance_id', $instance->id)->where('user_id', $delegation->delegate_user_id)
@@ -272,6 +280,11 @@ final class ApprovalDelegations
                 'url' => route('workflows.show', ['publicId' => $instance->public_id], false),
                 'dedupe' => 'wf:'.$instance->id.':r'.$revision.':delegation',
             ]);
+        }
+        // The delegate no longer qualifies and nobody else holds the step: the rerouter takes the step from the
+        // delegate, records that it waits with no holder and alerts the administration (never auto-approved).
+        if ($unheld !== []) {
+            app(OpenStepRerouter::class)->reroute($unheld, $reason, $actorId);
         }
 
         return $returned;

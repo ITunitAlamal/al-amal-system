@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Services\Attendance\AttendanceDailyService;
+use App\Services\Attendance\AttendanceDeviceBackoff;
 use App\Services\Attendance\AttendanceDeviceReader;
 use App\Services\Attendance\AttendanceRawImporter;
 use Carbon\CarbonImmutable;
@@ -36,8 +37,16 @@ final class AttendanceSync extends Command
         $devices = DB::table('attendance_devices')->where('is_active', true)->where('sync_mode', 'pull')
             ->where('assigned_agent', config('attendance.agent_id', 'local'))
             ->when($this->option('device'), fn ($q) => $q->where('id', (int) $this->option('device')))->orderBy('id')->get();
+        $backoff = AttendanceDeviceBackoff::ready();
         $failed = false;
         foreach ($devices as $device) {
+            // After a failure the device waits (AttendanceDeviceBackoff) instead of being retried every minute. A "sync now"
+            // made after the last failure, or an operator's --device run, still goes at once; an older request waits its turn.
+            $freshRequest = $device->sync_requested_at && (! $backoff || ! $device->sync_failed_at
+                || CarbonImmutable::parse($device->sync_requested_at)->greaterThan(CarbonImmutable::parse($device->sync_failed_at)));
+            if (! $this->option('device') && $backoff && $device->sync_retry_at && ! $freshRequest && now()->lessThan(CarbonImmutable::parse($device->sync_retry_at))) {
+                continue;
+            }
             if (! $this->option('device') && ! $device->sync_requested_at &&
                 (! $device->import_approved_at || ($device->last_synced_at && now()->diffInSeconds($device->last_synced_at, true) < $device->sync_interval_seconds))) {
                 continue;
@@ -50,13 +59,21 @@ final class AttendanceSync extends Command
             }
             $runId = null;
             $payload = null;
+            $dryRun = false;
+            // A streak of failures with the same error is one run row whose attempts grow (see the catch below), so a
+            // retry opens its own row only once the device answered.
+            $streakRun = $backoff && (int) $device->sync_failure_count > 0
+                ? DB::table('attendance_sync_runs')->where('device_id', $device->id)->orderByDesc('id')->first(['id', 'status', 'error', 'dry_run'])
+                : null;
+            $streakRun = $streakRun?->status === 'failed' ? $streakRun : null;
             try {
                 $dryRun = (bool) $this->option('dry-run') || ! $device->import_approved_at || $device->sync_request_mode === 'preview';
                 $digest = $importer->configurationDigest($device);
-                $runId = DB::table('attendance_sync_runs')->insertGetId([
+                $openRun = fn (): int => DB::table('attendance_sync_runs')->insertGetId([
                     'device_id' => $device->id, 'status' => 'running', 'dry_run' => $dryRun, 'configuration_digest' => $digest,
                     'started_at' => now(), 'created_at' => now(), 'updated_at' => now(),
                 ]);
+                $runId = $streakRun ? null : $openRun();
                 $disk = Storage::disk('local');
                 $path = 'attendance-retry/'.$device->id.'-'.$digest.'.encrypted';
                 if ($disk->exists($path)) {
@@ -68,9 +85,10 @@ final class AttendanceSync extends Command
                         throw new \RuntimeException('retry_buffer_unavailable');
                     }
                 }
+                $runId ??= $openRun();
                 DB::table('attendance_sync_runs')->where('id', $runId)->update(['received' => count($payload['events'])]);
                 $counts = $importer->ingest($device, $payload['events'], $runId, $dryRun);
-                DB::transaction(function () use ($runId, $counts, $dryRun, $device): void {
+                DB::transaction(function () use ($runId, $counts, $dryRun, $device, $backoff): void {
                     DB::table('attendance_sync_runs')->where('id', $runId)->update($counts + [
                         'status' => 'success', 'ended_at' => now(), 'updated_at' => now(),
                     ]);
@@ -78,10 +96,16 @@ final class AttendanceSync extends Command
                     if (! $dryRun) {
                         $updates += ['last_synced_at' => now(), 'last_sync_success_at' => now()];
                     }
+                    if ($backoff) {
+                        $updates += ['sync_failure_count' => 0, 'sync_failed_at' => null, 'sync_retry_at' => null];
+                    }
                     DB::table('attendance_devices')->where('id', $device->id)->update($updates);
                     DB::table('attendance_devices')->where('id', $device->id)->where('sync_requested_at', $device->sync_requested_at)
                         ->update(['sync_requested_at' => null, 'sync_request_mode' => null]);
                 });
+                if ($backoff && (int) $device->sync_failure_count > 0) {
+                    Log::info('Attendance device sync recovered', ['device_id' => (int) $device->id, 'failed_attempts' => (int) $device->sync_failure_count]);
+                }
                 if (! $dryRun) {
                     $disk->delete($path);
                 }
@@ -91,23 +115,35 @@ final class AttendanceSync extends Command
                 $failed = true;
                 $safeCodes = ['host_not_approved', 'probe_timeout', 'pyzk_unavailable', 'reader_failed', 'invalid_snapshot_event', 'invalid_local_timestamp', 'ambiguous_local_timestamp', 'invalid_snapshot_configuration', 'import_not_authorized', 'retry_buffer_unavailable'];
                 $code = in_array($exception->getMessage(), $safeCodes, true) ? $exception->getMessage() : 'sync_failed';
+                $failures = (int) ($device->sync_failure_count ?? 0) + 1;
+                $retryIn = AttendanceDeviceBackoff::delay($failures, 60);
                 try {
                     if ($runId) {
                         DB::table('attendance_sync_runs')->where('id', $runId)->update(['status' => 'failed', 'failed' => count($payload['events'] ?? []), 'error' => $code, 'ended_at' => now(), 'updated_at' => now()]);
+                    } elseif ($streakRun && $streakRun->error === $code && (bool) $streakRun->dry_run === $dryRun) {
+                        DB::table('attendance_sync_runs')->where('id', $streakRun->id)->update(['attempts' => DB::raw('attempts + 1'), 'ended_at' => now(), 'updated_at' => now()]);
                     } else {
-                        DB::table('attendance_sync_runs')->insert(['device_id' => $device->id, 'status' => 'failed', 'failed' => count($payload['events'] ?? []), 'error' => $code, 'started_at' => now(), 'ended_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
+                        DB::table('attendance_sync_runs')->insert(['device_id' => $device->id, 'status' => 'failed', 'dry_run' => $dryRun, 'failed' => count($payload['events'] ?? []), 'error' => $code, 'started_at' => now(), 'ended_at' => now(), 'created_at' => now(), 'updated_at' => now()]);
                     }
-                    DB::table('attendance_devices')->where('id', $device->id)->update(['last_error' => $code, 'updated_at' => now()]);
+                    DB::table('attendance_devices')->where('id', $device->id)->update(['last_error' => $code, 'updated_at' => now()]
+                        + ($backoff ? ['sync_failure_count' => $failures, 'sync_failed_at' => now(), 'sync_retry_at' => now()->addSeconds($retryIn)] : []));
                 } catch (Throwable) {
                     // A persisted encrypted snapshot remains available for retry after a database outage.
                 }
-                $this->error("Device {$device->id}: {$code}; retry retained.");
+                // One log line when the device starts failing or its error changes, not one per attempt.
+                if (! $backoff || $failures === 1 || $device->last_error !== $code) {
+                    Log::warning('Attendance device sync failing', ['device_id' => (int) $device->id, 'code' => $code, 'retry_in_seconds' => $retryIn]
+                        + ($code === 'sync_failed' ? ['exception' => $exception] : []));
+                }
+                $this->warn("Device {$device->id}: {$code}; retry retained".($backoff ? " in {$retryIn}s" : '').'.');
             } finally {
                 $lock->release();
             }
         }
 
-        return $failed ? self::FAILURE : self::SUCCESS;
+        // A device that cannot be reached is recorded on the device and its run, and logged once above; failing the
+        // scheduled command as well would log a stack trace every minute. An operator's --device run still reports it.
+        return $failed && $this->option('device') ? self::FAILURE : self::SUCCESS;
     }
 
     /**

@@ -22,11 +22,18 @@ final class CustomFieldService
         'textarea' => 'نص طويل',
         'number' => 'رقم',
         'date' => 'تاريخ',
+        'datetime' => 'تاريخ ووقت',
         'boolean' => 'نعم / لا',
         'select' => 'قائمة من الثوابت',
     ];
 
     public const VISIBILITY_OPERATORS = ['equals', 'not_equals', 'filled', 'empty'];
+
+    /** How a «تاريخ ووقت» value is stored in value_text: the wall-clock time as entered, to the minute. */
+    public const DATETIME_FORMAT = 'Y-m-d H:i';
+
+    /** Forms accepted for a «تاريخ ووقت» value: what <input type="datetime-local"> sends, and the stored form. */
+    private const DATETIME_INPUT_FORMATS = 'Y-m-d\TH:i,Y-m-d H:i,Y-m-d\TH:i:s,Y-m-d H:i:s';
 
     public function __construct(private readonly MasterDataLookup $masterData) {}
 
@@ -82,24 +89,27 @@ final class CustomFieldService
 
     /**
      * Validate submitted values and return them normalized, keyed by code.
-     * Fields hidden by their visibility rule are ignored.
+     * Fields hidden by their visibility rule are ignored, and so are fields that belong to other actions
+     * ("action_codes" in visible_when) than the one being taken.
      *
      * @param  Collection<int, object>  $definitions
      * @param  array<string, mixed>  $input
      * @param  array<string, mixed>  $existing  values already stored, used by visibility rules
      * @param  bool  $enforceRequired  false when sending a request back, so required step fields may stay empty
+     * @param  ?string  $actionCode  the action being taken on the step; null on a form without actions
      * @return array<string, mixed>
      */
-    public function validate(Collection $definitions, array $input, array $existing = [], bool $enforceRequired = true): array
+    public function validate(Collection $definitions, array $input, array $existing = [], bool $enforceRequired = true, ?string $actionCode = null): array
     {
         $context = [...$existing, ...$input];
         $rules = [];
         $attributes = [];
-        $visible = $definitions->filter(fn (object $definition): bool => $this->isVisible($definition, $context));
+        $visible = $definitions->filter(fn (object $definition): bool => $this->isVisible($definition, $context, $actionCode));
 
         foreach ($visible as $definition) {
             $key = 'fields.'.$definition->code;
-            $rules[$key] = $this->rulesFor($definition, $enforceRequired);
+            // A field tied to this very action is required with it, also when the action sends the request back.
+            $rules[$key] = $this->rulesFor($definition, $enforceRequired || $this->actionCodes($definition) !== []);
             $attributes[$key] = $definition->label_ar;
         }
 
@@ -118,6 +128,15 @@ final class CustomFieldService
             }
 
             $clean[$definition->code] = $this->normalize($definition->field_type, $value);
+
+            // "not_future": a time that already happened (e.g. when the work was actually finished). A few minutes
+            // are allowed for a workstation clock that runs ahead of the server.
+            if ($definition->field_type === 'datetime' && $clean[$definition->code] !== null && ! empty($definition->validation['not_future'])
+                && $clean[$definition->code] > now()->addMinutes(5)->format(self::DATETIME_FORMAT)) {
+                throw ValidationException::withMessages([
+                    'fields.'.$definition->code => 'لا يُقبل وقت في المستقبل في '.$definition->label_ar.'.',
+                ]);
+            }
         }
 
         return $clean;
@@ -193,29 +212,185 @@ final class CustomFieldService
 
     /**
      * Human-readable values for display. Sensitive fields are left out unless allowed.
+     * "type" is the field type, so a page can format a date-time ("Y-m-d H:i") in its own locale.
      *
-     * @return list<array{code: string, label: string, value: ?string, step_code: ?string}>
+     * A field filled with one action of a step ("action_codes") is a record of that action, not a property of the
+     * request: once a timeline event of the request carries it (see actionRecord()), it is shown under that event
+     * and left out here. A value no event carries (a sensitive one, or one stored before events carried them)
+     * is still shown here.
+     *
+     * @return list<array{code: string, label: string, value: ?string, step_code: ?string, type: string}>
      */
     public function display(string $entityType, int $entityId, bool $includeSensitive): array
     {
-        return $this->storedValues($entityType, $entityId)
-            ->filter(fn (object $row): bool => $includeSensitive || ! $row->is_sensitive)
+        $rows = $this->storedValues($entityType, $entityId)
+            ->filter(fn (object $row): bool => $includeSensitive || ! $row->is_sensitive);
+        $scoped = $rows->filter(fn (object $row): bool => $this->actionCodes((object) ['visible_when' => $this->decode($row->visible_when)]) !== []);
+        if ($scoped->isNotEmpty() && $entityType === CustomFieldEntities::AIMS_REQUEST) {
+            $onEvents = $this->codesOnEvents($entityId);
+            $rows = $rows->reject(fn (object $row): bool => $scoped->contains('code', $row->code) && isset($onEvents[$row->code]));
+        }
+
+        return $rows
             ->map(fn (object $row): array => [
                 'code' => $row->code,
                 'label' => $row->label_ar,
                 'value' => $this->displayValue($row),
                 'step_code' => $row->step_code,
+                'type' => $row->field_type,
             ])
             ->values()
             ->all();
     }
 
     /**
-     * @param  array<string, mixed>  $context
+     * Stored values of the given definitions in the form their inputs take, keyed by code, to pre-fill a form
+     * that is opened again. Sensitive values are left out unless allowed; the stored value is kept either way.
+     * A field of one action ("action_codes") is never pre-filled: it records that action and is entered anew
+     * each time the action is taken (e.g. the worker and the completion time of a second field job).
+     *
+     * @param  Collection<int, object>  $definitions
+     * @return array<string, mixed>
      */
-    public function isVisible(object $definition, array $context): bool
+    public function formValues(string $entityType, int $entityId, Collection $definitions, bool $includeSensitive = false): array
+    {
+        $allowed = $definitions
+            ->filter(fn (object $definition): bool => ($includeSensitive || ! $definition->is_sensitive) && $this->actionCodes($definition) === [])
+            ->pluck('code')->flip();
+
+        return array_filter(
+            array_intersect_key($this->context($entityType, $entityId), $allowed->all()),
+            fn ($value): bool => $value !== null,
+        );
+    }
+
+    /**
+     * What an action recorded in its own fields, to keep with its timeline event (workflow_events.metadata.fields):
+     * code => {label, value (as displayed), type}. Only fields tied to this action ("action_codes"), only values
+     * that were submitted, and never a sensitive field.
+     *
+     * @param  Collection<int, object>  $definitions  the step's definitions
+     * @param  array<string, mixed>  $values  output of validate() for this action
+     * @return array<string, array{label: string, value: string, type: string}>
+     */
+    public function actionRecord(Collection $definitions, array $values, string $actionCode): array
+    {
+        $record = [];
+        foreach ($definitions as $definition) {
+            $value = $values[$definition->code] ?? null;
+            if ($value === null || $definition->is_sensitive || ! in_array($actionCode, $this->actionCodes($definition), true)) {
+                continue;
+            }
+            $row = (object) [
+                ...$this->columnsFor($definition->field_type, $value),
+                'field_type' => $definition->field_type,
+                'master_label' => $definition->field_type === 'select' ? DB::table('master_data_values')->where('id', (int) $value)->value('name_ar') : null,
+            ];
+            $shown = $this->displayValue($row);
+            if ($shown !== null && $shown !== '') {
+                $record[$definition->code] = ['label' => (string) $definition->label_ar, 'value' => $shown, 'type' => (string) $definition->field_type];
+            }
+        }
+
+        return $record;
+    }
+
+    /**
+     * The fields an event recorded (metadata.fields written from actionRecord()), in a list for a page.
+     *
+     * @return list<array{code: string, label: string, value: string, type: string}>
+     */
+    public static function eventFields(mixed $metadata): array
+    {
+        $decoded = is_string($metadata) && $metadata !== '' ? json_decode($metadata, true) : $metadata;
+        $fields = is_array($decoded) && is_array($decoded['fields'] ?? null) ? $decoded['fields'] : [];
+        $list = [];
+        foreach ($fields as $code => $field) {
+            if (is_string($code) && is_array($field) && is_scalar($field['value'] ?? null) && is_scalar($field['label'] ?? null)) {
+                $list[] = ['code' => $code, 'label' => (string) $field['label'], 'value' => (string) $field['value'], 'type' => (string) ($field['type'] ?? 'text')];
+            }
+        }
+
+        return $list;
+    }
+
+    /**
+     * Clears the current value of the given fields of a request, keeping the row (the value columns become null).
+     * Used when a pass is cancelled or sent back: what it recorded stays in its timeline events and is no longer
+     * presented as the request's current state. Must run inside the caller's transaction.
+     *
+     * @param  list<string>  $codes
+     * @return list<string> the codes that held a value and were cleared
+     */
+    public function clearValues(string $entityType, int $entityId, string $scopeKey, array $codes, int $actorId): array
+    {
+        if ($codes === []) {
+            return [];
+        }
+        $rows = DB::table('custom_field_values as v')
+            ->join('custom_field_definitions as d', 'd.id', '=', 'v.definition_id')
+            ->where('v.entity_type', $entityType)->where('v.entity_id', $entityId)
+            ->where('d.entity_type', $entityType)->whereIn('d.scope_key', array_values(array_unique(['', $scopeKey])))
+            ->whereIn('d.code', $codes)
+            ->where(fn (Builder $query) => $query->whereNotNull('v.value_text')->orWhereNotNull('v.value_number')->orWhereNotNull('v.value_date')
+                ->orWhereNotNull('v.value_boolean')->orWhereNotNull('v.value_master_id'))
+            ->lockForUpdate()
+            ->get(['v.id', 'd.code']);
+        if ($rows->isEmpty()) {
+            return [];
+        }
+        DB::table('custom_field_values')->whereIn('id', $rows->pluck('id'))->update([
+            ...$this->columnsFor('text', null), 'updated_by' => $actorId, 'updated_at' => now(),
+        ]);
+
+        return $rows->pluck('code')->unique()->values()->all();
+    }
+
+    /**
+     * Codes of the fields that timeline events of a generic request carry.
+     *
+     * @return array<string, true>
+     */
+    private function codesOnEvents(int $requestId): array
+    {
+        $codes = [];
+        $metadata = DB::table('workflow_events as e')
+            ->join('workflow_instances as i', 'i.id', '=', 'e.workflow_instance_id')
+            ->where('i.subject_type', CustomFieldEntities::AIMS_REQUEST)->where('i.subject_id', $requestId)
+            ->whereNotNull('e.workflow_transition_id')->whereNotNull('e.metadata')
+            ->pluck('e.metadata');
+        foreach ($metadata as $json) {
+            foreach (self::eventFields($json) as $field) {
+                $codes[$field['code']] = true;
+            }
+        }
+
+        return $codes;
+    }
+
+    /**
+     * The action codes a field belongs to ("action_codes" in visible_when); empty when it belongs to the whole step.
+     *
+     * @return list<string>
+     */
+    public function actionCodes(object $definition): array
+    {
+        $codes = is_array($definition->visible_when ?? null) ? ($definition->visible_when['action_codes'] ?? null) : null;
+
+        return is_array($codes) ? array_values(array_filter($codes, fn ($code): bool => is_string($code) && $code !== '')) : [];
+    }
+
+    /**
+     * @param  array<string, mixed>  $context
+     * @param  ?string  $actionCode  the action being taken; a field tied to actions is hidden when none of them is taken
+     */
+    public function isVisible(object $definition, array $context, ?string $actionCode = null): bool
     {
         $rule = is_array($definition->visible_when ?? null) ? $definition->visible_when : null;
+        $actionCodes = $this->actionCodes($definition);
+        if ($actionCodes !== [] && ! in_array($actionCode, $actionCodes, true)) {
+            return false;
+        }
         if (! $rule || empty($rule['field'])) {
             return true;
         }
@@ -248,6 +423,7 @@ final class CustomFieldService
                 isset($validation['max']) ? 'max:'.$validation['max'] : null,
             ])),
             'date' => [$required ? 'required' : 'nullable', 'date'],
+            'datetime' => [$required ? 'required' : 'nullable', 'date_format:'.self::DATETIME_INPUT_FORMATS],
             // A required yes/no field is a confirmation the user must tick.
             'boolean' => [$required ? 'accepted' : 'nullable', 'boolean'],
             'select' => [$required ? 'required' : 'nullable', 'integer'],
@@ -266,6 +442,8 @@ final class CustomFieldService
             'boolean' => filter_var($value, FILTER_VALIDATE_BOOLEAN),
             'select' => (int) $value,
             'date' => substr((string) $value, 0, 10),
+            // Validated as "Y-m-d", a "T" or a space, then "H:i": stored as DATETIME_FORMAT, seconds dropped.
+            'datetime' => str_replace('T', ' ', substr(trim((string) $value), 0, 16)),
             default => trim((string) $value),
         };
     }
@@ -301,7 +479,7 @@ final class CustomFieldService
             ->orderBy('d.sort_order')
             ->orderBy('d.id')
             ->get([
-                'd.code', 'd.label_ar', 'd.field_type', 'd.is_sensitive', 'd.step_code',
+                'd.code', 'd.label_ar', 'd.field_type', 'd.is_sensitive', 'd.step_code', 'd.visible_when',
                 'v.value_text', 'v.value_number', 'v.value_date', 'v.value_boolean', 'v.value_master_id',
                 'm.name_ar as master_label', 'm.code as master_code',
             ]);

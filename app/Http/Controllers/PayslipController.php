@@ -3,11 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Services\Finance\FinancePayslips;
-use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response as HttpResponse;
 use Inertia\Inertia;
 use Inertia\Response;
+use Symfony\Component\HttpFoundation\Response as SymfonyResponse;
 
 /** «طلب قسيمة راتب» in «طلباتي»: the employee asks for one month and views only their own published slip. */
 final class PayslipController extends Controller
@@ -18,10 +18,9 @@ final class PayslipController extends Controller
     {
         $user = $request->user();
         abort_unless($user?->is_active, 403);
-        $months = collect(range(0, 23))->map(fn (int $i): string => now()->startOfMonth()->subMonths($i)->format('Y-m'))->all();
 
         return Inertia::render('Requests/Payslip', [
-            'months' => $months,
+            'months' => $this->payslips->availablePeriods($user),
             'linked' => $this->payslips->employeeOf($user) !== null,
             'requests' => $this->payslips->requestsOf($user)->map(fn (object $r): array => ['reference' => $r->reference, 'period' => $r->period,
                 'state' => $r->state, 'stateLabel' => FinancePayslips::STATES[$r->state][0] ?? $r->state, 'tone' => FinancePayslips::STATES[$r->state][1] ?? 'muted',
@@ -29,14 +28,13 @@ final class PayslipController extends Controller
         ]);
     }
 
-    public function store(Request $request): RedirectResponse
+    public function store(Request $request): SymfonyResponse
     {
         $d = $request->validate(['period' => 'required|date_format:Y-m', 'note' => 'nullable|string|max:1000'], [], ['period' => 'الشهر']);
         $result = $this->payslips->request($request->user(), $d['period'], $d['note'] ?? null);
 
-        // The request's state is shown in the list below the form; the notice repeats it.
-        return redirect()->route('payslips.create')->with('success',
-            ($result->reference.': '.FinancePayslips::STATES[$result->state][0]).($result->state === 'awaiting_payroll' ? '. سنُشعرك فور نشر المسير.' : '.'));
+        // The print view is plain HTML, so Inertia must perform a full browser navigation.
+        return Inertia::location(route('payslips.show', $result->slip_reference, false));
     }
 
     /** Rendered on demand from the published run; no file is stored and the page is never cached. */

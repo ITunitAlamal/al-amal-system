@@ -37,9 +37,13 @@ final class RentalTerminationWorkflow implements WorkflowSubject
             if (! $case->outcome_unit_status) {
                 throw ValidationException::withMessages(['workflow' => 'سجّل في محضر الاستلام حالة العين بعد الإخلاء قبل الإتمام.']);
             }
-            $reading = DB::table('aims_rental_meter_readings')->where('case_id', $case->id)->where('purpose', 'eviction')->exists();
-            if (! $reading && ! $this->contracts->hasDocument('case', (int) $case->id, 'eviction_record')) {
-                throw ValidationException::withMessages(['workflow' => 'أرفق محضر الاستلام والإخلاء أو سجّل قراءة العداد عند الإخلاء قبل الإتمام.']);
+            // Both the eviction record and, for a metered contract, the eviction reading of every unit (approved document §5/§9).
+            if (! $this->contracts->hasDocument('case', (int) $case->id, 'eviction_record')) {
+                throw ValidationException::withMessages(['workflow' => 'أرفق محضر الاستلام والإخلاء قبل الإتمام.']);
+            }
+            $missing = $this->contracts->unitsWithoutReading((int) $case->contract_id, 'eviction', 'case_id', (int) $case->id);
+            if ($missing !== []) {
+                throw ValidationException::withMessages(['workflow' => 'سجّل قراءة العداد عند الإخلاء لكل عين قبل الإتمام؛ ناقصة: '.implode('، ', $missing).'.']);
             }
         }
     }

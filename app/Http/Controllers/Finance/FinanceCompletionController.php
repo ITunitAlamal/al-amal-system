@@ -10,9 +10,11 @@ use App\Services\Finance\FinanceOperations;
 use App\Services\Finance\FinanceReports;
 use App\Services\Finance\FinanceSettlementService;
 use App\Services\Finance\FinanceSod;
+use App\Services\Finance\FinanceSourceBridge;
 use App\Services\Finance\StockExact as S;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
 
@@ -59,13 +61,14 @@ final class FinanceCompletionController extends Controller
         $this->require($r, 'finance.view');
         $tables = ['treasuries' => 'finance_treasuries', 'budgets' => 'finance_budget_lines', 'suppliers' => 'finance_suppliers', 'warehouses' => 'finance_warehouses', 'items' => 'finance_stock_items', 'funds' => 'finance_restricted_funds', 'transactions' => 'finance_transactions', 'purchases' => 'finance_purchase_requests', 'advances' => 'finance_advances', 'payroll' => 'finance_payroll_batches', 'receivables' => 'finance_receivables', 'transfers' => 'finance_internal_transfers', 'reconciliations' => 'finance_reconciliations', 'counts' => 'finance_inventory_counts', 'invoices' => 'finance_purchase_invoices'];
         $visibility = [
-            'treasuries' => ['finance.treasury.manage', 'finance.transaction.draft', 'finance.transaction.execute', 'finance.transfer.execute'],
-            'budgets' => ['finance.budget.manage', 'finance.budget.transfer', 'finance.procurement.manage', 'finance.transaction.draft'],
+            'treasuries' => ['finance.treasury.manage', 'finance.payment.draft', 'finance.payment.execute', 'finance.receipt.draft', 'finance.receipt.execute', 'finance.transfer.execute'],
+            'budgets' => ['finance.budget.manage', 'finance.budget.transfer', 'finance.procurement.manage', 'finance.payment.draft'],
             'suppliers' => ['finance.procurement.manage', 'finance.procurement.review'],
             'warehouses' => ['finance.warehouse.manage', 'finance.stock.receive', 'finance.stock.issue'],
             'items' => ['finance.warehouse.manage', 'finance.stock.receive', 'finance.stock.issue'],
             'funds' => ['finance.fund.manage', 'finance.fund.approve'],
-            'transactions' => ['finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute'],
+            'transactions' => ['finance.payment.draft', 'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute',
+                'finance.receipt.draft', 'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute'],
             'purchases' => ['finance.procurement.manage', 'finance.procurement.review'],
             'advances' => ['finance.advance.manage'],
             'payroll' => ['finance.payroll.manage', 'finance.payroll.approve'],
@@ -73,7 +76,7 @@ final class FinanceCompletionController extends Controller
             'transfers' => ['finance.transfer.execute', 'finance.transfer.approve'],
             'reconciliations' => ['finance.reconcile'],
             'counts' => ['finance.stock.count', 'finance.stock.count.approve'],
-            'invoices' => ['finance.purchase.invoice', 'finance.procurement.review'],
+            'invoices' => ['finance.purchase.invoice', 'finance.procurement.review', 'finance.payment.record', 'finance.payment.draft'],
         ];
         // In the documentary cycle the books (funds, budgets, vouchers, payroll...) are kept in the external software.
         $hidden = $this->guard->documentaryMode() ? ['treasuries', 'budgets', 'funds', 'transactions', 'advances', 'payroll', 'receivables', 'transfers', 'reconciliations'] : [];
@@ -92,7 +95,15 @@ final class FinanceCompletionController extends Controller
         $summary = [];
         foreach ($tables as $k => $t) {
             if ($can($k)) {
-                $summary[$k] = DB::table($t)->count();
+                $query = DB::table($t);
+                if ($k === 'transactions') {
+                    $kinds = array_values(array_filter(['payment', 'receipt'], fn (string $kind): bool => $this->guard->canViewTransactions($r->user(), $kind)));
+                    $query->whereIn('kind', $kinds);
+                    foreach ($kinds as $kind) {
+                        $summary[$kind === 'payment' ? 'payments' : 'receipts'] = (clone $query)->where('kind', $kind)->count();
+                    }
+                }
+                $summary[$k] = $query->count();
             }
         }
         $lookups = [];
@@ -132,13 +143,13 @@ final class FinanceCompletionController extends Controller
                 $alerts[] = ['title' => 'أصناف تحت الحد الأدنى في المخازن', 'count' => $low];
             }
         }
-        $due = $can('receivables') ? DB::table('finance_receivables')->whereDate('due_on', '<', now()->toDateString())->limit(200)->get(['id', 'amount']) : collect();
+        // Cancelled receivables are not arrears; what stays open counts adjustments and, for rent, the rentals ledger.
+        $due = $can('receivables') ? DB::table('finance_receivables')->whereDate('due_on', '<', now()->toDateString())->whereNull('cancelled_at')->limit(200)
+            ->get(['id', 'amount', 'cancelled_at', 'source_module', 'source_reference']) : collect();
         $unpaid = 0;
+        $bridge = app(FinanceSourceBridge::class);
         foreach ($due as $dueRow) {
-            $allocated = 0;
-            foreach (DB::table('finance_payment_allocations')->where('receivable_module', 'finance')->where('receivable_id', (string) $dueRow->id)->whereNull('reversed_by_transaction_id')->get(['amount']) as $a) {
-                $allocated += $this->cents((string) $a->amount);
-            }if ($allocated < $this->cents((string) $dueRow->amount)) {
+            if ($bridge->openCents($dueRow) > 0) {
                 $unpaid++;
             }
         }
@@ -336,18 +347,36 @@ final class FinanceCompletionController extends Controller
     public function purchaseReceipt(Request $r, int $orderId)
     {
         $actor = $this->require($r, 'finance.purchase.receive');
-        $d = $r->validate(['notes' => 'nullable|string|max:2000', 'items' => 'required|array|min:1', 'items.*.purchase_item_id' => 'required|exists:finance_purchase_items,id', 'items.*.stock_item_id' => 'required|exists:finance_stock_items,id', 'items.*.warehouse_id' => 'required|exists:finance_warehouses,id', 'items.*.quantity' => 'required|regex:/^\d{1,9}(\.\d{1,3})?$/', 'items.*.unit_cost' => 'required|regex:/^\d{1,9}(\.\d{1,4})?$/']);
+        $d = $r->validate(['notes' => 'nullable|string|max:2000', 'items' => 'required|array|min:1', 'items.*.purchase_item_id' => 'required|exists:finance_purchase_items,id', 'items.*.stock_item_id' => 'required|exists:finance_stock_items,id', 'items.*.warehouse_id' => 'required|exists:finance_warehouses,id', 'items.*.quantity' => 'required|regex:/^\d{1,9}(\.\d{1,3})?$/', 'items.*.unit_cost' => 'required|regex:/^\d{1,9}(\.\d{1,4})?$/',
+            // SRS 3.7.2 «تسجيل المقبول والمرفوض والنقص»: quantity is what is accepted into stock; a rejected quantity
+            // is documented with its reason and never enters stock (ACC-15).
+            'items.*.rejected_qty' => 'nullable|regex:/^\d{1,9}(\.\d{1,3})?$/', 'items.*.rejection_reason' => 'nullable|string|max:500'],
+            [], ['items.*.rejected_qty' => 'الكمية المرفوضة', 'items.*.rejection_reason' => 'سبب الرفض']);
+        $rejectionColumns = Schema::hasColumn('finance_purchase_receipt_items', 'rejected_qty');
+        foreach ($d['items'] as $index => $i) {
+            $rejected = S::scaled((string) ($i['rejected_qty'] ?? '0') ?: '0', 3);
+            if ($rejected > 0 && ! $rejectionColumns) {
+                $this->fail('items', 'تسجيل الكمية المرفوضة غير متاح قبل تحديث قاعدة البيانات.');
+            }
+            if ($rejected > 0 && mb_strlen(trim((string) ($i['rejection_reason'] ?? ''))) < 3) {
+                $this->fail("items.$index.rejection_reason", 'اذكر سبب رفض الكمية المرفوضة.');
+            }
+            if ($rejected === 0 && S::scaled((string) $i['quantity'], 3) === 0) {
+                $this->fail("items.$index.quantity", 'سجّل كمية مقبولة أو مرفوضة للبند.');
+            }
+        }
+        // Not the order's issuer, the request's creator or the employee who asked for it from «طلباتي».
+        $sod = app(FinanceSod::class);
+        $sod->assertDistinct($actor, $sod->orderOrigin($orderId), 'استلام أصناف الأمر', 'purchase_order', $orderId);
 
-        return DB::transaction(function () use ($orderId, $actor, $d) {
+        return DB::transaction(function () use ($orderId, $actor, $d, $sod) {
             $order = DB::table('finance_purchase_orders')->lockForUpdate()->find($orderId);
             abort_unless($order, 404);
             if (! in_array($order->state, ['issued', 'partial_received'], true)) {
                 $this->fail('order', 'الأمر غير قابل للاستلام');
             }
             $purchase = DB::table('finance_purchase_requests')->find($order->purchase_request_id);
-            if ((int) $order->created_by === $actor || (int) $purchase->created_by === $actor) {
-                $this->fail('actor', 'لا يجوز لمن أنشأ أمر الشراء استلامه');
-            }
+            $sod->assertDistinct($actor, $sod->orderOrigin($orderId), 'استلام أصناف الأمر', 'purchase_order', $orderId, false);
             $seen = [];
             foreach ($d['items'] as $i) {
                 $line = $i['purchase_item_id'];
@@ -363,11 +392,28 @@ final class FinanceCompletionController extends Controller
                 if (S::scaled((string) $already, 3) + S::scaled($i['quantity'], 3) > S::scaled((string) $source->quantity, 3)) {
                     $this->fail('quantity', 'الاستلام يتجاوز الكمية المطلوبة');
                 }
+                // A purchase line keeps the stock item its first accepted delivery entered (ACC-15): a later partial
+                // delivery of the same line cannot land on another item.
+                $mapped = DB::table('finance_purchase_receipt_items as x')->join('finance_purchase_receipts as y', 'x.receipt_id', '=', 'y.id')
+                    ->where('y.order_id', $orderId)->where('x.purchase_item_id', $line)->where('x.quantity', '>', 0)->orderBy('x.id')->value('x.stock_item_id');
+                if ($mapped !== null && (int) $mapped !== (int) $i['stock_item_id']) {
+                    $this->fail('items', 'بند الشراء «'.$source->item_name.'» استُلم من قبل على صنف مخزني آخر؛ استلم الدفعة على الصنف نفسه.');
+                }
             }
-            $id = DB::table('finance_purchase_receipts')->insertGetId(['order_id' => $orderId, 'number' => 'GRN-'.strtoupper(bin2hex(random_bytes(8))), 'state' => 'received', 'notes' => $d['notes'] ?? null, 'received_by' => $actor] + $this->stamp());
+            $accepted = collect($d['items'])->sum(fn (array $i): int => S::scaled((string) $i['quantity'], 3));
+            $rejectedAny = collect($d['items'])->contains(fn (array $i): bool => S::scaled((string) ($i['rejected_qty'] ?? '0') ?: '0', 3) > 0);
+            $id = DB::table('finance_purchase_receipts')->insertGetId(['order_id' => $orderId, 'number' => 'GRN-'.strtoupper(bin2hex(random_bytes(8))), 'state' => $accepted === 0 ? 'rejected' : 'received', 'notes' => $d['notes'] ?? null, 'received_by' => $actor] + $this->stamp());
             foreach ($d['items'] as $i) {
-                DB::table('finance_purchase_receipt_items')->insert($i + ['receipt_id' => $id] + $this->stamp());
-                S::movement(['warehouse_id' => $i['warehouse_id'], 'stock_item_id' => $i['stock_item_id'], 'kind' => 'receipt', 'quantity' => $i['quantity'], 'unit_cost' => $i['unit_cost'], 'reference_type' => 'purchase_receipt', 'reference_id' => (string) $id, 'note' => 'استلام أمر شراء'], $actor);
+                $rejected = S::scaled((string) ($i['rejected_qty'] ?? '0') ?: '0', 3);
+                $row = ['purchase_item_id' => $i['purchase_item_id'], 'warehouse_id' => $i['warehouse_id'], 'stock_item_id' => $i['stock_item_id'],
+                    'quantity' => S::decimal(S::scaled((string) $i['quantity'], 3), 3), 'unit_cost' => $i['unit_cost']];
+                if ($rejected > 0) {
+                    $row += ['rejected_qty' => S::decimal($rejected, 3), 'rejection_reason' => trim((string) $i['rejection_reason'])];
+                }
+                DB::table('finance_purchase_receipt_items')->insert($row + ['receipt_id' => $id] + $this->stamp());
+                if (S::scaled((string) $i['quantity'], 3) > 0) {
+                    S::movement(['warehouse_id' => $i['warehouse_id'], 'stock_item_id' => $i['stock_item_id'], 'kind' => 'receipt', 'quantity' => $i['quantity'], 'unit_cost' => $i['unit_cost'], 'reference_type' => 'purchase_receipt', 'reference_id' => (string) $id, 'note' => 'استلام أمر شراء'], $actor);
+                }
             }
             $pending = false;
             foreach (DB::table('finance_purchase_items')->where('purchase_request_id', $purchase->id)->get() as $line) {
@@ -376,8 +422,10 @@ final class FinanceCompletionController extends Controller
                     $pending = true;
                 }
             }
-            DB::table('finance_purchase_orders')->where('id', $orderId)->update(['state' => $pending ? 'partial_received' : 'received', 'updated_at' => now()]);
-            $this->guard->audit('goods_receipt', $id, $actor, 'receive');
+            // A delivery rejected in full documents the rejection and leaves an order with nothing accepted as issued.
+            $acceptedSoFar = (float) DB::table('finance_purchase_receipt_items as x')->join('finance_purchase_receipts as y', 'x.receipt_id', '=', 'y.id')->where('y.order_id', $orderId)->sum('x.quantity') > 0;
+            DB::table('finance_purchase_orders')->where('id', $orderId)->update(['state' => $pending ? ($acceptedSoFar ? 'partial_received' : $order->state) : 'received', 'updated_at' => now()]);
+            $this->guard->audit('goods_receipt', $id, $actor, $rejectedAny ? 'receive_with_rejection' : 'receive');
 
             return response()->json(['id' => $id, 'partial' => $pending], 201);
         });
@@ -387,6 +435,7 @@ final class FinanceCompletionController extends Controller
     {
         $actor = $this->require($r, 'finance.purchase.invoice');
         $d = $r->validate(['invoice_no' => 'required|string|max:80', 'amount' => 'required|regex:/^\d{1,12}(\.\d{1,2})?$/', 'invoice_on' => 'required|date']);
+        $d['invoice_no'] = trim($d['invoice_no']);
         if ($this->cents($d['amount']) <= 0) {
             $this->fail('amount', 'قيمة الفاتورة غير صالحة');
         }
@@ -400,9 +449,31 @@ final class FinanceCompletionController extends Controller
             if (! in_array($order->state, ['partial_received', 'received'], true)) {
                 $this->fail('order', 'لم يتم استلام مواد الأمر بعد');
             }
+            // A supplier's invoice is recorded once, whatever order it is entered on; the supplier row serializes
+            // concurrent entries (the database trigger of 2026_11_30_000027 refuses it too).
+            DB::table('finance_suppliers')->where('id', $order->supplier_id)->lockForUpdate()->first();
+            $duplicate = DB::table('finance_purchase_invoices as i')->join('finance_purchase_orders as o', 'o.id', '=', 'i.order_id')
+                ->where('o.supplier_id', $order->supplier_id)->whereRaw('lower(btrim(i.invoice_no)) = lower(btrim(?))', [$d['invoice_no']])->value('o.number');
+            if ($duplicate !== null) {
+                $this->fail('invoice_no', 'فاتورة المورد رقم «'.$d['invoice_no'].'» مسجلة من قبل على أمر الشراء '.$duplicate.'؛ لا تُسجَّل الفاتورة نفسها مرتين.');
+            }
             $receivedValue = 0;
-            foreach (DB::table('finance_purchase_receipt_items as ri')->join('finance_purchase_receipts as gr', 'gr.id', '=', 'ri.receipt_id')->where('gr.order_id', $orderId)->get(['ri.quantity', 'ri.unit_cost']) as $ri) {
+            $lines = DB::table('finance_purchase_receipt_items as ri')->join('finance_purchase_receipts as gr', 'gr.id', '=', 'ri.receipt_id')->where('gr.order_id', $orderId)
+                ->get(['ri.receipt_id', 'ri.warehouse_id', 'ri.stock_item_id', 'ri.quantity', 'ri.unit_cost']);
+            foreach ($lines as $ri) {
                 $receivedValue += M::lineCents((string) $ri->quantity, (string) $ri->unit_cost);
+            }
+            // Goods sent back to the supplier against this order's receipts are not invoiced (ACC-15): each return is
+            // valued at the unit cost its receipt line recorded.
+            $returns = DB::table('finance_stock_movements')->where('kind', 'return_out')->where('reference_type', 'purchase_receipt')
+                ->whereIn('reference_id', $lines->pluck('receipt_id')->unique()->map(fn ($v): string => (string) $v)->values()->all())
+                ->get(['reference_id', 'warehouse_id', 'stock_item_id', 'quantity']);
+            foreach ($returns as $back) {
+                $source = $lines->first(fn (object $ri): bool => (string) $ri->receipt_id === (string) $back->reference_id
+                    && (int) $ri->warehouse_id === (int) $back->warehouse_id && (int) $ri->stock_item_id === (int) $back->stock_item_id);
+                if ($source) {
+                    $receivedValue -= M::lineCents((string) $back->quantity, (string) $source->unit_cost);
+                }
             }
             $existing = DB::table('finance_purchase_invoices')->where('order_id', $orderId)->get();
             $total = 0;
@@ -590,10 +661,10 @@ final class FinanceCompletionController extends Controller
         [$table,$cols,$filter,$value] = $map[$module];
         $restricted = ['payroll' => ['finance.payroll.manage'], 'stock' => ['finance.stock.receive', 'finance.stock.issue', 'finance.warehouse.manage'], 'advances' => ['finance.advance.manage'],
             'receivables' => ['finance.receivable.manage'], 'purchases' => ['finance.procurement.manage', 'finance.procurement.review'], 'budgets' => ['finance.budget.manage'],
-            'orders' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.purchase.receive'], 'invoices' => ['finance.purchase.invoice', 'finance.procurement.review'],
+            'orders' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.purchase.receive'], 'invoices' => ['finance.purchase.invoice', 'finance.procurement.review', 'finance.payment.record'],
             // Vouchers belong to the books: in the documentary cycle they are kept in the external accounting software.
-            'receipts' => ['finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute'],
-            'payments' => ['finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute']];
+            'receipts' => ['finance.receipt.draft', 'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute'],
+            'payments' => ['finance.payment.draft', 'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute']];
         if (isset($restricted[$module]) && ! collect($restricted[$module])->contains(fn (string $permission): bool => $this->guard->allows($r->user(), $permission))) {
             abort(403, 'لا تملك صلاحية هذا التقرير');
         }
@@ -709,9 +780,10 @@ final class FinanceCompletionController extends Controller
         $actor = $this->require($r, 'finance.reversal.request');
         $d = $r->validate(['reason' => 'required|string|min:10|max:2000']);
 
-        return DB::transaction(function () use ($id, $actor, $d) {
+        return DB::transaction(function () use ($id, $actor, $d, $r) {
             $tx = DB::table('finance_transactions')->where('id', $id)->lockForUpdate()->first();
             abort_unless($tx, 404);
+            abort_unless($this->guard->canViewTransactions($r->user(), $tx->kind), 403);
             if ($tx->state !== 'executed' || $tx->reversal_of_id) {
                 $this->fail('transaction', 'السند غير قابل للعكس');
             }if (DB::table('finance_internal_transfers')->where('in_transaction_id', $id)->orWhere('out_transaction_id', $id)->exists()) {
@@ -787,7 +859,7 @@ final class FinanceCompletionController extends Controller
 
     public function invoicePaymentDraft(Request $r, int $invoiceId)
     {
-        $actor = $this->require($r, 'finance.transaction.draft');
+        $actor = $this->require($r, 'finance.payment.draft');
         $d = $r->validate(['treasury_id' => 'required|exists:finance_treasuries,id', 'amount' => 'required|regex:/^\d{1,12}(\.\d{1,2})?$/', 'effective_on' => 'required|date']);
 
         return DB::transaction(function () use ($invoiceId, $actor, $d) {
@@ -894,6 +966,6 @@ final class FinanceCompletionController extends Controller
         abort_unless($u && $u->is_active, 403);
         abort_unless($approvals->isApprover($u), 403);
 
-        return Inertia::render('Finance/Approvals', ['queue' => $approvals->entries($u), 'board' => $approvals->isBoardApprover($u)]);
+        return Inertia::render('Finance/Approvals', ['queue' => $approvals->entries($u), 'board' => $approvals->isBoardApprover($u), 'cancellable' => $approvals->cancellable($u)]);
     }
 }

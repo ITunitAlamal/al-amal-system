@@ -5,6 +5,7 @@ namespace App\Services\Dashboard\Boards;
 use App\Models\User;
 use App\Services\Configuration\SystemReadiness;
 use App\Services\Finance\FinanceApprovalQueue;
+use App\Services\Finance\FinanceGuard;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\Progress\TransactionTracker;
 use App\Services\Rentals\RentalsDashboard;
@@ -37,7 +38,7 @@ final class ServiceBoards
                 BoardKit::metric('الموظفون الفعّالون', (int) $main['employees']['value'], null, detail: $main['employees']['detail'], url: $main['employees']['url']),
                 $secondary['review']['value'] === null ? BoardKit::unavailable('حالات حضور تحتاج مراجعة اليوم', $secondary['review']['detail'])
                     : BoardKit::metric('حالات حضور تحتاج مراجعة اليوم', (int) $secondary['review']['value'], 'down', detail: 'تأخير، خروج مبكر، بصمات ناقصة…', url: $secondary['review']['url']),
-                BoardKit::metric('طلبات خدمات وصيانة مفتوحة', (int) $main['services']['value'], 'down', detail: $main['services']['detail'], url: '/hr-services#services'),
+                BoardKit::metric('طلبات خدمات وصيانة مفتوحة', (int) $main['services']['value'], 'down', detail: $main['services']['detail'], url: $main['services']['url']),
             ],
             'trend' => BoardKit::trend('أيام الدوام أسبوعيًا: حضور مقابل حالات تحتاج مراجعة', 'من نتائج الدوام اليومية المحتسبة. الحالات = تأخير أو خروج مبكر أو بصمات ناقصة أو جدول غير مكتمل؛ البصمة الناقصة سؤال للمراجعة وليست غيابًا.', [
                 ['label' => 'حضور', 'values' => BoardKit::weekly((clone $results)->whereIn('status', ['present', 'late', 'early', 'exempt_punch']), 'work_date')],
@@ -48,7 +49,7 @@ final class ServiceBoards
                     ->groupBy('d.name')->selectRaw("COALESCE(d.name, 'دون قسم') AS label, count(*) AS value")->get()->map(fn (object $r): array => ['label' => $r->label, 'value' => (int) $r->value])->all()),
             'table' => BoardKit::table('إجازات تنتظر الإجراء', [['key' => 'subject', 'label' => 'الموظف'], ['key' => 'type', 'label' => 'النوع والقسم'], ['key' => 'date', 'label' => 'الفترة'], ['key' => 'step', 'label' => 'المرحلة']],
                 $rows, 'لا توجد إجازات معلقة.', route('leaves.index', [], false)),
-            'actions' => [['label' => 'لوحة الموارد البشرية', 'url' => '/hr-services', 'icon' => 'users'], ['label' => 'الدوام', 'url' => route('admin.attendance.index', [], false), 'icon' => 'calendar']],
+            'actions' => [['label' => 'متابعة القسم', 'url' => route('hr.dashboard', [], false), 'icon' => 'chart'], ['label' => 'الدوام', 'url' => route('admin.attendance.index', [], false), 'icon' => 'calendar']],
         ];
     }
 
@@ -58,7 +59,10 @@ final class ServiceBoards
         $approver = $queue->isApprover($user);
         $counts = $approver ? $queue->counts($user) : [];
         $entries = $approver ? $queue->entries($user, 30) : [];
-        $executed = DB::table('finance_transactions')->whereNotNull('executed_at')->whereNull('reversal_of_id');
+        $guard = app(FinanceGuard::class);
+        $kinds = array_values(array_filter(['payment', 'receipt'], fn (string $kind): bool => $guard->canViewTransactions($user, $kind)));
+        $transactions = DB::table('finance_transactions')->whereIn('kind', $kinds);
+        $executed = (clone $transactions)->whereNotNull('executed_at')->whereNull('reversal_of_id');
         $hasBooks = (clone $executed)->exists();
         $rows = array_map(fn (array $e): array => ['cells' => ['reference' => '#'.$e['id'], 'type' => $e['label'], 'amount' => $e['amount'] !== null ? number_format((float) $e['amount'], 2) : '—'],
             'status' => ['label' => 'بانتظار اعتمادك', 'tone' => 'warning'], 'url' => $e['url'], 'action' => 'مراجعة', 'overdue' => false], $entries);
@@ -68,13 +72,15 @@ final class ServiceBoards
             'hero' => $approver ? BoardKit::metric('اعتمادات مالية بانتظاري', array_sum($counts), 'down', detail: $counts ? collect($counts)->map(fn ($n, $l) => $l.' '.$n)->implode(' · ') : 'لا شيء بانتظارك', url: '/finance/approvals')
                 : BoardKit::unavailable('اعتمادات مالية بانتظاري', 'لا تملك صلاحية اعتماد مالي.'),
             'kpis' => [
-                BoardKit::metric('سندات منفذة هذا الشهر', (clone $executed)->where('executed_at', '>=', now()->startOfMonth())->count(), null, url: route('finance.index', [], false)),
-                BoardKit::metric('سندات بانتظار التنفيذ', DB::table('finance_transactions')->where('state', 'approved')->whereNull('executed_at')->count(), 'down'),
+                $kinds ? BoardKit::metric('سندات منفذة هذا الشهر', (clone $executed)->where('executed_at', '>=', now()->startOfMonth())->count(), null, detail: 'ضمن صلاحياتك في القبض والصرف.', url: route('finance.index', [], false))
+                    : BoardKit::unavailable('سندات منفذة هذا الشهر', 'لا تملك صلاحية الاطلاع على سندات القبض أو الصرف.'),
+                $kinds ? BoardKit::metric('سندات بانتظار التنفيذ', (clone $transactions)->where('state', 'approved')->whereNull('executed_at')->count(), 'down', detail: 'ضمن صلاحياتك في القبض والصرف.')
+                    : BoardKit::unavailable('سندات بانتظار التنفيذ', 'لا تملك صلاحية الاطلاع على سندات القبض أو الصرف.'),
                 BoardKit::unavailable('الانحراف عن الموازنة المعتمدة', 'الدفاتر والموازنة تُمسك في النظام المحاسبي الخارجي؛ لا مصدر لها في AIMS.'),
             ],
             'trend' => BoardKit::trend('السندات المنفذة أسبوعيًا', 'عدد السندات المنفذة (دون العكسية). لا يُستنتج أي مبلغ من المساعدات المقترحة.', [
                 ['label' => 'منفذة', 'values' => BoardKit::weekly(clone $executed, 'executed_at')],
-            ], $hasBooks ? null : 'لا توجد سندات منفذة مسجلة في AIMS؛ الدفاتر تُمسك في النظام المحاسبي الخارجي.'),
+            ], $hasBooks ? null : ($kinds ? 'لا توجد سندات منفذة ضمن صلاحياتك مسجلة في AIMS؛ الدفاتر تُمسك في النظام المحاسبي الخارجي.' : 'لا تملك صلاحية الاطلاع على سندات القبض أو الصرف.')),
             'bars' => BoardKit::bars('الاعتمادات المنتظرة حسب النوع', 'ما ينتظر اعتمادك حسب نوع المستند.', collect($counts)->map(fn (int $n, string $l): array => ['label' => $l, 'value' => $n])->values()->all(),
                 $approver ? null : 'لا تملك صلاحية اعتماد مالي.'),
             'table' => BoardKit::table('مستندات تنتظر اعتمادي', [['key' => 'reference', 'label' => 'الرقم'], ['key' => 'type', 'label' => 'النوع'], ['key' => 'amount', 'label' => 'المبلغ']], $rows, 'لا توجد مستندات بانتظارك.', '/finance/approvals'),

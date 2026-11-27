@@ -38,13 +38,8 @@ final class FinancePermissionCatalog
             'finance.stock.count.approve' => 'اعتماد محاضر الجرد وتسوية الفروقات',
         ]],
         'accountant' => ['المحاسب العام', [
-            'finance.purchase.invoice' => 'تسجيل فواتير الموردين ورقم سند الصرف',
-            'finance.rentals.record' => 'تسجيل قبض الإيجارات وترحيل تسوياتها',
+            'finance.purchase.invoice' => 'تسجيل فواتير الموردين ومطابقتها',
             'finance.treasury.manage' => 'الصندوق والبنوك',
-            'finance.transaction.draft' => 'إعداد سند قبض وسند صرف (مسودة وإرسال)',
-            'finance.transaction.review' => 'مراجعة سندات القبض والصرف',
-            'finance.transaction.approve' => 'اعتماد سندات القبض والصرف',
-            'finance.transaction.execute' => 'تنفيذ سندات القبض والصرف (الترحيل)',
             'finance.reversal.request' => 'طلب عكس سند منفّذ',
             'finance.reversal.approve' => 'اعتماد عكس السندات',
             'finance.receivable.manage' => 'المستحقات',
@@ -53,6 +48,21 @@ final class FinancePermissionCatalog
             'finance.transfer.approve' => 'اعتماد التحويلات',
             'finance.reconcile' => 'المطابقة البنكية',
             'finance.advance.manage' => 'العهد والسلف',
+        ]],
+        'payments' => ['الصرف', [
+            'finance.payment.draft' => 'إعداد سندات الصرف وإرسالها للمراجعة',
+            'finance.payment.review' => 'مراجعة سندات الصرف',
+            'finance.payment.approve' => 'اعتماد سندات الصرف',
+            'finance.payment.execute' => 'تنفيذ سندات الصرف (الترحيل)',
+            'finance.payment.record' => 'تسجيل سند الصرف من البرنامج المحاسبي',
+        ]],
+        'receipts' => ['القبض', [
+            'finance.receipt.draft' => 'إعداد سندات القبض وإرسالها للمراجعة',
+            'finance.receipt.review' => 'مراجعة سندات القبض',
+            'finance.receipt.approve' => 'اعتماد سندات القبض',
+            'finance.receipt.execute' => 'تنفيذ سندات القبض (الترحيل)',
+            'finance.rentals.record' => 'تسجيل قبض الإيجارات وترحيل تسوياتها',
+            'finance.sponsorships.record' => 'تسجيل قبض الكفالات من البرنامج المحاسبي',
         ]],
         'payroll' => ['مسير الرواتب', [
             'finance.payroll.manage' => 'إعداد مسير الرواتب وربط الصرف',
@@ -81,8 +91,10 @@ final class FinancePermissionCatalog
         ['finance.procurement.manage', 'finance.purchase.receive'],
         ['finance.procurement.manage', 'finance.purchase.invoice'],
         ['finance.purchase.receive', 'finance.purchase.invoice'],
-        ['finance.transaction.draft', 'finance.transaction.approve'],
-        ['finance.transaction.draft', 'finance.transaction.execute'],
+        ['finance.payment.draft', 'finance.payment.approve'],
+        ['finance.payment.draft', 'finance.payment.execute'],
+        ['finance.receipt.draft', 'finance.receipt.approve'],
+        ['finance.receipt.draft', 'finance.receipt.execute'],
         ['finance.stock.count', 'finance.stock.count.approve'],
         ['finance.payroll.manage', 'finance.payroll.approve'],
         ['finance.payroll.record', 'finance.payroll.publish'],
@@ -102,16 +114,17 @@ final class FinancePermissionCatalog
     public const TEMPLATES = [
         'procurement' => ['مسؤول المشتريات', 'finance_procurement'],
         'warehouse' => ['أمين المخازن', 'finance_warehouse'],
-        'general_accountant' => ['المحاسب العام (الفواتير والتحصيل)', 'finance_accountant'],
+        'general_accountant' => ['المحاسب العام (الفواتير وإعداد السندات)', 'finance_accountant'],
         'payroll' => ['مسؤول الرواتب', 'finance_payroll'],
         'auditor' => ['مدقق مالي (اطلاع فقط)', 'finance_auditor'],
         'cash_executor' => ['منفّذ الصرف', 'finance_cash_executor'],
+        'receipt_executor' => ['منفّذ القبض', 'finance_receipt_executor'],
         'finance_head' => ['رئيس القسم (صلاحيات المراجعة)', 'finance_head'],
         'director_approver' => ['المعتمد المالي', 'finance_director_approver'],
     ];
 
     /** Templates the head of Accounts may assign within the department; the others stay with the system administrator. */
-    public const HEAD_TEMPLATES = ['procurement', 'warehouse', 'general_accountant', 'payroll', 'auditor', 'cash_executor'];
+    public const HEAD_TEMPLATES = ['procurement', 'warehouse', 'general_accountant', 'payroll', 'auditor', 'cash_executor', 'receipt_executor'];
 
     /** Permissions the head of Accounts never grants: executive and board decisions, and the assignment right itself. */
     public const HEAD_EXCLUDED = ['finance.procurement.director_approve', 'finance.procurement.board_approve', 'finance.staff.assign', 'finance.payroll.authorize'];
@@ -121,14 +134,23 @@ final class FinancePermissionCatalog
      * one of them waits for the executive director's decision, whoever proposed it.
      */
     public const SENSITIVE = [
-        'finance.transaction.approve', 'finance.transaction.execute', 'finance.transfer.execute', 'finance.transfer.approve',
+        'finance.payment.approve', 'finance.payment.execute', 'finance.payment.record', 'finance.receipt.approve', 'finance.receipt.execute', 'finance.rentals.record',
+        'finance.sponsorships.record', 'finance.transfer.execute', 'finance.transfer.approve',
         'finance.treasury.manage', 'finance.payroll.manage', 'finance.payroll.approve', 'finance.payroll.record', 'finance.payroll.publish', 'finance.payroll.authorize',
         'finance.procurement.policy', 'finance.procurement.director_approve', 'finance.procurement.board_approve',
         'finance.budget.approve', 'finance.fund.approve', 'finance.reversal.approve',
     ];
 
     /** Templates that are sensitive as a whole, whatever their permissions. */
-    public const SENSITIVE_TEMPLATES = ['finance_head', 'director_approver', 'cash_executor', 'payroll'];
+    public const SENSITIVE_TEMPLATES = ['finance_head', 'director_approver', 'cash_executor', 'receipt_executor', 'payroll'];
+
+    /** Legacy keys retained only to migrate grants and reject stale callers; no runtime permission inheritance. */
+    public const LEGACY_TRANSACTION_PERMISSIONS = [
+        'finance.transaction.draft' => ['finance.payment.draft', 'finance.receipt.draft'],
+        'finance.transaction.review' => ['finance.payment.review', 'finance.receipt.review'],
+        'finance.transaction.approve' => ['finance.payment.approve', 'finance.receipt.approve'],
+        'finance.transaction.execute' => ['finance.payment.execute', 'finance.receipt.execute'],
+    ];
 
     public static function templateLabel(string $code): string
     {

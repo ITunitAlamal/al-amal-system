@@ -9,6 +9,9 @@ use App\Models\Employee;
 use App\Models\Role;
 use App\Models\User;
 use App\Services\AuditService;
+use App\Services\Hr\EmployeePlacements;
+use App\Services\Organization\AssignmentHistory;
+use App\Services\Organization\RoleSeparation;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -42,14 +45,15 @@ class EmployeeController extends Controller
      * second department (owner decision: one person may head several departments). Finance roles stay on
      * «صلاحيات الحسابات», the board secretary on its own checkbox, executive and admin roles nowhere here.
      */
-    private const ADDITIONAL_ROLES = ['department_employee', 'department_head', 'procurement_officer', 'storekeeper', 'maintenance_technician', 'rentals_officer'];
+    private const ADDITIONAL_ROLES = ['department_employee', 'department_head', 'procurement_officer', 'storekeeper', 'maintenance_technician', 'rentals_officer', 'hr_staff'];
 
     /** Roles that make up the main assignment edited by the form; every other assignment is kept as it is. */
     private const MAIN_ROLES = ['department_employee', 'department_head', 'procurement_officer', 'storekeeper', 'maintenance_technician'];
 
     /**
-     * Records the board of directors' decisions in the system, e.g. on the executive director's own leave
-     * (owner decision 2026-10-22). It is held on top of the person's main role and set by the system admin only.
+     * Records and transmits the board of directors' decisions in the system (BOARD_CORRESPONDENCE). It is held on
+     * top of the person's main role and set by the system admin only, never for a holder of the Secretariat duty
+     * (owner decision 5, 2026-11-27; RoleSeparation).
      */
     private const BOARD_SECRETARY_ROLE = 'board_secretary';
 
@@ -76,11 +80,16 @@ class EmployeeController extends Controller
         if ($designated && ! $employee->is_active) {
             throw ValidationException::withMessages(['board_secretary' => 'لا تُسند صفة أمين سر مجلس الإدارة إلى حساب غير نشط.']);
         }
+        if ($designated) {
+            RoleSeparation::assertAllowed((int) $employee->id, self::BOARD_SECRETARY_ROLE, 'board_secretary');
+        }
 
         if ($designated) {
             DepartmentUserRole::create(['user_id' => $employee->id, 'department_id' => null, 'role_id' => $roleId]);
         } else {
-            DepartmentUserRole::query()->where('user_id', $employee->id)->where('role_id', $roleId)->delete();
+            // The ended designation stays readable in department_user_role_history.
+            AssignmentHistory::remove(DepartmentUserRole::query()->where('user_id', $employee->id)->where('role_id', $roleId)->pluck('id')->all(),
+                (int) $request->user()->id, 'إلغاء صفة أمين سر مجلس الإدارة');
         }
         $audit->record($request, $designated ? 'employee.board_secretary.assigned' : 'employee.board_secretary.removed', $employee,
             ['board_secretary' => $held], ['board_secretary' => $designated]);
@@ -338,7 +347,8 @@ class EmployeeController extends Controller
                     'can_edit' => (int) $employee->id !== (int) $request->user()->id
                         && ! $employee->roleAssignments->contains(fn ($item) => in_array($item->role?->code, ['system_admin', 'executive_director'], true)),
                     'can_reset_password' => $request->user()->isSystemAdmin() && (int) $employee->id !== (int) $request->user()->id,
-                    'can_delete' => $request->user()->isSystemAdmin() && (int) $employee->id !== (int) $request->user()->id
+                    // «إيقاف الحساب» (accounts are never erased): active accounts only.
+                    'can_delete' => $request->user()->isSystemAdmin() && (int) $employee->id !== (int) $request->user()->id && (bool) $employee->is_active
                         && ! $employee->roleAssignments->contains(fn ($item) => in_array($item->role?->code, ['system_admin', 'executive_director'], true)),
                     'name' => $employee->name,
                     'email' => $employee->email,
@@ -454,6 +464,7 @@ class EmployeeController extends Controller
             if (DepartmentUserRole::query()->where('user_id', $locked->id)->where('role_id', $role->id)->where('department_id', $data['department_id'])->exists()) {
                 throw ValidationException::withMessages(['role_id' => 'هذا التكليف مسند للموظف من قبل.']);
             }
+            RoleSeparation::assertAllowed((int) $locked->id, $role->code);
             $assignment = DepartmentUserRole::create(['user_id' => $locked->id, 'department_id' => $data['department_id'], 'role_id' => $role->id]);
             $audit->record($request, 'employee.assignment.added', $locked, null,
                 ['assignment_id' => $assignment->id, 'role' => $role->code, 'department_id' => (int) $data['department_id'], 'reason' => $data['reason']]);
@@ -484,7 +495,8 @@ class EmployeeController extends Controller
                 throw ValidationException::withMessages(['assignment' => 'الموظف رئيس هذا القسم حاليًا؛ عيّن رئيسًا بديلًا أو ألغِ الرئاسة من صفحة «الأقسام» أولًا.']);
             }
             $before = ['assignment_id' => $row->id, 'role' => $code, 'department_id' => $row->department_id];
-            $row->delete();
+            // Ended, not erased: the assignment, its period, who removed it and why stay in department_user_role_history.
+            AssignmentHistory::remove((int) $row->id, (int) $request->user()->id, $data['reason']);
             $audit->record($request, 'employee.assignment.removed', $locked, $before, ['reason' => $data['reason']]);
         });
 
@@ -548,7 +560,7 @@ class EmployeeController extends Controller
         );
 
         if (($data['board_secretary'] ?? false) && $role->code === self::EXECUTIVE_ROLE) {
-            throw ValidationException::withMessages(['board_secretary' => 'لا تُسند صفة أمين سر مجلس الإدارة إلى المدير التنفيذي؛ فالمجلس يعتمد إجازاته.']);
+            throw ValidationException::withMessages(['board_secretary' => 'لا تُسند صفة أمين سر مجلس الإدارة إلى المدير التنفيذي.']);
         }
 
         // An archived or current employee profile keeps its number; a new account must not reuse it.
@@ -771,6 +783,10 @@ class EmployeeController extends Controller
                 'department_id' => $data['department_id'],
                 'is_active' => $data['is_active'],
             ]);
+            if ($before['is_active'] && ! $data['is_active']) {
+                // A deactivated account loses its open sessions now (EnsureStaffActive also ends any that remain).
+                DB::connection(config('session.connection'))->table(config('session.table', 'sessions'))->where('user_id', $lockedEmployee->id)->delete();
+            }
 
             $profile = Employee::withTrashed()->where('user_id', $lockedEmployee->id)->lockForUpdate()->first();
             if (Employee::withTrashed()->where('employee_number', $data['employee_number'])
@@ -778,20 +794,35 @@ class EmployeeController extends Controller
                 throw ValidationException::withMessages(['employee_number' => 'الرقم الوظيفي مستخدم في ملف موظف آخر.']);
             }
             if ($profile !== null) {
+                $departmentChanged = (int) $profile->department_id !== (int) $data['department_id'];
                 $profile->update([
                     'employee_number' => $data['employee_number'],
                     'department_id' => $data['department_id'],
                     'updated_by' => $request->user()->id,
                 ]);
+                if ($departmentChanged) {
+                    // The profile form sends department changes of account-linked staff here, so this path writes
+                    // «سجل التنقلات» the same way: the previous placement is closed and a new one opens today.
+                    app(EmployeePlacements::class)->record($profile->id, $profile->only(['department_id', 'job_title_id', 'job_grade_id', 'department_source', 'job_title_source', 'grade_source']),
+                        now()->toDateString(), 'profile', 'نقل القسم من «حسابات الموظفين والأدوار»', (int) $request->user()->id);
+                }
             }
 
-            DepartmentUserRole::query()
-                ->whereIn('id', $mainAssignments->pluck('id')->all())
-                ->delete();
+            // The main assignment is kept when it does not change (its start date and history stay as they are);
+            // a replaced one ends and stays readable in department_user_role_history.
+            $unchanged = $mainAssignments->first(fn (DepartmentUserRole $item): bool => (int) $item->role_id === (int) $role->id
+                && (int) $item->department_id === (int) $data['department_id']);
+            AssignmentHistory::remove($mainAssignments->reject(fn (DepartmentUserRole $item): bool => $item->id === $unchanged?->id)->pluck('id')->all(),
+                (int) $request->user()->id, 'تعديل التكليف الرئيسي من «حسابات الموظفين والأدوار»');
 
-            $alreadyHeld = $keptAssignments->contains(fn (DepartmentUserRole $item): bool => (int) $item->role_id === (int) $role->id
+            // A board secretary designation removed in this same save goes first, so the separation check sees the result.
+            if ($request->user()->isSystemAdmin() && array_key_exists('board_secretary', $data) && ! $data['board_secretary']) {
+                $this->setBoardSecretary($request, $lockedEmployee, false, $audit);
+            }
+            $alreadyHeld = $unchanged !== null || $keptAssignments->contains(fn (DepartmentUserRole $item): bool => (int) $item->role_id === (int) $role->id
                 && (int) $item->department_id === (int) $data['department_id']);
             if (! $alreadyHeld) {
+                RoleSeparation::assertAllowed((int) $lockedEmployee->id, $role->code);
                 DepartmentUserRole::create([
                     'user_id' => $lockedEmployee->id,
                     'department_id' => $data['department_id'],

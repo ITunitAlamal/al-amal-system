@@ -205,9 +205,9 @@ watch(() => props.employees, () => { preview.value = null; });
 </script>
 
 <template>
-    <AppLayout title="حسابات المستخدمين">
+    <AppLayout title="حسابات الموظفين والأدوار">
         <div class="mx-auto max-w-7xl space-y-5">
-        <PageHeader eyebrow="الموارد البشرية" title="حسابات المستخدمين" description="حسابات الدخول للموظفين: القسم والدور الوظيفي وحالة الحساب. بيانات الموظف التفصيلية في «ملفات الموظفين».">
+        <PageHeader eyebrow="الموارد البشرية" title="حسابات الموظفين والأدوار" description="حسابات الدخول للموظفين: القسم والدور الوظيفي وحالة الحساب. بيانات الموظف التفصيلية في «ملفات الموظفين».">
             <Link href="/admin/employee-profiles" class="btn btn-secondary">ملفات الموظفين</Link>
             <button type="button" :disabled="!hasDepartments || !hasRoles" class="btn btn-primary" @click="openCreate">+ إضافة حساب</button>
         </PageHeader>
@@ -271,7 +271,7 @@ watch(() => props.employees, () => { preview.value = null; });
  <button type="button" class="btn btn-sm btn-secondary" @click="preview = employee" :aria-label="`معاينة: ${employee.name}`">معاينة</button>
  <button v-if="employee.can_edit" type="button" class="btn btn-sm btn-secondary" @click="openEdit(employee)">تعديل</button>
  <button v-if="employee.can_reset_password" type="button" class="btn btn-sm btn-secondary" @click="openAccountAction(employee, 'password')">تغيير كلمة المرور</button>
- <button v-if="employee.can_delete" type="button" class="btn btn-sm btn-danger" @click="openAccountAction(employee, 'delete')">حذف الحساب</button>
+ <button v-if="employee.can_delete" type="button" class="btn btn-sm btn-danger" @click="openAccountAction(employee, 'delete')">إيقاف الحساب</button>
                             </td>
                         </tr>
                     </tbody>
@@ -352,7 +352,7 @@ watch(() => props.employees, () => { preview.value = null; });
                     <div v-if="canDesignateBoard" class="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm">
                         <label class="flex items-start gap-2">
                             <input v-model="form.board_secretary" type="checkbox" class="mt-1" />
-                            <span><strong>أمين سر مجلس الإدارة</strong> — يسجّل في النظام قرارات المجلس، ومنها اعتماد إجازة المدير التنفيذي، مع رقم القرار وتاريخه. تُضاف هذه الصفة إلى دوره الأساسي ولا تغيّره.</span>
+                            <span><strong>أمين سر مجلس الإدارة</strong> — يسجّل في النظام قرارات المجلس ويبلّغها، مع رقم القرار وتاريخه. تُضاف هذه الصفة إلى دوره الأساسي ولا تغيّره، ولا تُسند إلى من يحمل دور «السكرتاريا».</span>
                         </label>
                         <p v-if="form.errors.board_secretary" class="field-error">{{ form.errors.board_secretary }}</p>
                     </div>
@@ -426,7 +426,7 @@ watch(() => props.employees, () => { preview.value = null; });
     <RecordPreview :title="preview ? preview.name : ''" :fields="preview ? [{ label: 'الرقم الوظيفي', value: preview.employee_number }, { label: 'البريد الإلكتروني', value: preview.email }, { label: 'القسم', value: preview.department_name }, { label: 'الدور', value: preview.role_name }, { label: 'الحالة', value: preview.pending_activation ? 'بانتظار التفعيل' : preview.is_active ? 'نشط' : 'معطل' }] : []" :href="preview ? '' : ''" @close="preview = null" />
         <div v-if="accountTarget" class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-900/50 p-4" @click.self="closeAccountAction" @keydown.esc="closeAccountAction">
             <section role="dialog" aria-modal="true" aria-labelledby="account-action-title" class="card w-full max-w-lg space-y-4">
-                <h2 id="account-action-title" class="card-title">{{ accountAction === 'password' ? 'تغيير كلمة المرور' : 'حذف حساب الدخول' }}</h2>
+                <h2 id="account-action-title" class="card-title">{{ accountAction === 'password' ? 'تغيير كلمة المرور' : 'إيقاف حساب الدخول' }}</h2>
                 <p class="text-sm font-semibold">{{ accountTarget.name }} — {{ accountTarget.employee_number }}</p>
                 <form class="space-y-4" @submit.prevent="submitAccountAction">
                     <template v-if="accountAction === 'password'">
@@ -441,14 +441,14 @@ watch(() => props.employees, () => { preview.value = null; });
                         <p v-if="!accountTarget.is_active" class="text-sm text-gold-800">الحساب غير نشط؛ تغيير كلمة المرور لا يفعّله.</p>
                     </template>
                     <template v-else>
-                        <p class="text-sm text-red-700">سيُحذف حساب الدخول نهائيًا وتُنهي جلساته. يبقى ملف الموظف وسجلاته محفوظة دون حساب مرتبط. الحساب المرتبط بمعاملات أو تكليفات قائمة يتطلب تسويتها أولًا.</p>
-                        <label class="flex items-start gap-2 text-sm"><input v-model="accountForm.confirm" type="checkbox" required class="mt-1" /> أؤكد حذف حساب هذا المستخدم نهائيًا.</label>
+                        <p class="text-sm text-red-700">سيُوقف حساب الدخول وتنتهي جلساته فورًا. لا يُحذف الحساب: تبقى تكليفاته وسجلاته وملف الموظف محفوظة، ويمكن إعادة تفعيله من «تعديل».</p>
+                        <label class="flex items-start gap-2 text-sm"><input v-model="accountForm.confirm" type="checkbox" required class="mt-1" /> أؤكد إيقاف حساب هذا المستخدم.</label>
                     </template>
                     <p v-for="(message, key) in accountForm.errors" :key="key" class="field-error" role="alert">{{ message }}</p>
                     <div class="flex justify-end gap-2">
                         <button type="button" class="btn btn-secondary" :disabled="accountForm.processing" @click="closeAccountAction">إلغاء</button>
                         <button type="submit" :class="['btn', accountAction === 'password' ? 'btn-primary' : 'btn-danger']" :disabled="accountForm.processing || (accountAction === 'delete' && !accountForm.confirm)">
-                            {{ accountForm.processing ? 'جارٍ التنفيذ…' : accountAction === 'password' ? 'حفظ كلمة المرور' : 'حذف نهائي' }}
+                            {{ accountForm.processing ? 'جارٍ التنفيذ…' : accountAction === 'password' ? 'حفظ كلمة المرور' : 'إيقاف الحساب' }}
                         </button>
                     </div>
                 </form>

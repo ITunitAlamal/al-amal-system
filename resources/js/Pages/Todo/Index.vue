@@ -67,10 +67,10 @@ const priorityTone = code => ({ urgent: 'danger', high: 'warning', normal: 'info
 </script>
 
 <template>
-    <AppLayout title="قائمة مهامي الشخصية">
+    <AppLayout title="قائمتي الشخصية">
         <div class="mx-auto max-w-5xl space-y-5">
-            <PageHeader eyebrow="مساحتي" title="قائمة مهامي الشخصية"
-                description="مهام خاصة بك وحدك مع مواعيدها وتذكيراتها. لا يطلع عليها رئيسك ولا غيره، ولا تُنجز بها أي معاملة رسمية: المعاملات تُنجز من «مهامي الرسمية».">
+            <PageHeader eyebrow="مساحتي" title="قائمتي الشخصية"
+                description="مهام خاصة بك وحدك مع مواعيدها وتذكيراتها. لا يطلع عليها رئيسك ولا غيره، ولا تُنجز بها أي معاملة رسمية: المعاملات تُنجز من «مهامي».">
                 <button type="button" class="btn btn-primary" @click="startCreate">+ مهمة جديدة</button>
             </PageHeader>
 

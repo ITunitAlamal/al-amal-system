@@ -4,6 +4,7 @@ namespace App\Services\Notifications;
 
 use App\Models\User;
 use App\Services\HotSmsService;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -36,6 +37,15 @@ final class NotificationCenter
     public const MANDATORY_EVENTS = [
         'workflow_task_assigned', 'workflow_task_urgent', 'workflow_task_overdue', 'workflow_request_returned',
         'approval_delegation_issued', 'approval_delegation_revoked', 'correspondence.assigned',
+        // A task taken back from the user or moved to someone else (StepAssignments).
+        'workflow_assignment_withdrawn',
+        // Decisions waiting outside the engine: cancelling an HR action that stands on the ED's decision, and a
+        // campaign list waiting for the head's review before it can reach the ED.
+        'hr_action_cancel_request', 'orphans_campaign_review',
+        // A prepared employee-file change or a sensitive orphan-registry change waiting for the head's decision.
+        'employee_file_change_submitted', 'orphans_sensitive_change',
+        // A purchase request waiting for the next stage's decision (Accounts head, executive director, Board treasurer).
+        'finance_purchase_pending',
     ];
 
     /** @var array<int, list<string>> */
@@ -163,6 +173,7 @@ final class NotificationCenter
             ->join('roles as r', 'r.id', '=', 'a.role_id')
             ->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('r.code', $roleCode)->where('u.is_active', true)
+            ->whereRaw(EffectiveAssignments::sql('a'))
             ->distinct()->pluck('a.user_id');
 
         return $this->notifyMany($userIds, $event, $payload);

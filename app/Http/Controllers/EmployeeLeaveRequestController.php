@@ -13,6 +13,7 @@ use App\Services\LeaveSubmissionRules;
 use App\Services\LeaveWorkflow;
 use App\Services\Notifications\NotificationCenter;
 use App\Services\Progress\LeaveProgress;
+use App\Services\Workflow\StepAssignments;
 use App\Services\Workflow\WorkflowEngine;
 use App\Services\WorkflowVisibilityService;
 use Illuminate\Http\RedirectResponse;
@@ -303,6 +304,8 @@ final class EmployeeLeaveRequestController extends Controller
                     ->where('v.id', $instance->workflow_version_id)->value('d.name'),
                 'actions' => $engine->availableActions($instance, $r->user()),
             ] : null,
+            // «إسناد إلى موظف»: the HR head may hand the registration step to an HR employee, who then acts here.
+            'assignment' => $instance ? app(StepAssignments::class)->panel($instance, $r->user(), $level) : null,
             'isOwner' => $isOwner,
             'canEdit' => $isOwner && in_array($row->status, ['draft', 'returned'], true),
             'settings' => $this->settings(),
@@ -376,12 +379,11 @@ final class EmployeeLeaveRequestController extends Controller
             if ($row->status !== 'submitted' || $mode !== 'department_or_executive') {
                 throw ValidationException::withMessages(['status' => 'هذا الطلب ليس بانتظار الاعتماد في المسار المعتمد.']);
             }
+            // No self-approval, except the executive director's own leave (owner decision 2026-11-27).
+            abort_if((int) $row->requested_by === (int) $r->user()->id && ! app(LeaveApproverResolver::class)->isOwnExecutiveLeave($row),
+                403, 'لا يعتمد مقدم الطلب طلبه.');
             $approverId = $this->approverFor($row);
             abort_unless($approverId !== null && $approverId === (int) $r->user()->id, 403);
-            if ((int) $row->requested_by === (int) $r->user()->id
-                && ! $this->isExecutive((int) $r->user()->id)) {
-                abort(403, 'الاعتماد الذاتي مسموح للمدير التنفيذي فقط.');
-            }
             $data['decision'] === 'approve'
                 ? $this->decisions->approve($row, (int) $r->user()->id, $data['comment'] ?? null, true)
                 : $this->decisions->reject($row, (int) $r->user()->id, $data['comment'] ?? null, true);
@@ -397,7 +399,13 @@ final class EmployeeLeaveRequestController extends Controller
             $row = DB::table('employee_leave_requests')->where('id', $leave)->lockForUpdate()->first();
             abort_unless($row && (int) $row->requested_by === (int) $r->user()->id, 403);
             if (! in_array($row->status, ['draft', 'submitted', 'manager_approved', 'returned'], true)) {
-                throw ValidationException::withMessages(['status' => 'إلغاء الإجازة المعتمدة يتطلب إجراء عكس مستقل من الموارد البشرية.']);
+                // There is no reversal action: a registered leave stays in the record and only its balance is corrected,
+                // by the system administrator's documented adjustment («تسوية موثقة») on «أرصدة الإجازات».
+                throw ValidationException::withMessages(['status' => match ($row->status) {
+                    'approved' => 'هذه الإجازة مسجلة وخُصمت من رصيدك، ولا يمكن إلغاؤها من هذه الصفحة. راجع رئيس قسم الموارد البشرية واذكر سبب الإلغاء؛ تُعاد الأيام إلى رصيدك بـ«تسوية موثقة» يسجلها مدير النظام من صفحة «أرصدة الإجازات»، ويبقى الطلب في سجلك بحالته.',
+                    'pending_registration' => 'اعتُمدت الإجازة وهي بانتظار تسجيل الموارد البشرية، ولا يمكن إلغاؤها من هذه الصفحة. راجع رئيس قسم الموارد البشرية قبل تسجيلها؛ بيده إعادتها إلى صاحب الاعتماد بدل تسجيلها. لم يُخصم شيء من رصيدك بعد.',
+                    default => 'هذا الطلب منتهٍ (مرفوض أو ملغى) ولا يحتاج إلى إلغاء.',
+                }]);
             }
             if ($row->workflow_instance_id) {
                 $this->workflow->cancel($r->user(), $row);

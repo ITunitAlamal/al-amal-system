@@ -11,8 +11,10 @@ import RegistrationSummary from '../../../Components/Registration/RegistrationSu
 // One workspace: applicant vs registry, files, each claimed child with matches, checklist, decisions, history.
 // A family request also brings its reported snapshot, the reconciliation of its totals, and identity conflicts.
 const props = defineProps({ application: Object, account: Object, guardian: Object, applicantMatches: Array, children: Array, checklistItems: Array, documents: Array, events: Array,
-    abilities: Object, staff: Array, options: Object, me: Number, snapshot: { type: Object, default: null } });
+    abilities: Object, staff: Array, options: Object, me: Number, snapshot: { type: Object, default: null }, reviewConflict: { type: String, default: null } });
 const closed = computed(() => ['completed', 'rejected', 'withdrawn'].includes(props.application.status));
+// Review actions only for a holder of «portal» who neither entered this request nor is its applicant/guardian (the server checks again).
+const canReview = computed(() => !closed.value && props.abilities.portal && !props.reviewConflict);
 const { decision: confirmation, busy: decisionBusy, error: decisionError, ask, close: closeDecision, confirm: confirmDecision } = useDecision();
 const checklist = useForm({ checklist: { ...props.application.checklist }, review_notes: props.application.review_notes || '' });
 const childStatus = computed(() => Object.fromEntries(props.children.filter(c => c.card_key).map(c => [c.card_key, { status: c.status, label: c.status_label }])));
@@ -28,14 +30,14 @@ const actions = { submitted: 'قُدّم الطلب', assigned: 'إسناد', ch
 function openChild(child, kind) { decision.value = child.id; childForm.reset(); childForm.decision = kind; childForm.orphan_public_id = child.orphan_public_id; }
 function submitChild(child) { childForm.post(`/orphans/reviews/${props.application.public_id}/children/${child.id}`, { preserveScroll: true, onSuccess: () => { decision.value = null; } }); }
 function accountDecision(kind) {
-    if (closed.value || !props.abilities.portal) return;
+    if (!canReview.value) return;
     ask({ title: kind === 'approve' ? 'اعتماد حساب البوابة' : 'رفض حساب البوابة',
         description: 'هذا القرار يخص الحساب فقط. تبقى علاقة الوصاية قرارًا مستقلًا لكل طفل.',
         required: kind === 'reject', danger: kind === 'reject',
         url: `/orphans/reviews/${props.application.public_id}/account`, data: { decision: kind } });
 }
 function rejectAll() {
-    if (closed.value || !props.abilities.portal) return;
+    if (!canReview.value) return;
     ask({ title: 'رفض الطلب كاملًا', description: 'سيُسجل رفض الطلب وسببه. راجع قرارات الأطفال وأدلتهم قبل التأكيد.', required: true, danger: true,
         url: `/orphans/reviews/${props.application.public_id}/reject`, data: {} });
 }
@@ -51,8 +53,9 @@ async function reveal() { try { revealed.value = (await jsonRequest(`/orphans/re
                     <h1 class="text-2xl font-bold text-navy-800">طلب <span class="font-mono" dir="ltr">{{ application.reference_no }}</span></h1>
                     <p class="text-sm text-slate-600">قُدّم {{ application.submitted_at?.slice(0, 16) }} · المسؤول: {{ application.assignee || 'غير مسند' }}<span v-if="application.due_on"> · الاستحقاق {{ application.due_on }}</span></p>
                     <StatusBadge :label="application.status_label" tone="info" />
+                    <p v-if="reviewConflict && !closed" class="alert-warning text-sm">{{ reviewConflict }}</p>
                 </div>
-                <form v-if="!closed && (abilities.assign || (abilities.portal && !application.assigned_to))" class="flex flex-wrap items-end gap-2" @submit.prevent="assign.post(`/orphans/reviews/${application.public_id}/assign`, { preserveScroll: true })">
+                <form v-if="!closed && (abilities.assign || (abilities.portal && !application.assigned_to && !reviewConflict))" class="flex flex-wrap items-end gap-2" @submit.prevent="assign.post(`/orphans/reviews/${application.public_id}/assign`, { preserveScroll: true })">
                     <label v-if="abilities.assign" class="text-sm">إسناد إلى<select v-model="assign.user_id" class="field mt-1"><option :value="null">غير مسند</option><option v-for="s in staff" :key="s.id" :value="s.id">{{ s.name }}</option></select></label>
                     <label v-if="abilities.assign" class="text-sm">الاستحقاق<input v-model="assign.due_on" type="date" class="field mt-1"></label>
                     <button v-if="abilities.assign" type="submit" class="btn btn-secondary" :disabled="assign.processing">حفظ الإسناد</button>
@@ -77,7 +80,7 @@ async function reveal() { try { revealed.value = (await jsonRequest(`/orphans/re
                     <p v-if="application.source === 'staff'" class="rounded-xl bg-slate-50 p-3 text-sm">طلب أُدخل من القسم؛ لا يوجد حساب بوابة مرتبط به.</p>
                     <div v-else class="flex flex-wrap items-center gap-2 rounded-xl bg-slate-50 p-3 text-sm">
                         <span>حساب البوابة:</span><StatusBadge :label="{ pending: 'بانتظار الاعتماد', approved: 'معتمد', rejected: 'مرفوض', suspended: 'موقوف' }[account?.status] || 'غير معروف'" :tone="account?.status === 'approved' ? 'success' : 'info'" />
-                        <template v-if="!closed && abilities.portal && account?.status === 'pending'">
+                        <template v-if="canReview && account?.status === 'pending'">
                             <button type="button" class="btn btn-sm btn-primary" @click="accountDecision('approve')">اعتماد الحساب</button>
                             <button type="button" class="btn btn-sm btn-danger" @click="accountDecision('reject')">رفض الحساب</button></template>
                         <span class="text-xs text-slate-500">اعتماد الحساب لا يفتح ملف أي طفل.</span>
@@ -87,11 +90,11 @@ async function reveal() { try { revealed.value = (await jsonRequest(`/orphans/re
                     <h2 class="card-title">قائمة الفحص</h2>
                     <p v-if="!checklistItems.length" class="text-sm text-slate-500">لا توجد بنود؛ تُضاف من «ثوابت النظام» (قائمة فحص طلبات البوابة).</p>
                     <form v-else class="space-y-2" @submit.prevent="checklist.post(`/orphans/reviews/${application.public_id}/checklist`, { preserveScroll: true })">
-                        <label v-for="item in checklistItems" :key="item.id" class="flex items-center gap-2 text-sm"><input v-model="checklist.checklist[item.id]" type="checkbox" :disabled="closed"> {{ item.name }}</label>
-                        <button v-if="!closed" type="submit" class="btn btn-sm btn-secondary" :disabled="checklist.processing">حفظ</button></form>
+                        <label v-for="item in checklistItems" :key="item.id" class="flex items-center gap-2 text-sm"><input v-model="checklist.checklist[item.id]" type="checkbox" :disabled="!canReview"> {{ item.name }}</label>
+                        <button v-if="canReview" type="submit" class="btn btn-sm btn-secondary" :disabled="checklist.processing">حفظ</button></form>
                     <form v-if="abilities.portal" class="space-y-2" @submit.prevent="checklist.post(`/orphans/reviews/${application.public_id}/checklist`, { preserveScroll: true })">
-                        <label class="field-label">ملاحظات المراجعة الإدارية<textarea v-model="checklist.review_notes" class="field mt-1 font-normal" rows="3" maxlength="5000" :disabled="closed" /></label>
-                        <button v-if="!closed" type="submit" class="btn btn-sm btn-secondary" :disabled="checklist.processing">حفظ الملاحظات</button></form>
+                        <label class="field-label">ملاحظات المراجعة الإدارية<textarea v-model="checklist.review_notes" class="field mt-1 font-normal" rows="3" maxlength="5000" :disabled="!canReview" /></label>
+                        <button v-if="canReview" type="submit" class="btn btn-sm btn-secondary" :disabled="checklist.processing">حفظ الملاحظات</button></form>
                     <template v-if="snapshot?.missingDocuments?.length">
                         <h2 class="card-title pt-2">مستندات ناقصة</h2>
                         <ul class="list-disc space-y-1 ps-5 text-sm text-gold-900"><li v-for="m in snapshot.missingDocuments" :key="`${m.target}-${m.type}`">{{ m.label }}</li></ul>
@@ -130,8 +133,8 @@ async function reveal() { try { revealed.value = (await jsonRequest(`/orphans/re
                     <p v-for="m in c.name_matches" :key="m.public_id" class="text-gold-800">تشابه في الاسم: {{ m.full_name }} ({{ m.roles.join('، ') || 'دون ملف' }}) — راجع قبل الإنشاء.</p>
                     <p v-if="c.other_guardians.length" class="text-gold-800">أوصياء آخرون مرتبطون: {{ c.other_guardians.map(o => o.full_name).join('، ') }}</p>
                     <p v-if="c.decision_note" class="text-slate-600">ملاحظة القرار: {{ c.decision_note }} · {{ c.decided_by_name }}</p>
-                    <div v-if="!closed && abilities.portal && ['pending', 'needs_completion'].includes(c.status)" class="mt-2 flex gap-1">
-                        <button type="button" class="btn btn-sm btn-primary" @click="openChild(c, 'approve')">اعتماد الوصاية</button><button type="button" class="btn btn-sm btn-danger" @click="openChild(c, 'reject')">رفض مع سبب</button></div>
+                    <div v-if="canReview && ['pending', 'needs_completion'].includes(c.status)" class="mt-2 flex gap-1">
+                        <button v-if="abilities.decide_portal" type="button" class="btn btn-sm btn-primary" @click="openChild(c, 'approve')">اعتماد الوصاية</button><button type="button" class="btn btn-sm btn-danger" @click="openChild(c, 'reject')">رفض مع سبب</button></div>
                     <form v-if="decision === c.id" class="mt-3 grid gap-3 rounded-xl border border-blue-200 bg-blue-50/40 p-3 sm:grid-cols-2" @submit.prevent="submitChild(c)">
                         <template v-if="childForm.decision === 'approve'">
                             <label class="text-sm">بداية السريان<input v-model="childForm.starts_on" type="date" class="field mt-1" required></label>
@@ -148,7 +151,7 @@ async function reveal() { try { revealed.value = (await jsonRequest(`/orphans/re
                 </article>
             </section>
 
-            <section v-if="!closed && abilities.portal" class="card space-y-3">
+            <section v-if="canReview" class="card space-y-3">
                 <h2 class="card-title">طلب استكمال</h2>
                 <form class="space-y-2" @submit.prevent="completion.post(`/orphans/reviews/${application.public_id}/completion`, { preserveScroll: true })">
                     <label class="field-label">ما المطلوب من الوصي؟<textarea v-model="completion.message" class="field mt-1 font-normal" rows="3" maxlength="2000" placeholder="رسالة واحدة واضحة بما يلزم استكماله" required /></label>

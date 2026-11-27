@@ -39,4 +39,11 @@ export const menuIconPaths = {
     close: 'M6 6l12 12 M18 6L6 18',
     logout: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9',
     'panel-collapse': 'M3 4h18v16H3z M9 4v16 M15 10l-2 2 2 2',
+    // Workflow action buttons (always beside the action's text, never alone).
+    check: 'M5 12.5l4.5 4.5L19 7', // approve / confirm
+    undo: 'M15 14l5-5-5-5 M20 9H10a6 6 0 0 0 0 12h4', // send back (the arrow points to the start side in RTL)
+    'circle-check': 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18 M8 12.5l3 3 5-6', // close a request
+    'user-plus': 'M15 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M8.5 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M19 8v6 M16 11h6', // assign to a person
+    send: 'M21 3L3 10.5l7 3 3 7.5z M10 13.5L21 3', // forward to the next stage
+    paperclip: 'M20 11l-8.5 8.5a5 5 0 0 1-7-7L13 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-3-3L14 7', // attachments
 };

@@ -24,6 +24,23 @@ final class RentalFinanceService
         }
     }
 
+    /** A due the rentals file cancelled (termination, amendment) is cancelled in Accounts' receivables too. */
+    public function cancelDue(int $dueId, string $reason, int $actor): void
+    {
+        $this->bridge->cancelReceivable('rentals', (string) $dueId, $reason, $actor);
+    }
+
+    /** A posted settlement changes the registered receivable by its signed amount, once per settlement. */
+    public function settleDue(object $settlement, int $actor): void
+    {
+        if (! $settlement->due_id) {
+            return;
+        }
+        $delta = ($settlement->effect === 'reduce' ? '-' : '').FinanceMoney::format(FinanceMoney::cents((string) $settlement->amount));
+        $this->bridge->adjustReceivable('rentals', (string) $settlement->due_id, $delta, 'rental_settlement:'.$settlement->id,
+            'تسوية إيجار مرحّلة '.($settlement->posting_reference ?? ''), $actor);
+    }
+
     /** @return list<object> */
     public function receipts(): array
     {

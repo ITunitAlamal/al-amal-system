@@ -6,13 +6,17 @@ use App\Models\User;
 use App\Services\Configuration\CustomFieldEntities;
 use App\Services\Configuration\CustomFieldService;
 use App\Services\Configuration\NavigationAccessRules;
+use App\Services\Maintenance\MaintenanceAddenda;
 use App\Services\Progress\TransactionTracker;
 use App\Services\Workflow\AssigneeResolver;
+use App\Services\Workflow\RequestAttachments;
 use App\Services\Workflow\WorkflowCatalog;
 use App\Services\Workflow\WorkflowEngine;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -29,6 +33,7 @@ class WorkflowRequestController extends Controller
         private readonly CustomFieldService $fields,
         private readonly AssigneeResolver $assignees,
         private readonly NavigationAccessRules $accessRules,
+        private readonly RequestAttachments $attachments,
     ) {}
 
     public function index(Request $request, TransactionTracker $tracker): Response
@@ -63,13 +68,70 @@ class WorkflowRequestController extends Controller
         $definition = $this->catalog->startableDefinition($code);
         $version = $definition ? $this->catalog->publishedVersion((int) $definition->id) : null;
         abort_unless($definition && $version, 404, 'نوع الطلب غير متاح حاليًا.');
+        $fields = $this->fields->forForm($this->fields->definitions(CustomFieldEntities::AIMS_REQUEST, $definition->code));
 
         return Inertia::render('Requests/Create', [
             'definition' => ['code' => $definition->code, 'name' => $definition->name, 'description' => $definition->description],
-            'fields' => $this->fields->forForm($this->fields->definitions(CustomFieldEntities::AIMS_REQUEST, $definition->code)),
+            'fields' => $fields,
+            // A draft saved on the old maintenance screen: its text fills the form ({title, description, fields}).
+            'initial' => $definition->code === 'MAINTENANCE' ? $this->legacyMaintenanceValues($user, (string) $request->query('draft', ''), $fields) : null,
+            // «طلب ملحق»: the maintenance request this one is opened from ({publicId, referenceNo, title}); null otherwise.
+            'parent' => $definition->code === MaintenanceAddenda::DEFINITION && Str::isUuid((string) $request->query('parent', ''))
+                ? app(MaintenanceAddenda::class)->formParent((string) $request->query('parent'), $user) : null,
             'pickOptions' => $this->firstStepPickOptions($user, (int) $version->id),
             'hasDepartment' => (bool) $user->department_id,
+            // Null on a confidential workflow (complaints), which takes no attachments.
+            'attachmentPolicy' => $this->attachments->offeredOn((int) $version->id) ? $this->attachments->limits() : null,
         ]);
+    }
+
+    /**
+     * The old maintenance screen saved drafts that were never sent (aims_requests, status "draft"). Its address
+     * now opens «طلب صيانة» with the draft's text filled in, for its author only.
+     */
+    public function legacyMaintenanceDraft(Request $request, string $publicId): RedirectResponse
+    {
+        $user = $request->user();
+        abort_unless($user?->is_active, 403);
+        abort_unless($this->legacyMaintenanceDraftRow($user, $publicId), 404, 'مسودة الصيانة غير موجودة.');
+
+        return redirect()->route('requests.create', ['code' => 'MAINTENANCE', 'draft' => $publicId]);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $fields  the form's fields (CustomFieldService::forForm)
+     * @return array{title: string, description: string, fields: array<string, string>}|null
+     */
+    private function legacyMaintenanceValues(User $user, string $publicId, array $fields): ?array
+    {
+        $draft = $this->legacyMaintenanceDraftRow($user, $publicId);
+        if (! $draft) {
+            return null;
+        }
+        $description = trim((string) $draft->description);
+        if (trim((string) $draft->fault_type) !== '') {
+            $description = trim($description."\n".'نوع العطل: '.trim((string) $draft->fault_type));
+        }
+        $hasLocation = in_array('location', array_column($fields, 'code'), true);
+
+        return [
+            'title' => (string) $draft->title,
+            'description' => $description,
+            'fields' => $hasLocation && trim((string) $draft->location) !== '' ? ['location' => (string) $draft->location] : [],
+        ];
+    }
+
+    private function legacyMaintenanceDraftRow(User $user, string $publicId): ?object
+    {
+        if (! Str::isUuid($publicId)) {
+            return null;
+        }
+
+        return DB::table('aims_requests as ar')
+            ->leftJoin('maintenance_request_details as md', 'md.aims_request_id', '=', 'ar.id')
+            ->where('ar.public_id', $publicId)->where('ar.request_type', 'maintenance')
+            ->where('ar.requested_by', $user->id)->where('ar.status', 'draft')
+            ->first(['ar.title', 'ar.description', 'md.location', 'md.fault_type']);
     }
 
     public function store(Request $request, string $code): RedirectResponse
@@ -81,15 +143,41 @@ class WorkflowRequestController extends Controller
             'description' => ['nullable', 'string', 'max:10000'],
             'fields' => ['nullable', 'array'],
             'picked_user_id' => ['nullable', 'integer'],
+            'attachments' => ['nullable', 'array'],
+            'parent' => ['nullable', 'uuid'],
+            'addendum_required' => ['nullable', 'boolean'],
         ]);
+        abort_if(! empty($data['parent']) && $code !== MaintenanceAddenda::DEFINITION, 422, 'الطلب الملحق يكون «طلب صيانة».');
 
-        $instance = $this->engine->start(
-            $user,
-            $code,
-            ['title' => $data['title'], 'description' => $data['description'] ?? null],
-            $data['fields'] ?? [],
-            isset($data['picked_user_id']) ? (int) $data['picked_user_id'] : null,
-        );
+        // Optional photos and documents go with the submission, to its event. A refused request stores nothing.
+        $files = array_values(array_filter(Arr::wrap($request->file('attachments', []))));
+        $this->attachments->validate($files, ! ($this->catalog->startableDefinition($code)?->is_confidential ?? false));
+
+        $written = [];
+        try {
+            $instance = DB::transaction(function () use ($request, $user, $code, $data, $files, &$written): object {
+                $instance = $this->engine->start(
+                    $user,
+                    $code,
+                    ['title' => $data['title'], 'description' => $data['description'] ?? null],
+                    $data['fields'] ?? [],
+                    isset($data['picked_user_id']) ? (int) $data['picked_user_id'] : null,
+                );
+                if (! empty($data['parent'])) {
+                    // An addendum is linked to its original in the same transaction, or not created at all.
+                    app(MaintenanceAddenda::class)->attach($instance, (string) $data['parent'], $user, (bool) ($data['addendum_required'] ?? true));
+                }
+                if ($files !== []) {
+                    $this->attachments->store($instance, $this->attachments->eventOf((int) $instance->id, (int) $user->id), $user, $files, $written, $request->ip());
+                }
+
+                return $instance;
+            });
+        } catch (\Throwable $exception) {
+            $this->attachments->cleanup($written);
+
+            throw $exception;
+        }
 
         return redirect()->route('workflows.show', $instance->public_id)
             ->with('success', 'تم إرسال الطلب برقم '.$instance->reference_no.'.');

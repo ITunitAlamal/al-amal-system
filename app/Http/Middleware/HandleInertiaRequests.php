@@ -5,9 +5,10 @@ namespace App\Http\Middleware;
 use App\Services\Configuration\NavigationBuilder;
 use App\Services\Correspondence\CorrespondenceAccess;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Portal\PortalNotifier;
+use App\Services\Progress\TransactionTracker;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Inertia\Middleware;
 
@@ -23,7 +24,7 @@ class HandleInertiaRequests extends Middleware
                 'menu' => [],
                 // Only what the portal shell needs: name, account state and the unread notice count.
                 'guardian' => fn () => ($account = Auth::guard('guardian')->user()) ? ['name' => $account->name, 'status' => $account->account_status,
-                    'unread' => app(\App\Services\Portal\PortalNotifier::class)->unread($account->id)] : null,
+                    'unread' => app(PortalNotifier::class)->unread($account->id)] : null,
                 'flash' => ['success' => fn () => $request->session()->get('success')],
             ];
         }
@@ -36,11 +37,13 @@ class HandleInertiaRequests extends Middleware
             'notifications' => fn () => $request->user('web')
                 ? ['unread' => app(NotificationCenter::class)->unreadCount($request->user('web'))]
                 : ['unread' => 0],
-            // Top-bar counters of work waiting for the user: official workflow tasks and correspondence tasks.
+            // Counters of work waiting for the user. "tasks" is the one number of «مهامي»: the sidebar badge, the
+            // top-bar counter and the page heading all show what TransactionTracker::tasksOf lists. The tracker is one
+            // instance per request (scoped in AppServiceProvider): on a page that already read the list this is its
+            // length, elsewhere count queries only. A failure is logged and shows no badge rather than breaking every page.
             'workCounters' => fn () => $request->user('web') ? [
-                'tasks' => DB::table('workflow_participants as p')->join('workflow_instances as i', 'i.id', '=', 'p.workflow_instance_id')
-                    ->where('p.user_id', $request->user('web')->id)->where('p.participation_type', 'assignee')->where('p.is_active', true)
-                    ->where('i.status', 'in_progress')->distinct()->count('i.id'),
+                'tasks' => $request->user('web')->is_active
+                    ? (int) rescue(fn (): int => app(TransactionTracker::class)->taskCount($request->user('web')), 0) : 0,
                 'correspondence' => Schema::hasTable('correspondence_tasks')
                     ? app(CorrespondenceAccess::class)->mailbox($request->user('web'), 'needs_action')->count() : 0,
             ] : null,

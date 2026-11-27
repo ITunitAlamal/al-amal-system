@@ -85,15 +85,17 @@ final class EmployeeProfileView
             'documentTypes' => array_values(array_filter($this->files->documentTypes(true), fn (array $type): bool => $this->access->canUploadDocument($viewer, $employee, $type['classification']))),
             'pay' => $sections['pay'] ? ['current' => $this->pay->currentCompensation($employee->id), 'history' => $payHistory['compensation']] : null,
             'bank' => $sections['bank'] ? ['history' => $payHistory['bank'], 'full' => $sections['bank_full']] : null,
-            'payChange' => $openChange && ($sections['pay'] || $this->access->canRequestPayChange($viewer)) ? ['id' => (int) $openChange->id, 'status' => $openChange->status,
-                'label' => EmployeePayChanges::STATUS_LABELS[$openChange->status] ?? $openChange->status] : null,
+            // The employee concerned is not a party to the request (EmployeePayChangeController::show refuses them).
+            'payChange' => $openChange && ! $this->access->isSelf($viewer, $employee) && ($sections['pay'] || $this->access->canRequestPayChange($viewer)) ? ['id' => (int) $openChange->id, 'status' => $openChange->status,
+                'label' => EmployeePayChanges::statusLabel((string) $openChange->status, $this->access->employeeIsExecutive((int) $employee->id))] : null,
             'leave' => $sections['leave'] ? $this->leave($employee) : null,
             'history' => $sections['history'] ? $this->history($employee) : [],
             'provenance' => $sections['provenance'] && $employee->import_batch_id ? DB::table('employee_import_rows')->where('employee_id', $employee->id)
                 ->where('batch_id', $employee->import_batch_id)->first(['batch_id', 'row_number', 'processed_at']) : null,
             'can' => [
                 'manage' => $manage,
-                'edit' => $manage,
+                // HR staff open the form too; what they save waits for the HR head (EmployeeFileChanges).
+                'edit' => $this->access->canOpenFiles($viewer),
                 'verify' => $this->access->canVerify($viewer),
                 'uploadPhoto' => $this->access->canUploadPhoto($viewer, $employee),
                 'uploadDocuments' => $this->access->canUploadDocument($viewer, $employee, 'normal'),

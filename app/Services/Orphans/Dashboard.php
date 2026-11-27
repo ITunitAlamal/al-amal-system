@@ -6,6 +6,7 @@ use App\Models\User;
 use App\Services\Configuration\AuditActionCatalog;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * «الرئيسية» of the department: one dashboard rendered by role (head/executive: oversight; staff: today's work).
@@ -134,6 +135,16 @@ final class Dashboard
             $items[] = ['source' => ['visit' => 'زيارة ميدانية', 'assessment' => 'تقييم اجتماعي', 'follow_up' => 'متابعة'][$v->kind] ?? 'زيارة', 'subject' => $v->full_name ?? 'أسرة',
                 'assignee' => $v->assignee, 'due' => $v->scheduled_on, 'status' => 'مجدولة', 'url' => $v->public_id ? '/orphans/registry/orphans/'.$v->public_id.'?tab=assessment' : '/orphans/registry',
                 'urgency' => 1, 'at' => $v->created_at];
+        }
+        // Completed visits with a needs level wait for the head's review before they feed campaign scoring (ORP-19).
+        if ($this->access->canDecide($user) && Schema::hasColumn('social_assessments', 'review_outcome')) {
+            $toReview = DB::table('social_assessments as s')->leftJoin('orphans as o', 'o.id', '=', 's.orphan_id')->leftJoin('persons as p', 'p.id', '=', 'o.person_id')
+                ->leftJoin('users as u', 'u.id', '=', 's.completed_by')->where('s.status', 'completed')->whereNotNull('s.needs_level_value_id')->whereNull('s.review_outcome')
+                ->where('s.completed_by', '<>', $user->id)->orderBy('s.completed_on')->limit(30)->get(['o.public_id', 'p.full_name', 's.kind', 's.completed_on', 's.updated_at', 'u.name as assignee']);
+            foreach ($toReview as $v) {
+                $items[] = ['source' => 'زيارة بانتظار مراجعتك', 'subject' => $v->full_name ?? 'أسرة', 'assignee' => $v->assignee, 'due' => null, 'status' => 'منجزة، لم تُراجَع',
+                    'url' => $v->public_id ? '/orphans/registry/orphans/'.$v->public_id.'?tab=assessment' : '/orphans/registry', 'urgency' => 1, 'at' => $v->updated_at];
+            }
         }
         $due = DB::table('orphans as o')->join('persons as p', 'p.id', '=', 'o.person_id')->leftJoin('users as u', 'u.id', '=', 'o.assigned_to')->whereNotNull('o.review_due_on')
             ->where('o.review_due_on', '<=', today()->addDays(7)->toDateString())->whereNotIn('o.status', ['ended', 'archived'])->when(! $all, fn ($q) => $q->where('o.assigned_to', $user->id))

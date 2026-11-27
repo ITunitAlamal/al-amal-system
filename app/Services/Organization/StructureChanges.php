@@ -23,7 +23,7 @@ final class StructureChanges
     public const SUGGESTED_UNITS = [
         'ORPHANS' => ['سجلات الأيتام والأوصياء', 'البحث الاجتماعي ومتابعة الحالات', 'الكفالات والمتبرعون', 'الحملات الإغاثية'],
         'HR' => ['شؤون الموظفين والعقود', 'الدوام والإجازات', 'التوظيف والتدريب'],
-        'FIN' => ['المحاسبة والصندوق والبنوك', 'الرواتب والتسويات', 'التحصيل والتقارير المالية'],
+        'FIN' => ['المشتريات', 'المخازن', 'المحاسبة والصندوق والبنوك', 'الرواتب والتسويات', 'التحصيل والتقارير المالية'],
         'ASSETS' => ['سجل الأصول والمباني', 'العقود والتأجير', 'تشغيل المباني وتنسيق الصيانة'],
         'PR' => ['التواصل المؤسسي والإعلام', 'الشراكات والفعاليات'],
     ];
@@ -56,7 +56,7 @@ final class StructureChanges
     public function headedDepartments(User $user): array
     {
         return DB::table('departments as d')->join('department_user_roles as a', fn ($join) => $join->on('a.department_id', '=', 'd.id')->where('a.user_id', $user->id))
-            ->join('roles as r', 'r.id', '=', 'a.role_id')->where('r.code', 'department_head')->where('d.head_user_id', $user->id)
+            ->join('roles as r', 'r.id', '=', 'a.role_id')->where('r.code', 'department_head')->where('d.head_user_id', $user->id)->whereRaw(EffectiveAssignments::sql('a'))
             ->where('d.is_active', true)->whereNull('d.deleted_at')->distinct()->pluck('d.id')->map(fn ($id): int => (int) $id)->all();
     }
 

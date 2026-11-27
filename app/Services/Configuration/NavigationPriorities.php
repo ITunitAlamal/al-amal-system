@@ -12,14 +12,32 @@ final class NavigationPriorities
     public const ORDER = [
         'executive' => ['dashboard', 'finance_approvals', 'kpi_dashboard', 'my_department', 'my_tasks', 'official_correspondence', 'approval_delegations'],
         'administrator' => ['dashboard', 'employee_accounts', 'departments', 'master_data', 'audit_logs', 'navigation_admin', 'dashboard_layouts', 'my_tasks'],
-        'hr_head' => ['dashboard', 'employee_profiles', 'attendance', 'attendance_operations', 'attendance_compensatory', 'leaves_requests', 'leaves_balances', 'hr_dashboard', 'my_tasks'],
-        'hr_staff' => ['my_tasks', 'employee_profiles', 'attendance', 'my_requests', 'leaves_requests', 'dashboard', 'my_profile'],
+        // The unified department (HR, general services and maintenance): the five daily destinations first, then its groups.
+        'hr_head' => ['dashboard', 'my_tasks', 'my_requests_all', 'hr_dashboard', 'official_correspondence',
+            'employee_profiles', 'attendance', 'attendance_compensatory', 'employee_accounts', 'attendance_operations',
+            'services_requests', 'maintenance_requests', 'leaves_requests', 'leaves_balances', 'my_attendance', 'my_profile', 'my_todo'],
+        'hr_staff' => ['dashboard', 'my_tasks', 'my_requests_all', 'hr_dashboard', 'official_correspondence', 'employee_profiles', 'attendance',
+            'leaves_requests', 'leaves_balances', 'my_attendance', 'my_profile', 'my_todo'],
         'orphans' => ['orphans_home', 'orphans_registry', 'orphans_reviews', 'orphans_aid', 'orphans_campaigns', 'orphans_reports', 'dashboard', 'my_tasks'],
         'public_relations' => ['dashboard', 'my_tasks', 'official_correspondence', 'my_requests', 'my_profile'],
-        'finance' => ['dashboard', 'finance_pending', 'finance_home', 'finance_approvals', 'finance_rentals', 'finance_reports', 'finance_payroll_runs', 'finance_staff', 'my_tasks'],
-        'assets' => ['dashboard', 'rentals_file', 'rentals_buildings', 'maintenance_draft', 'my_tasks', 'official_correspondence', 'my_requests'],
-        'maintenance' => ['dashboard', 'my_tasks', 'maintenance_draft', 'my_requests', 'official_correspondence'],
+        'finance' => ['dashboard', 'finance_pending', 'finance_home', 'finance_approvals', 'finance_payments', 'finance_collections', 'finance_rentals', 'finance_reports', 'finance_payroll_runs', 'finance_staff', 'my_tasks'],
+        'assets' => ['dashboard', 'rentals_file', 'rentals_buildings', 'my_tasks', 'official_correspondence', 'my_requests'],
+        'maintenance' => ['dashboard', 'my_tasks', 'my_requests_all', 'hr_dashboard', 'official_correspondence',
+            'leaves_requests', 'leaves_balances', 'my_attendance', 'my_profile', 'my_todo'],
         'employee' => ['dashboard', 'my_tasks', 'my_requests', 'attendance', 'leaves_requests', 'leaves_balances', 'my_profile', 'official_correspondence'],
+    ];
+
+    /**
+     * Entries shown at the top level in one work context, wherever the administrator keeps them: «طلباتي» sits inside
+     * «خدماتي» for everyone, and the people of the unified department open it directly. The entry is only moved; it is
+     * already in the user's authorized menu, and every other context keeps the administrator's arrangement.
+     *
+     * @var array<string, list<string>>
+     */
+    public const LIFTED = [
+        'hr_head' => ['my_requests_all', 'hr_dashboard'],
+        'hr_staff' => ['my_requests_all', 'hr_dashboard'],
+        'maintenance' => ['my_requests_all', 'hr_dashboard'],
     ];
 
     /** @var array<string, string> */
@@ -85,7 +103,7 @@ final class NavigationPriorities
             if ($assignment->department_id !== null && ! $departments->has($assignment->department_id)) {
                 continue;
             }
-            if (in_array($assignment->code, ['finance_accountant', 'finance_head', 'finance_cash_executor'], true)) {
+            if (in_array($assignment->code, ['finance_accountant', 'finance_head', 'finance_procurement', 'finance_warehouse', 'finance_payroll', 'finance_auditor', 'finance_cash_executor', 'finance_receipt_executor'], true)) {
                 $contexts[] = 'finance';
             } elseif ($assignment->code === 'rentals_officer') {
                 $contexts[] = 'assets';
@@ -103,6 +121,7 @@ final class NavigationPriorities
     public function arrange(array $menu, string $context): array
     {
         $priorities = array_flip(self::ORDER[$context] ?? self::ORDER['employee']);
+        $menu = $this->lift($menu, self::LIFTED[$context] ?? []);
         foreach ($menu as &$item) {
             $children = $item['children'] ?? [];
             /** Keep custom section headings attached to their original links. */
@@ -113,6 +132,39 @@ final class NavigationPriorities
         unset($item);
 
         return $this->sort($menu, $priorities);
+    }
+
+    /**
+     * Moves the given entries out of their group to the top level; a group left without links goes with them.
+     * A group the administrator divided with section headings is left as arranged.
+     *
+     * @param  list<array<string, mixed>>  $menu
+     * @param  list<string>  $codes
+     * @return list<array<string, mixed>>
+     */
+    private function lift(array $menu, array $codes): array
+    {
+        if ($codes === []) {
+            return $menu;
+        }
+        $kept = [];
+        $lifted = [];
+        foreach ($menu as $item) {
+            $children = $item['children'] ?? [];
+            $moving = array_values(array_filter($children, fn (array $child): bool => in_array($child['code'], $codes, true)));
+            if ($moving === [] || array_filter($children, fn (array $child): bool => (bool) ($child['heading'] ?? false))) {
+                $kept[] = $item;
+
+                continue;
+            }
+            array_push($lifted, ...array_map(fn (array $child): array => [...$child, 'children' => []], $moving));
+            $item['children'] = array_values(array_filter($children, fn (array $child): bool => ! in_array($child['code'], $codes, true)));
+            if (($item['url'] ?? null) !== null || $item['children'] !== []) {
+                $kept[] = $item;
+            }
+        }
+
+        return [...$kept, ...$lifted];
     }
 
     /** @param list<array<string, mixed>> $items

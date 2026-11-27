@@ -65,9 +65,21 @@ function decide(a, decision) {
         { issue: 'إصدار الإجراء وإبلاغ الموظف؟', reject: 'رفض الإجراء؟', return: 'إعادة الإجراء للتعديل؟' }[decision]);
 }
 function cancel(a) {
-    const text = (note.value[a.id] || '').trim();
+    // The executive director deciding an open cancellation request may keep the requester's reason.
+    const text = (note.value[a.id] || '').trim() || (a.cancel_request?.reason || '').trim();
     if (text.length < 10) { message.value = 'اكتب سبب الإلغاء (10 أحرف على الأقل) في خانة الملاحظة.'; return; }
     post(`/admin/attendance/actions/${a.id}/cancel`, { reason: text }, 'أُلغي الإجراء.', 'إلغاء الإجراء مع حفظ سجله؟');
+}
+// An action that stands on the executive director's decision: the HR head asks, the director cancels or keeps it.
+function requestCancel(a) {
+    const text = (note.value[a.id] || '').trim();
+    if (text.length < 10) { message.value = 'اكتب سبب طلب الإلغاء (10 أحرف على الأقل) في خانة الملاحظة.'; return; }
+    post(`/admin/attendance/actions/${a.id}/cancel-request`, { reason: text }, 'رُفع طلب الإلغاء إلى المدير التنفيذي.', 'رفع طلب إلغاء هذا الإجراء إلى المدير التنفيذي؟');
+}
+function declineCancel(a) {
+    const text = (note.value[a.id] || '').trim();
+    if (text.length < 5) { message.value = 'اكتب سبب إبقاء الإجراء في خانة الملاحظة.'; return; }
+    post(`/admin/attendance/actions/${a.id}/cancel-request/decline`, { note: text }, 'بقي الإجراء قائمًا.', 'إبقاء الإجراء ورفض طلب الإلغاء؟');
 }
 const name = e => [e.first_name_ar, e.father_name_ar, e.family_name_ar].filter(Boolean).join(' ');
 </script>
@@ -92,7 +104,7 @@ const name = e => [e.first_name_ar, e.father_name_ar, e.family_name_ar].filter(B
         </form>
 
         <div class="card flex flex-wrap items-end gap-2">
-            <label class="text-sm font-semibold text-slate-700">الحالة<select v-model="status" class="field mt-1" @change="load"><option value="">الكل</option><option value="draft">مسودة</option><option value="in_review">قيد المراجعة</option><option value="issued">صادر</option><option value="rejected">مرفوض</option><option value="cancelled">ملغى</option></select></label>
+            <label class="text-sm font-semibold text-slate-700">الحالة<select v-model="status" class="field mt-1" @change="load"><option value="">الكل</option><option value="draft">مسودة أو مُعاد للتعديل</option><option value="in_review">قيد المراجعة</option><option value="issued">صادر</option><option value="rejected">مرفوض</option><option value="cancelled">ملغى</option></select></label>
             <label class="text-sm font-semibold text-slate-700">الاسم أو المرجع<input v-model="search" class="field mt-1" @keydown.enter.prevent="load" /></label>
             <button type="button" class="btn btn-secondary" @click="load">بحث</button>
         </div>
@@ -100,29 +112,35 @@ const name = e => [e.first_name_ar, e.father_name_ar, e.family_name_ar].filter(B
         <p v-if="!list.length" class="card text-center text-sm text-slate-500">لا توجد إجراءات.</p>
         <article v-for="a in list" :key="a.id" class="card space-y-2 text-sm">
             <div class="flex flex-wrap items-center gap-2">
-                <span class="rounded-full px-2 py-0.5 text-xs font-bold" :class="requestStatusTone[a.status]">{{ a.status_label }}</span>
+                <span class="rounded-full px-2 py-0.5 text-xs font-bold" :class="a.returned ? 'bg-amber-100 text-amber-900' : requestStatusTone[a.status]">{{ a.status_label }}</span>
                 <strong>{{ a.type }}</strong><span>{{ a.employee_name }}</span><span class="text-xs text-slate-500">{{ a.reference_no }} · إصدار {{ a.version }}</span>
                 <span dir="ltr" class="text-xs">{{ a.incident_date }}</span>
             </div>
             <p>{{ a.facts }}</p>
             <p v-if="a.evidence" class="text-xs text-slate-600">الأدلة: {{ a.evidence }}</p>
             <a v-if="a.has_attachment" :href="`/admin/attendance/actions/${a.id}/attachment`" class="text-xs text-navy-700 underline">المرفق: {{ a.attachment_name }}</a>
-            <p v-if="a.review_note" class="text-xs text-slate-600">ملاحظة المراجعة: {{ a.review_note }} — {{ a.reviewed_by_name }}</p>
+            <p v-if="a.returned" class="alert-warning text-xs">{{ a.created_by === can.user_id ? 'أُعيد إليك للتعديل' : 'أُعيد إلى معدّه للتعديل' }}{{ a.review_note ? `: ${a.review_note}` : '' }}{{ a.reviewed_by_name ? ` — ${a.reviewed_by_name}` : '' }}<template v-if="a.created_by === can.user_id"> · عدّله ثم ارفعه للمراجعة من جديد.</template></p>
+            <p v-else-if="a.review_note" class="text-xs text-slate-600">ملاحظة المراجعة: {{ a.review_note }} — {{ a.reviewed_by_name }}</p>
             <p v-if="a.acknowledged_at" class="text-xs text-slate-600">اطلاع الموظف: {{ a.acknowledged_at }}</p>
             <p v-if="a.employee_response" class="text-xs text-slate-700">رد الموظف: {{ a.employee_response }}</p>
             <p v-if="a.cancel_reason" class="text-xs text-slate-600">سبب الإلغاء: {{ a.cancel_reason }}</p>
+            <p v-if="a.cancel_request" class="alert-warning text-xs">طلب إلغاء من {{ a.cancel_request.by }} <span dir="ltr">{{ a.cancel_request.at }}</span>: {{ a.cancel_request.reason }} — بانتظار قرار المدير التنفيذي.</p>
+            <p v-else-if="a.status === 'issued' && a.executive_owned && !can.executive && can.decide" class="text-xs text-slate-600">صدر بقرار المدير التنفيذي؛ لا يلغيه إلا هو، ويمكنك رفع طلب الإلغاء إليه.</p>
+            <p v-if="a.status === 'in_review' && a.decider === 'executive' && !can.executive" class="text-xs text-slate-600">بانتظار قرار المدير التنفيذي.</p>
             <div v-if="['draft', 'in_review', 'issued'].includes(a.status)" class="flex flex-wrap gap-2">
                 <input v-model="note[a.id]" class="field min-w-0 flex-1" maxlength="2000" placeholder="ملاحظة القرار أو سبب الإلغاء" aria-label="ملاحظة" />
                 <template v-if="a.status === 'draft' && can.manage">
                     <button type="button" class="btn btn-secondary btn-sm" @click="edit(a)">تعديل</button>
                     <button type="button" class="btn btn-primary btn-sm" :disabled="busy" @click="post(`/admin/attendance/actions/${a.id}/submit`, {}, 'رُفع للمراجعة.', 'رفع الإجراء للمراجعة؟')">رفع للمراجعة</button>
                 </template>
-                <template v-if="a.status === 'in_review' && can.decide && a.created_by !== can.user_id">
+                <template v-if="a.status === 'in_review' && can.decide && a.created_by !== can.user_id && (a.decider !== 'executive' || can.executive)">
                     <button type="button" class="btn btn-primary btn-sm" :disabled="busy" @click="decide(a, 'issue')">إصدار</button>
                     <button type="button" class="btn btn-secondary btn-sm" :disabled="busy" @click="decide(a, 'return')">إعادة للتعديل</button>
                     <button type="button" class="btn btn-danger btn-sm" :disabled="busy" @click="decide(a, 'reject')">رفض</button>
                 </template>
-                <button v-if="can.decide || (can.manage && a.status !== 'issued' && a.created_by === can.user_id)" type="button" class="btn btn-secondary btn-sm" :disabled="busy" @click="cancel(a)">إلغاء الإجراء</button>
+                <button v-if="a.can_cancel?.cancel" type="button" class="btn btn-secondary btn-sm" :disabled="busy" @click="cancel(a)">إلغاء الإجراء</button>
+                <button v-if="a.can_cancel?.request_cancel" type="button" class="btn btn-secondary btn-sm" :disabled="busy" @click="requestCancel(a)">طلب الإلغاء من المدير التنفيذي</button>
+                <button v-if="a.can_cancel?.decline_cancel" type="button" class="btn btn-secondary btn-sm" :disabled="busy" @click="declineCancel(a)">إبقاء الإجراء</button>
             </div>
             <details v-if="a.timeline.length" class="text-xs">
                 <summary class="cursor-pointer font-semibold text-navy-800">السجل الزمني ({{ a.timeline.length }})</summary>

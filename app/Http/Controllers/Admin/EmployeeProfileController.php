@@ -9,9 +9,12 @@ use App\Services\Configuration\GazaAddress;
 use App\Services\EmployeeAccountService;
 use App\Services\EmployeeActivationService;
 use App\Services\Hr\EmployeeAccess;
+use App\Services\Hr\EmployeeDocumentAlerts;
+use App\Services\Hr\EmployeeFileChanges;
 use App\Services\Hr\EmployeeNames;
 use App\Services\Hr\EmployeePlacements;
 use App\Services\Hr\EmployeeProfileView;
+use App\Services\Hr\HrServicesDashboard;
 use DateTimeInterface;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Http\JsonResponse;
@@ -22,6 +25,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
@@ -71,6 +75,19 @@ class EmployeeProfileController extends Controller
             $request->user()?->is_active && $request->user()->canManageEmployees(),
             403,
             'إدارة ملفات الموظفين متاحة لمدير النظام ورئيس الموارد البشرية فقط.'
+        );
+    }
+
+    /**
+     * The files list, the forms and the lookups: HR management, and HR staff whose saves wait for the HR head's
+     * approval (EmployeeFileChanges). Account actions, exports and imports stay with HR management.
+     */
+    private function authorizeFiles(Request $request): void
+    {
+        abort_unless(
+            $request->user() && app(EmployeeAccess::class)->canOpenFiles($request->user()),
+            403,
+            'ملفات الموظفين متاحة لإدارة الموارد البشرية وموظفيها.'
         );
     }
 
@@ -133,6 +150,8 @@ class EmployeeProfileController extends Controller
                 : (object) [],
             // Second way to open the account (system administrator only): active now with a temporary password.
             'canActivateDirectly' => $request->user()->isSystemAdmin(),
+            // HR staff: the form sends to the HR head for approval instead of saving.
+            'submitsForReview' => app(EmployeeAccess::class)->canPrepare($request->user()),
         ];
     }
 
@@ -473,7 +492,10 @@ class EmployeeProfileController extends Controller
         }
     }
 
-    private function audit(Request $request, string $action, int $id, ?array $before, array $after, array $relatedTypes = []): void
+    /**
+     * @param  array<string, mixed>  $extra  e.g. the prepared change it applies and who prepared it
+     */
+    private function audit(Request $request, string $action, int $id, ?array $before, array $after, array $relatedTypes = [], array $extra = []): void
     {
         // Compare dates as Y-m-d and booleans as 0/1 so unchanged fields are not reported as changed.
         $comparable = fn (array $values): array => array_map(fn ($value) => match (true) {
@@ -495,6 +517,7 @@ class EmployeeProfileController extends Controller
             'metadata' => json_encode([
                 'changed_fields' => $changed,
                 'related_collections_touched' => $relatedTypes,
+                ...$extra,
             ], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
             'ip_address' => $request->ip(),
             'created_at' => now(),
@@ -502,11 +525,12 @@ class EmployeeProfileController extends Controller
         ]);
     }
 
-    public function index(Request $request): Response
+    public function index(Request $request, EmployeeAccess $access, EmployeeFileChanges $changes): Response
     {
-        $this->authorizeManagement($request);
+        $this->authorizeFiles($request);
 
         $filters = $this->listFilters($request);
+        $user = $request->user();
 
         return Inertia::render('Admin/EmployeeProfiles/Index', [
             'username' => $request->user()->name,
@@ -520,6 +544,10 @@ class EmployeeProfileController extends Controller
             'departments' => DB::table('departments')->whereNull('deleted_at')->orderBy('name')->get(['id', 'name']),
             'smsEnabled' => (bool) config('services.hotsms.enabled', false),
             'accountsWithoutProfile' => $this->accountsWithoutProfile(),
+            'can' => ['manage' => $access->canManage($user), 'prepare' => $access->canPrepare($user), 'review' => $access->canReviewChanges($user)],
+            // What HR staff prepared: waiting for the HR head (management), or the viewer's own open ones (HR staff).
+            'fileChanges' => EmployeeFileChanges::available() ? ['url' => EmployeeFileChanges::url(),
+                'count' => $access->canManage($user) ? $changes->pendingCount() : count($changes->rows($user, 'open'))] : null,
         ]);
     }
 
@@ -533,7 +561,7 @@ class EmployeeProfileController extends Controller
         return [
             'search' => mb_substr(trim((string) $request->query('search', '')), 0, 100),
             'department' => max(0, $request->integer('department')),
-            'state' => in_array($state, ['imported', 'no_account', 'draft', 'name_review'], true) ? $state : '',
+            'state' => in_array($state, ['imported', 'no_account', 'draft', 'name_review', 'review', 'documents_expiring', 'documents_missing'], true) ? $state : '',
         ];
     }
 
@@ -567,6 +595,11 @@ class EmployeeProfileController extends Controller
             ->when($filters['state'] === 'no_account', fn ($query) => $query->whereNull('e.user_id'))
             ->when($filters['state'] === 'draft', fn ($query) => $query->where('e.onboarding_status', 'draft'))
             ->when($filters['state'] === 'name_review', fn ($query) => $query->where('e.name_review_status', 'suggested'))
+            ->when($filters['state'] === 'review', fn ($query) => $query->whereIn('e.id', app(HrServicesDashboard::class)->staffFilesForReview()->select('e.id')))
+            // The same rows the HR dashboards count and «hr:document-alerts» announces (EmployeeDocumentAlerts).
+            ->when($filters['state'] === 'documents_expiring', fn ($query) => $query->whereIn('e.id', app(EmployeeDocumentAlerts::class)->expiring()->select('e.id')))
+            ->when($filters['state'] === 'documents_missing', fn ($query) => ($missing = app(EmployeeDocumentAlerts::class)->missing()) !== null
+                ? $query->whereIn('e.id', $missing->select('e.id')) : $query->whereRaw('false'))
             ->orderByDesc('e.id');
     }
 
@@ -620,7 +653,7 @@ class EmployeeProfileController extends Controller
 
     public function create(Request $request): Response
     {
-        $this->authorizeManagement($request);
+        $this->authorizeFiles($request);
 
         return Inertia::render('Admin/EmployeeProfiles/Form', [
             'username' => $request->user()->name,
@@ -793,9 +826,9 @@ class EmployeeProfileController extends Controller
      * Create the employee and related records atomically. The activation SMS is sent only after the
      * response, so a slow or unavailable SMS gateway never delays the screen or loses the new profile.
      */
-    public function store(Request $request, EmployeeAccountService $accounts, EmployeeActivationService $activation): RedirectResponse
+    public function store(Request $request, EmployeeAccountService $accounts, EmployeeActivationService $activation, EmployeeAccess $access, EmployeeFileChanges $changes): RedirectResponse
     {
-        $this->authorizeManagement($request);
+        $this->authorizeFiles($request);
 
         abort_unless(Schema::hasColumn('users', 'must_change_password'), 503, 'حقل التحقق الأمني غير جاهز.');
 
@@ -805,97 +838,18 @@ class EmployeeProfileController extends Controller
         if (isset($data['addresses'])) {
             $data['addresses'] = app(GazaAddress::class)->employeeRows($data['addresses']);
         }
-        $this->verifyReferences($data);
-        $this->validateFinalOnboarding($data);
+        $this->checkNewProfile($data);
 
-        // An archived employee number must not be reused.
-        if (Employee::withTrashed()->where('employee_number', $data['employee_number'])->exists()) {
-            throw ValidationException::withMessages(['employee_number' => 'الرقم الوظيفي مستخدم في ملف حالي أو مؤرشف.']);
+        // HR staff: the new file waits for the HR head's approval (approved HR requirements §7.1); nothing is created yet.
+        if ($access->canPrepare($request->user())) {
+            $this->accountForNewProfile($data, false);
+            $id = $changes->submitCreate($request->user(), $data, $request->integer('file_change_id') ?: null, $request->ip());
+
+            return redirect()->to(EmployeeFileChanges::url($id))
+                ->with('success', 'أُرسل الملف إلى رئيس الموارد البشرية للاعتماد. يُنشأ الملف وحساب الدخول بعد اعتماده.');
         }
 
-        foreach (['addresses', 'qualifications', 'family_members', 'leave_opening_balances'] as $collection) {
-            foreach ($data[$collection] ?? [] as $index => $row) {
-                if (isset($row['id'])) {
-                    throw ValidationException::withMessages(["{$collection}.{$index}.id" => 'لا يمكن ربط سجل قديم بملف موظف جديد.']);
-                }
-            }
-        }
-
-        $this->verifyRows($data);
-
-        $created = DB::transaction(function () use ($request, $accounts, $activation, $data, $choice) {
-            $basic = Arr::except($data, ['addresses', 'qualifications', 'family_members', 'leave_opening_balances', 'confirm_no_opening_balances', 'link_existing_account', 'name_parts_reviewed']);
-            $number = $basic['employee_number'];
-
-            // Serialize concurrent linking/creation for an existing account.
-            $existingUser = User::query()->where('employee_number', $number)->lockForUpdate()->first();
-
-            if ($existingUser) {
-                if (! ($data['link_existing_account'] ?? false)) {
-                    throw ValidationException::withMessages([
-                        'employee_number' => 'هذا الرقم مرتبط بحساب مستخدم موجود. راجع الاسم وأكّد ربط الملف بالحساب الحالي.',
-                    ]);
-                }
-
-                // Matching name is an extra guard, not proof of identity. Accounts often hold a short name
-                // («هاني دبابش») while the profile needs all four parts, so the first and family names are compared.
-                if (! $this->accountNameMatches((string) $existingUser->name, (string) ($basic['first_name_ar'] ?? ''), (string) ($basic['family_name_ar'] ?? ''))) {
-                    throw ValidationException::withMessages([
-                        'employee_number' => "اسم الحساب «{$existingUser->name}» لا يطابق الاسم الأول واسم العائلة في الملف. راجع الهوية، أو صحّح اسم الحساب من «حسابات الموظفين والأدوار».",
-                    ]);
-                }
-
-                if (Employee::withTrashed()->where('user_id', $existingUser->id)->exists()) {
-                    throw ValidationException::withMessages(['employee_number' => 'الحساب مرتبط بملف موظف مسبقًا أو بملف مؤرشف.']);
-                }
-
-                if ((int) ($basic['department_id'] ?? 0) !== (int) $existingUser->department_id) {
-                    throw ValidationException::withMessages([
-                        'department_id' => 'يجب أن يطابق قسم الملف قسم الحساب المرتبط. عدّل تكليف الحساب أولًا من إدارة الموظفين.',
-                    ]);
-                }
-
-                // Existing account data (password, role assignments, department, enabled state) stays untouched.
-                $profile = new Employee;
-                $profile->fill($basic);
-                $profile->user_id = $existingUser->id;
-                $profile->created_by = $request->user()->id;
-                $profile->updated_by = $request->user()->id;
-                $profile->save();
-
-                $result = ['employee' => $profile, 'user' => $existingUser, 'linked_existing' => true];
-            } else {
-                if ($data['link_existing_account'] ?? false) {
-                    throw ValidationException::withMessages([
-                        'employee_number' => 'لا يوجد حساب مطابق للربط. ألغِ خيار الربط لإنشاء حساب جديد.',
-                    ]);
-                }
-
-                $result = $accounts->create($basic);
-                $result['linked_existing'] = false;
-            }
-
-            $employee = $result['employee'];
-            $actor = (int) $request->user()->id;
-            $this->saveSubmittedRelations($employee, $data, $actor);
-            $this->saveOpeningBalances($employee, $data['leave_opening_balances'] ?? [], $actor);
-            app(EmployeePlacements::class)->record($employee->id, $employee->only(['department_id', 'job_title_id', 'job_grade_id']),
-                ($employee->work_start_date ?? $employee->hire_date ?? now())->format('Y-m-d'), 'profile', 'إنشاء ملف الموظف', $actor);
-
-            $employee->onboarding_status = $result['linked_existing'] ? 'completed' : 'pending_activation';
-            $employee->onboarding_step = 5;
-            $employee->onboarding_completed_at = now();
-            $employee->save();
-
-            $this->audit($request, 'employee_profile.created', $employee->id, null, $basic,
-                array_values(array_intersect(['addresses', 'qualifications', 'family_members', 'leave_opening_balances'], array_keys($data))));
-
-            if ($choice['direct'] && ! $result['linked_existing']) {
-                $activation->activateByAdministrator($request->user(), $result['user'], (string) $choice['password'], $request->ip());
-            }
-
-            return $result;
-        });
+        $created = $this->createProfile($request, $data, $choice, (int) $request->user()->id, [], $accounts, $activation);
 
         if ($created['linked_existing']) {
             return redirect()->route('admin.employee-profiles.show', $created['employee']->id)
@@ -915,6 +869,134 @@ class EmployeeProfileController extends Controller
         }
 
         return redirect()->route('admin.employee-profiles.show', $created['employee']->id)->with('success', $message);
+    }
+
+    /**
+     * The checks a new file passes before anything is written, whether it is saved now or submitted for approval.
+     *
+     * @param  array<string, mixed>  $data  validated form data
+     */
+    private function checkNewProfile(array $data): void
+    {
+        $this->verifyReferences($data);
+        $this->validateFinalOnboarding($data);
+
+        // An archived employee number must not be reused.
+        if (Employee::withTrashed()->where('employee_number', $data['employee_number'])->exists()) {
+            throw ValidationException::withMessages(['employee_number' => 'الرقم الوظيفي مستخدم في ملف حالي أو مؤرشف.']);
+        }
+
+        foreach (['addresses', 'qualifications', 'family_members', 'leave_opening_balances'] as $collection) {
+            foreach ($data[$collection] ?? [] as $index => $row) {
+                if (isset($row['id'])) {
+                    throw ValidationException::withMessages(["{$collection}.{$index}.id" => 'لا يمكن ربط سجل قديم بملف موظف جديد.']);
+                }
+            }
+        }
+
+        $this->verifyRows($data);
+    }
+
+    /**
+     * The existing login account a new file links to (or null when a new account is created), after its checks.
+     * Locked when the file is written, to serialize concurrent linking or creation for one account.
+     *
+     * @param  array<string, mixed>  $data
+     */
+    private function accountForNewProfile(array $data, bool $lock): ?User
+    {
+        $existingUser = User::query()->where('employee_number', $data['employee_number'])->when($lock, fn ($query) => $query->lockForUpdate())->first();
+        $link = (bool) ($data['link_existing_account'] ?? false);
+
+        if (! $existingUser) {
+            if ($link) {
+                throw ValidationException::withMessages([
+                    'employee_number' => 'لا يوجد حساب مطابق للربط. ألغِ خيار الربط لإنشاء حساب جديد.',
+                ]);
+            }
+
+            return null;
+        }
+
+        if (! $link) {
+            throw ValidationException::withMessages([
+                'employee_number' => 'هذا الرقم مرتبط بحساب مستخدم موجود. راجع الاسم وأكّد ربط الملف بالحساب الحالي.',
+            ]);
+        }
+
+        // Matching name is an extra guard, not proof of identity. Accounts often hold a short name
+        // («هاني دبابش») while the profile needs all four parts, so the first and family names are compared.
+        if (! $this->accountNameMatches((string) $existingUser->name, (string) ($data['first_name_ar'] ?? ''), (string) ($data['family_name_ar'] ?? ''))) {
+            throw ValidationException::withMessages([
+                'employee_number' => "اسم الحساب «{$existingUser->name}» لا يطابق الاسم الأول واسم العائلة في الملف. راجع الهوية، أو صحّح اسم الحساب من «حسابات الموظفين والأدوار».",
+            ]);
+        }
+
+        if (Employee::withTrashed()->where('user_id', $existingUser->id)->exists()) {
+            throw ValidationException::withMessages(['employee_number' => 'الحساب مرتبط بملف موظف مسبقًا أو بملف مؤرشف.']);
+        }
+
+        if ((int) ($data['department_id'] ?? 0) !== (int) $existingUser->department_id) {
+            throw ValidationException::withMessages([
+                'department_id' => 'يجب أن يطابق قسم الملف قسم الحساب المرتبط. عدّل تكليف الحساب أولًا من إدارة الموظفين.',
+            ]);
+        }
+
+        return $existingUser;
+    }
+
+    /**
+     * Creates the employee and related records atomically. $actorId is who entered the file (created_by/updated_by):
+     * the HR head or administrator themselves, or the HR staff member whose prepared file is being approved.
+     *
+     * @param  array<string, mixed>  $data
+     * @param  array{direct: bool, password: ?string}  $choice
+     * @param  array<string, mixed>  $auditExtra
+     * @return array{employee: Employee, user: User, linked_existing: bool}
+     */
+    private function createProfile(Request $request, array $data, array $choice, int $actorId, array $auditExtra, EmployeeAccountService $accounts, EmployeeActivationService $activation): array
+    {
+        return DB::transaction(function () use ($request, $accounts, $activation, $data, $choice, $actorId, $auditExtra): array {
+            $basic = Arr::except($data, ['addresses', 'qualifications', 'family_members', 'leave_opening_balances', 'confirm_no_opening_balances', 'link_existing_account', 'name_parts_reviewed']);
+            $existingUser = $this->accountForNewProfile($data, true);
+
+            if ($existingUser) {
+                // Existing account data (password, role assignments, department, enabled state) stays untouched.
+                $profile = new Employee;
+                $profile->fill($basic);
+                $profile->user_id = $existingUser->id;
+                $profile->created_by = $actorId;
+                $profile->updated_by = $actorId;
+                $profile->save();
+
+                $result = ['employee' => $profile, 'user' => $existingUser, 'linked_existing' => true];
+            } else {
+                $result = $accounts->create($basic);
+                $result['linked_existing'] = false;
+            }
+
+            $employee = $result['employee'];
+            $this->saveSubmittedRelations($employee, $data, $actorId);
+            $this->saveOpeningBalances($employee, $data['leave_opening_balances'] ?? [], $actorId);
+            app(EmployeePlacements::class)->record($employee->id, $employee->only(['department_id', 'job_title_id', 'job_grade_id']),
+                ($employee->work_start_date ?? $employee->hire_date ?? now())->format('Y-m-d'), 'profile', 'إنشاء ملف الموظف', $actorId);
+
+            $employee->onboarding_status = $result['linked_existing'] ? 'completed' : 'pending_activation';
+            $employee->onboarding_step = 5;
+            $employee->onboarding_completed_at = now();
+            $employee->created_by = $actorId;
+            $employee->updated_by = $actorId;
+            $employee->save();
+
+            $this->audit($request, 'employee_profile.created', $employee->id, null, $basic,
+                array_values(array_intersect(['addresses', 'qualifications', 'family_members', 'leave_opening_balances'], array_keys($data))), $auditExtra);
+
+            if ($choice['direct'] && ! $result['linked_existing']) {
+                $activation->activateByAdministrator($request->user(), $result['user'], (string) $choice['password'], $request->ip());
+            }
+
+            return $result;
+        });
     }
 
     /**
@@ -1049,7 +1131,9 @@ class EmployeeProfileController extends Controller
         $record = $this->employeeOr404($employee);
         abort_unless($request->user() && $access->canView($request->user(), $record), 403, 'لا تملك صلاحية الاطلاع على هذا الملف.');
 
-        return Inertia::render('Admin/EmployeeProfiles/Show', [...$view->build($request->user(), $record), ...$this->accountPanel($request, $record, $access)]);
+        return Inertia::render('Admin/EmployeeProfiles/Show', [...$view->build($request->user(), $record), ...$this->accountPanel($request, $record, $access),
+            // A change HR staff prepared on this file and the HR head has not decided yet.
+            'fileChange' => app(EmployeeFileChanges::class)->banner($request->user(), (int) $record->id)]);
     }
 
     /**
@@ -1152,18 +1236,174 @@ class EmployeeProfileController extends Controller
         return back()->with('success', 'أُنشئ حساب دخول بانتظار التفعيل. خدمة SMS معطّلة؛ أرسل الرمز من هذا الملف بعد تفعيلها.');
     }
 
-    public function edit(Request $request, int $employee): Response
+    public function edit(Request $request, int $employee, EmployeeFileChanges $changes): Response
     {
-        $this->authorizeManagement($request);
+        $this->authorizeFiles($request);
         $record = $this->employeeOr404($employee);
+        $payload = $this->employeePayload($record);
+        // HR staff continue their own open change: the form shows it, so a later step does not send old values back.
+        $open = $changes->openFor((int) $record->id);
+        if ($open !== null && (int) $open->prepared_by === (int) $request->user()->id) {
+            $payload = $changes->overlay($payload, $open);
+        }
 
         return Inertia::render('Admin/EmployeeProfiles/Form', [
             'username' => $request->user()->name,
             'navigation' => $this->navigation(),
-            'employee' => $this->employeePayload($record),
+            'employee' => $payload,
             'leaveOnboarding' => $this->leaveOnboardingContext($record->id),
             'lookups' => $this->lookups($request, $record),
+            'fileChange' => $changes->banner($request->user(), (int) $record->id),
         ]);
+    }
+
+    /** HR staff reopen a new file they prepared (returned to them, or still waiting) to correct and resend it. */
+    public function editChange(Request $request, int $change, EmployeeAccess $access): Response
+    {
+        abort_unless($request->user() && $access->canPrepare($request->user()) && EmployeeFileChanges::available(), 403);
+        $row = DB::table('employee_file_changes')->where('id', $change)->first();
+        abort_unless($row && $row->kind === 'create' && (int) $row->prepared_by === (int) $request->user()->id
+            && in_array($row->status, EmployeeFileChanges::OPEN, true), 404);
+
+        return Inertia::render('Admin/EmployeeProfiles/Form', [
+            'username' => $request->user()->name,
+            'navigation' => $this->navigation(),
+            'employee' => null,
+            'prefill' => null,
+            'draft' => json_decode((string) $row->payload, true) ?: [],
+            'fileChange' => ['id' => (int) $row->id, 'status' => $row->status, 'note' => $row->review_note, 'own' => true],
+            'leaveOnboarding' => $this->leaveOnboardingContext(),
+            'lookups' => $this->lookups($request),
+        ]);
+    }
+
+    /**
+     * «تعديلات ملفات الموظفين»: what HR staff prepared. The HR head approves or returns it; the administrator reads it;
+     * HR staff follow, correct or withdraw their own.
+     */
+    public function changes(Request $request, EmployeeFileChanges $changes, EmployeeAccess $access): Response
+    {
+        $user = $request->user();
+        abort_unless($user && $access->canOpenFiles($user), 403, 'ملفات الموظفين متاحة لإدارة الموارد البشرية وموظفيها.');
+        abort_unless(EmployeeFileChanges::available(), 503, 'مراجعة ملفات الموظفين غير مفعلة بعد.');
+        $scope = $request->query('scope') === 'all' ? 'all' : 'open';
+        $selected = $request->integer('change');
+
+        return Inertia::render('Admin/EmployeeProfiles/Changes', [
+            'rows' => $changes->rows($user, $scope),
+            'scope' => $scope,
+            'selected' => $selected > 0 ? $changes->detail($user, $selected) : null,
+            'can' => ['review' => $access->canReviewChanges($user), 'prepare' => $access->canPrepare($user), 'manage' => $access->canManage($user)],
+        ]);
+    }
+
+    /**
+     * The HR head approves a prepared file or change: it is checked again against the file as it is now and written
+     * exactly like the head's own save, with the preparer as author and the approval recorded.
+     */
+    public function approveChange(Request $request, int $change, EmployeeFileChanges $changes, EmployeeAccountService $accounts, EmployeeActivationService $activation): RedirectResponse
+    {
+        $revision = (int) $request->validate(['revision' => ['required', 'integer', 'min:1']])['revision'];
+        $created = null;
+        $changes->approve($request->user(), $change, $revision, function (object $item, array $payload, int $preparedBy) use ($request, $accounts, $activation, &$created): int {
+            $extra = ['file_change_id' => (int) $item->id, 'prepared_by' => $preparedBy];
+            if ($item->kind === 'create') {
+                $data = Validator::make($payload, $this->rules(), $this->messages(), ['national_id' => 'رقم الوثيقة'])->validate();
+                $this->checkNewProfile($data);
+                $created = $this->createProfile($request, $data, ['direct' => false, 'password' => null], $preparedBy, $extra, $accounts, $activation);
+
+                return (int) $created['employee']->id;
+            }
+            $record = Employee::query()->findOrFail($item->employee_id);
+            $this->revalidateUpdate($record, $payload);
+            $this->applyUpdate($request, (int) $record->id, $payload, $preparedBy, $extra);
+
+            return (int) $record->id;
+        }, $request->ip());
+
+        $message = 'اعتُمد التعديل وثُبّت في ملف الموظف، وسُجل من أعده ومن اعتمده.';
+        if ($created !== null) {
+            if ($created['linked_existing']) {
+                $message = 'اعتُمد الملف الجديد ورُبط بحساب الموظف القائم دون تعديل كلمة مروره أو صلاحياته.';
+            } elseif (config('services.hotsms.enabled', false)) {
+                $this->sendActivationAfterResponse($activation, $created['user']);
+                $message = 'اعتُمد الملف الجديد وأُنشئ له حساب دخول بانتظار التفعيل؛ سيصل رمز التفعيل إلى الجوال الأساسي خلال لحظات.';
+            } else {
+                $message = 'اعتُمد الملف الجديد وأُنشئ له حساب دخول بانتظار التفعيل. خدمة SMS معطّلة؛ أرسل الرمز من ملف الموظف بعد تفعيلها.';
+            }
+        }
+
+        return redirect()->to(EmployeeFileChanges::url($change))->with('success', $message);
+    }
+
+    public function returnChange(Request $request, int $change, EmployeeFileChanges $changes): RedirectResponse
+    {
+        $data = $request->validate([
+            'revision' => ['required', 'integer', 'min:1'],
+            'note' => ['required', 'string', 'min:3', 'max:2000'],
+        ], [], ['note' => 'الملاحظة']);
+        $changes->returnToPreparer($request->user(), $change, (int) $data['revision'], (string) $data['note'], $request->ip());
+
+        return redirect()->to(EmployeeFileChanges::url($change))->with('success', 'أُعيد التعديل إلى مُعِدّه مع ملاحظتك.');
+    }
+
+    public function withdrawChange(Request $request, int $change, EmployeeFileChanges $changes): RedirectResponse
+    {
+        $changes->withdraw($request->user(), $change, $request->ip());
+
+        return redirect()->to(EmployeeFileChanges::url())->with('success', 'سُحب التعديل؛ لم يُغيَّر شيء في ملف الموظف.');
+    }
+
+    /**
+     * The profile columns the form edits (rule keys of the file itself, not of its row collections).
+     *
+     * @return list<string>
+     */
+    private function basicKeys(Employee $record): array
+    {
+        return array_values(array_filter(array_keys($this->rules($record)), fn (string $key): bool => ! str_contains($key, '.')
+            && ! in_array($key, ['addresses', 'qualifications', 'family_members', 'leave_opening_balances', 'confirm_no_opening_balances'], true)));
+    }
+
+    /**
+     * At approval, a prepared change is validated again as the whole file it produces (the file as it is now with
+     * the change on top), so a department, title or constant deactivated meanwhile is refused.
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    private function revalidateUpdate(Employee $record, array $payload): void
+    {
+        $collections = array_keys(EmployeeFileChanges::COLLECTIONS);
+        $merged = [];
+        foreach ($this->basicKeys($record) as $key) {
+            if ($key !== 'name_parts_reviewed') {
+                $value = $record->getAttribute($key);
+                $merged[$key] = $value instanceof DateTimeInterface ? $value->format('Y-m-d') : $value;
+            }
+        }
+        $merged = [...$merged, ...Arr::except($payload, $collections), ...Arr::only($payload, $collections)];
+        $data = Validator::make($merged, $this->rules($record), $this->messages(), ['national_id' => 'رقم الوثيقة'])->validate();
+        $this->verifyReferences($data, $record);
+    }
+
+    /**
+     * The employee number and department of a file with a login account change on «حسابات الموظفين والأدوار» only.
+     *
+     * @param  array<string, mixed>  $basic
+     */
+    private function verifyAccountFields(Employee $record, array $basic): void
+    {
+        if ($record->user_id === null) {
+            return;
+        }
+        $account = User::query()->findOrFail($record->user_id);
+        foreach (['employee_number', 'department_id'] as $field) {
+            if (array_key_exists($field, $basic) && (string) $basic[$field] !== (string) $account->{$field}) {
+                throw ValidationException::withMessages([
+                    $field => 'عدّل الرقم الوظيفي والقسم من «حسابات الموظفين والأدوار» لضمان تطابق الحساب والملف.',
+                ]);
+            }
+        }
     }
 
     /**
@@ -1260,9 +1500,9 @@ class EmployeeProfileController extends Controller
         }
     }
 
-    public function update(Request $request, int $employee): RedirectResponse
+    public function update(Request $request, int $employee, EmployeeAccess $access, EmployeeFileChanges $changes): RedirectResponse
     {
-        $this->authorizeManagement($request);
+        $this->authorizeFiles($request);
         $record = $this->employeeOr404($employee);
 
         $request->merge($this->cleanBlankChildren($request));
@@ -1272,14 +1512,38 @@ class EmployeeProfileController extends Controller
         }
         $this->verifyReferences($data, $record);
 
+        // HR staff: the change waits for the HR head's approval; the file is untouched until then.
+        if ($access->canPrepare($request->user())) {
+            $this->verifyRelated($record, $data);
+            $this->verifyAccountFields($record, Arr::only($data, $this->basicKeys($record)));
+            $changes->submitUpdate($request->user(), $record, $data, $this->basicKeys($record), $request->ip());
+
+            return redirect()->route('admin.employee-profiles.show', $employee)
+                ->with('success', 'أُرسلت البيانات إلى رئيس الموارد البشرية للاعتماد؛ تظهر في الملف بعد اعتمادها.');
+        }
+
+        $this->applyUpdate($request, $employee, $data, (int) $request->user()->id, []);
+
+        return redirect()->route('admin.employee-profiles.show', $employee)
+            ->with('success', 'تم حفظ بيانات الموظف والسجلات التابعة المرسلة دون تعديل الحساب أو الصلاحيات.');
+    }
+
+    /**
+     * Writes a change to the file. $actorId is who entered it (updated_by): the HR head or administrator themselves,
+     * or the HR staff member whose prepared change is being approved (the approval is in $auditExtra and on the change).
+     *
+     * @param  array<string, mixed>  $data
+     * @param  array<string, mixed>  $auditExtra
+     */
+    private function applyUpdate(Request $request, int $employee, array $data, int $actorId, array $auditExtra): void
+    {
         // Lock the employee during the multi-table operation; audit and dependent
         // data are committed together. Never modify user credentials or roles here.
-        DB::transaction(function () use ($request, $employee, $data) {
+        DB::transaction(function () use ($request, $employee, $data, $actorId, $auditExtra) {
             $record = Employee::query()->lockForUpdate()->findOrFail($employee);
             $this->verifyRelated($record, $data);
 
-            $basicFields = array_keys(Arr::except($this->rules($record), ['addresses', 'qualifications', 'family_members', 'leave_opening_balances', 'confirm_no_opening_balances']));
-            $basic = Arr::only($data, $basicFields);
+            $basic = Arr::only($data, $this->basicKeys($record));
             // HR confirms the suggested split of an imported name; until then the source full name is the reference.
             if (array_key_exists('name_parts_reviewed', $basic)) {
                 if ($basic['name_parts_reviewed']) {
@@ -1296,25 +1560,16 @@ class EmployeeProfileController extends Controller
                 $basic['has_family_members'] = true;
             }
 
-            if ($record->user_id !== null) {
-                $account = User::query()->findOrFail($record->user_id);
-                foreach (['employee_number', 'department_id'] as $field) {
-                    if (array_key_exists($field, $basic) && (string) $basic[$field] !== (string) $account->{$field}) {
-                        throw ValidationException::withMessages([
-                            $field => 'عدّل الرقم الوظيفي والقسم من «حسابات الموظفين والأدوار» لضمان تطابق الحساب والملف.',
-                        ]);
-                    }
-                }
-            }
+            $this->verifyAccountFields($record, $basic);
 
             $before = $record->only(array_keys($basic));
             $moved = collect(['department_id', 'job_title_id', 'job_grade_id'])
                 ->contains(fn (string $key): bool => array_key_exists($key, $basic) && (string) ($before[$key] ?? '') !== (string) ($basic[$key] ?? ''));
             $record->fill($basic);
-            $record->updated_by = $request->user()->id;
+            $record->updated_by = $actorId;
             $record->save();
 
-            $actor = (int) $request->user()->id;
+            $actor = $actorId;
             if ($moved) {
                 // A transfer closes the previous placement; the history is never overwritten.
                 app(EmployeePlacements::class)->record($record->id, $record->only(['department_id', 'job_title_id', 'job_grade_id', 'department_source', 'job_title_source', 'grade_source']),
@@ -1353,16 +1608,13 @@ class EmployeeProfileController extends Controller
             }
 
             $touched = array_values(array_intersect(['addresses', 'qualifications', 'family_members'], array_keys($data)));
-            $this->audit($request, 'employee_profile.updated', $record->id, $before, $basic, $touched);
+            $this->audit($request, 'employee_profile.updated', $record->id, $before, $basic, $touched, $auditExtra);
         });
-
-        return redirect()->route('admin.employee-profiles.show', $employee)
-            ->with('success', 'تم حفظ بيانات الموظف والسجلات التابعة المرسلة دون تعديل الحساب أو الصلاحيات.');
     }
 
     public function lookup(Request $request): JsonResponse
     {
-        $this->authorizeManagement($request);
+        $this->authorizeFiles($request);
 
         return response()->json($this->lookups($request));
     }

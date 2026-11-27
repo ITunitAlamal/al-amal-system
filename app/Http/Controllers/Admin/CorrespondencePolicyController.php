@@ -7,6 +7,7 @@ use App\Services\AuditService;
 use App\Services\Correspondence\CorrespondenceAccess;
 use App\Services\Correspondence\CorrespondenceDocuments;
 use App\Services\Correspondence\CorrespondenceRegistry;
+use App\Services\Organization\RoleSeparation;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -69,6 +70,7 @@ final class CorrespondencePolicyController extends Controller
             abort_unless($row && $row->department_id, 422);
             $role = DB::table('roles')->where('id', $row->role_id)->value('code');
             abort_unless(in_array($role, ['department_head', 'acting_department_head', 'executive_director', 'secretariat', 'board_secretary'], true), 422);
+            RoleSeparation::assertAllowed((int) $row->user_id, (string) $role, 'ends_on', $data['starts_on'], $data['ends_on'], (int) $row->id);
             DB::table('department_user_roles')->where('id', $assignment)->update(['starts_on' => $data['starts_on'], 'ends_on' => $data['ends_on'], 'updated_at' => now()]);
             $audit->recordRow('correspondence.appointment.dates', 'department_user_roles', $assignment, (array) $row, $data, (int) $request->user()->id);
         });

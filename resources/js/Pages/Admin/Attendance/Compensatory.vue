@@ -6,7 +6,7 @@ import PageHeader from '../../../Components/PageHeader.vue';
 import StatusBadge from '../../../Components/StatusBadge.vue';
 import StatusStepper from '../../../Components/StatusStepper.vue';
 
-const props = defineProps({ emergency_holidays: Array, compensatory_work: Array, official_holidays: Array, employees: Array, departments: Array, canApprove: Boolean });
+const props = defineProps({ emergency_holidays: Array, compensatory_work: Array, official_holidays: Array, employees: Array, departments: Array, canApprove: Boolean, canRegisterHoliday: Boolean, canRegisterWork: Boolean });
 const holiday = useForm({ holiday_date: '', name: '', reason: '', employee_id: '', department_id: '' });
 const work = useForm({ employee_id: '', work_date: '', reason: '' });
 const submit = (form, path) => form.post(path, { preserveScroll: true, onSuccess: () => form.reset() });
@@ -32,7 +32,8 @@ function name(id) {
 
             <section class="card space-y-4">
                 <h2 class="card-title">طلب عطلة طارئة</h2>
-                <form class="grid gap-3 md:grid-cols-2" @submit.prevent="submit(holiday, '/admin/attendance/compensatory/holidays')">
+                <p class="text-sm text-slate-600">يسجّلها رئيس قسم الموارد البشرية، ويعتمدها المدير التنفيذي وحده.</p>
+                <form v-if="canRegisterHoliday" class="grid gap-3 md:grid-cols-2" @submit.prevent="submit(holiday, '/admin/attendance/compensatory/holidays')">
                     <div>
                         <label for="holiday-date" class="field-label">التاريخ *</label>
                         <input id="holiday-date" v-model="holiday.holiday_date" type="date" required class="field" />
@@ -79,7 +80,8 @@ function name(id) {
             <section class="card space-y-4">
                 <h2 class="card-title">تكليف عمل في يوم عطلة / إجازة تعويضية</h2>
                 <p class="alert-info">العمل المعتمد في عطلة رسمية أو يوم راحة أسبوعية يمنح يومًا تعويضيًا كاملًا بغض النظر عن ساعات العمل، بعد اعتماد التكليف وإثبات بصمتي الحضور والانصراف. لا يُمنح اليوم مرتين لنفس التكليف.</p>
-                <form class="grid gap-3 md:grid-cols-2" @submit.prevent="submit(work, '/admin/attendance/compensatory/work')">
+                <p class="text-sm text-slate-600">تسجّله الموارد البشرية، ويعتمده المدير التنفيذي ويمنح اليوم التعويضي.</p>
+                <form v-if="canRegisterWork" class="grid gap-3 md:grid-cols-2" @submit.prevent="submit(work, '/admin/attendance/compensatory/work')">
                     <div>
                         <label for="work-employee" class="field-label">الموظف *</label>
                         <select id="work-employee" v-model="work.employee_id" required class="field"><option value="">اختر</option><option v-for="e in employees" :key="e.id" :value="e.id">{{ name(e.id) }}</option></select>

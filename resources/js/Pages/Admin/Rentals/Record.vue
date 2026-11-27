@@ -40,6 +40,15 @@ function submitDraft() {
     if (confirm('إرسال الطلب إلى مسار الاعتماد؟ بعد الإرسال لا يُعدَّل إلا إذا أُعيد إليك.')) router.post(`/admin/rentals/records/${props.type}/${r.value.id}/submit`, {}, { preserveScroll: true });
 }
 
+/* Withdrawing a draft or returned request, or closing an approved application without a contract */
+const closingApproved = computed(() => props.type === 'application' && r.value.status === 'approved');
+const withdrawLabel = computed(() => closingApproved.value ? 'إغلاق الطلب دون تعاقد' : 'سحب الطلب');
+const withdrawing = ref(false);
+const withdrawForm = useForm({ reason: '' });
+function withdraw() {
+    withdrawForm.post(`/admin/rentals/records/${props.type}/${r.value.id}/withdraw`, { preserveScroll: true, onSuccess: () => { withdrawing.value = false; withdrawForm.reset(); } });
+}
+
 /* Documents */
 const upload = useForm({ file: null, document_type_value_id: null, title: '', supersedes_id: null });
 const currentDocs = computed(() => props.documents.filter(d => d.current));
@@ -72,7 +81,7 @@ const outcomeLabels = { vacant: 'شاغرة', maintenance: 'تحت الصيان�
 <template>
 <AppLayout :title="title">
 <div dir="rtl" class="mx-auto max-w-6xl space-y-5">
-    <PageHeader eyebrow="ملف الإيجارات" :title="title" :description="workflow ? `رقم المعاملة ${workflow.referenceNo}` : 'مسودة لم تُرسل بعد'">
+    <PageHeader eyebrow="ملف الإيجارات" :title="title" :description="workflow ? `رقم المعاملة ${workflow.referenceNo}` : (record.status === 'cancelled' ? 'سُحب قبل الإرسال' : 'مسودة لم تُرسل بعد')">
         <Link :href="`/admin/rentals?tab=${{ application: 'applications', contract: 'contracts', case: 'cases', settlement: 'settlements' }[type]}`" class="btn btn-secondary">العودة إلى القائمة</Link>
     </PageHeader>
 
@@ -80,16 +89,28 @@ const outcomeLabels = { vacant: 'شاغرة', maintenance: 'تحت الصيان�
         <div class="flex flex-wrap items-center gap-2">
             <StatusBadge :label="statusLabels[record.status] || record.status" :status="record.status" />
             <button v-if="can.submit" type="button" class="btn btn-primary" @click="submitDraft">{{ { application: 'إرسال إلى المدير التنفيذي', contract: 'رفع العقد للاعتماد', case: 'إحالة للفحص', settlement: 'إرسال إلى الحسابات' }[type] }}</button>
+            <button v-if="can.withdraw && !withdrawing" type="button" class="btn btn-secondary" @click="withdrawing = true; withdrawForm.clearErrors()">{{ withdrawLabel }}</button>
         </div>
+        <form v-if="can.withdraw && withdrawing" class="space-y-2" @submit.prevent="withdraw">
+            <p class="text-sm text-slate-600">{{ closingApproved ? 'يُغلق الطلب وتعود العين المحجوزة له شاغرة، ويبقى قرار المدير التنفيذي في سجله.' : 'يبقى الطلب في السجل مسحوبًا بالسبب ولا يُرسل بعدها.' }}</p>
+            <label for="withdraw-reason" :class="field">السبب (مطلوب)</label>
+            <textarea id="withdraw-reason" v-model="withdrawForm.reason" rows="2" maxlength="2000" required class="field"></textarea>
+            <p v-for="(message, key) in withdrawForm.errors" :key="key" class="field-error">{{ message }}</p>
+            <div class="flex flex-wrap gap-2">
+                <button class="btn btn-primary" :disabled="withdrawForm.processing">تأكيد: {{ withdrawLabel }}</button>
+                <button type="button" class="btn btn-secondary" @click="withdrawing = false">تراجع</button>
+            </div>
+        </form>
         <StatusStepper v-if="progress" :steps="progress.steps" :summary="progress.summary" />
-        <p v-else class="text-sm text-slate-500">المسودة لم تدخل مسار العمل؛ أكمل البيانات والمستندات ثم أرسلها.</p>
+        <p v-else-if="record.status === 'draft'" class="text-sm text-slate-500">المسودة لم تدخل مسار العمل؛ أكمل البيانات والمستندات ثم أرسلها.{{ { settlement: ' مستند التسوية مطلوب قبل الإرسال.', application: ' هوية المستأجر أو شهادة تسجيله مطلوبة قبل الإرسال.' }[type] || '' }}</p>
     </section>
 
     <!-- The step the viewer holds now -->
     <section v-if="actions.length" class="card space-y-3" aria-labelledby="act-title">
         <h2 id="act-title" class="card-title">الإجراء المطلوب منك</h2>
-        <p v-if="type === 'contract' && workflow?.step === 'signing'" class="text-sm text-slate-600">قبل «تفعيل العقد» أرفق النسخة الموقعة ومحضر التسليم أدناه، وسجّل قراءة العداد عند التسليم.</p>
-        <p v-if="type === 'case' && workflow?.step === 'handover'" class="text-sm text-slate-600">قبل الإتمام سجّل محضر الاستلام (حالة العين بعد الإخلاء) وقراءة العداد أو أرفق محضر الإخلاء.</p>
+        <p v-if="type === 'contract' && workflow?.step === 'signing'" class="text-sm text-slate-600">قبل «تفعيل العقد» أرفق النسخة الموقعة ومحضر التسليم أدناه، وسجّل قراءة العداد عند التسليم لكل عين (إلزامية إذا شمل العقد خدمة الكهرباء).</p>
+        <p v-if="type === 'case' && workflow?.step === 'handover'" class="text-sm text-slate-600">قبل الإتمام سجّل محضر الاستلام (حالة العين بعد الإخلاء)، وأرفق محضر الاستلام والإخلاء، وسجّل قراءة العداد عند الإخلاء لكل عين (إلزامية إذا شمل العقد خدمة الكهرباء).</p>
+        <p v-if="['application', 'settlement'].includes(type) && workflow?.step === 'officer'" class="text-sm text-slate-600">{{ type === 'settlement' ? 'لا تُرسل التسوية دون مستندها المرفق.' : 'لا يُرفع الطلب دون هوية المستأجر أو شهادة تسجيله في ملف الطلب أو ملف المستأجر.' }}</p>
         <div class="flex flex-wrap gap-2">
             <button v-for="a in actions" :key="a.id" type="button" class="btn btn-sm" :class="selected === a.id ? 'btn-primary' : 'btn-secondary'" @click="selected = a.id; actionForm.clearErrors()">{{ a.name }}</button>
         </div>

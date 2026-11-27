@@ -66,6 +66,7 @@ class RentalRecordController extends Controller
                 'manage' => $manage,
                 'edit' => $manage && in_array($row->status, RentalRequests::EDITABLE, true),
                 'submit' => $manage && $row->status === 'draft' && ! $row->workflow_instance_id,
+                'withdraw' => $manage && $this->canWithdraw($user, $type, $row, $instance),
                 'upload' => $this->canUpload($user, $instance),
                 'outcome' => $type === 'case' && $manage && $row->status === 'approved',
                 'post' => $type === 'settlement' && $instance && (int) $instance->current_assignee_id === (int) $user->id && $row->status === 'approved' && $this->access->canRecordFinance($user),
@@ -99,6 +100,17 @@ class RentalRecordController extends Controller
         $instance = $requests->submit($r->user(), $type, $id);
 
         return back()->with('success', 'أُرسل الطلب برقم '.$instance->reference_no.'. تابع مراحله من هذه الصفحة.');
+    }
+
+    /** Withdraw a draft or returned request, or close an approved application that will not become a contract. */
+    public function withdraw(Request $r, string $type, int $id, RentalRequests $requests): RedirectResponse
+    {
+        abort_unless(isset(RentalRequests::TYPES[$type]) && $this->access->canManage($r->user()), 403);
+        $d = $r->validate(['reason' => 'required|string|min:3|max:2000'], [], ['reason' => 'السبب']);
+        $closing = $type === 'application' && DB::table('aims_rental_applications')->where('id', $id)->value('status') === 'approved';
+        $requests->withdraw($r->user(), $type, $id, $d['reason']);
+
+        return back()->with('success', $closing ? 'أُغلق الطلب دون تعاقد وأصبحت العين شاغرة.' : 'سُحب الطلب وحُفظ السبب في سجله.');
     }
 
     public function document(Request $r, string $owner, int $id): RedirectResponse
@@ -168,6 +180,20 @@ class RentalRecordController extends Controller
         return [$row, $instance];
     }
 
+    /**
+     * A draft, or a request the workflow returned to the officer who sent it (only he holds that step), or an
+     * approved application with no contract being prepared or decided on it.
+     */
+    private function canWithdraw(User $user, string $type, object $row, ?object $instance): bool
+    {
+        if ($type === 'application' && $row->status === 'approved') {
+            return ! DB::table('aims_rental_contracts')->where('application_id', $row->id)->whereIn('status', RentalContracts::OPEN)->exists();
+        }
+
+        return in_array($row->status, RentalRequests::EDITABLE, true)
+            && (! $instance || ($instance->status === 'in_progress' && (int) $instance->requested_by === (int) $user->id));
+    }
+
     private function canUpload(?User $user, ?object $instance): bool
     {
         return $user && ($this->access->canManage($user) || ($instance && $instance->status === 'in_progress' && (int) $instance->current_assignee_id === (int) $user->id));
@@ -202,7 +228,8 @@ class RentalRecordController extends Controller
     /** @return array<string, mixed> */
     private function contractContext(object $row, callable $tenant, callable $contractUnits, RentalMaintenance $maintenance): array
     {
-        $dues = $this->ledger->dues()->where('d.contract_id', $row->id)->orderBy('d.due_on')->orderBy('d.kind');
+        // The contract's own page also shows its planned (not yet activated) schedule lines; they are never overdue.
+        $dues = $this->ledger->dues(true)->where('d.contract_id', $row->id)->orderBy('d.due_on')->orderBy('d.kind');
 
         return [
             'tenant' => $tenant((int) $row->tenant_id),

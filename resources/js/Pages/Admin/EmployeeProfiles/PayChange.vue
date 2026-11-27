@@ -8,7 +8,8 @@ import StatusStepper from '../../../Components/StatusStepper.vue';
 
 /**
  * A pay or bank change request: what changes, from when, against the current record; the decision is taken on the
- * central workflow. Amounts appear only to holders of the pay permission.
+ * central workflow (the executive director, or the Head of Accounts for the executive director's own change).
+ * Amounts appear only to holders of the pay permission and to the Head of Accounts deciding that change.
  */
 const props = defineProps({
     change: { type: Object, required: true },
@@ -130,7 +131,7 @@ function withdraw() {
                     <button type="button" class="btn btn-primary btn-sm" :disabled="revise.processing" @click="saveRevision">حفظ التصحيح</button>
                     <button type="button" class="btn btn-secondary btn-sm" :disabled="withdrawForm.processing" @click="withdraw">سحب الطلب</button>
                 </div>
-                <p class="text-xs text-slate-500">بعد الحفظ استخدم إجراء «رفع الطلب إلى المدير التنفيذي» أعلاه.</p>
+                <p class="text-xs text-slate-500">بعد الحفظ استخدم إجراء رفع الطلب أعلاه (إلى المدير التنفيذي، أو إلى رئيس قسم الحسابات إن كان التعديل يخص المدير التنفيذي).</p>
             </section>
             <button v-else-if="canWithdraw" type="button" class="btn btn-secondary btn-sm" :disabled="withdrawForm.processing" @click="withdraw">سحب الطلب</button>
         </div>

@@ -20,6 +20,7 @@ const message = ref('');
 const revertReason = ref({});
 const requestForm = ref({});
 const reviewNote = ref({});
+const matchLabels = { unmatched: 'غير مطابقة', time_review: 'بانتظار تأكيد الوقت', time_replaced: 'استُبدلت بحركة مؤكدة الوقت' };
 
 async function load() {
     loading.value = true;
@@ -58,7 +59,7 @@ function revert(correction) {
 function requestCorrection(punch) {
     const form = requestForm.value[punch.id] || {};
     if (!form.direction || (form.reason || '').trim().length < 10) { message.value = 'اختر الاتجاه الصحيح واكتب السبب (10 أحرف على الأقل).'; return; }
-    post(`/admin/attendance/punches/${punch.id}/correction`, { corrected_direction: form.direction, reason: form.reason }, 'سُجّل طلب التصحيح بانتظار اعتماد مدير النظام.');
+    post(`/admin/attendance/punches/${punch.id}/correction`, { corrected_direction: form.direction, reason: form.reason }, 'سُجّل طلب التصحيح بانتظار قرار رئيس قسم الموارد البشرية (أو المدير التنفيذي إن كان رئيس القسم مقدمه أو صاحب البصمة).');
 }
 
 function decide(correction, decision) {
@@ -130,7 +131,7 @@ defineExpose({ load });
                     <span v-if="punch.original_label && punch.corrected" class="text-slate-600">الأصل من الجهاز: {{ punch.original_label }}</span>
                     <span class="text-xs text-slate-500">{{ punch.source }}<template v-if="punch.device_code !== null && punch.device_code !== undefined"> — رمز الجهاز {{ punch.device_code }}</template></span>
                     <span v-if="punch.flag" class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900">{{ punch.flag }} — يحتاج مراجعة</span>
-                    <span v-if="!punch.counted" class="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700">غير محتسبة ({{ punch.match_status }})</span>
+                    <span v-if="!punch.counted" class="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700">غير محتسبة ({{ matchLabels[punch.match_status] || punch.match_status }})</span>
                 </div>
                 <p v-if="punch.reason" class="text-xs text-slate-600">سبب الإدخال: {{ punch.reason }}</p>
                 <div v-for="c in punch.auto || []" :key="'a' + c.id" class="rounded-md border border-slate-200 p-2">
@@ -148,7 +149,7 @@ defineExpose({ load });
                     <span class="text-xs text-slate-600">{{ c.original }} ← {{ c.corrected }} — طلبه {{ c.requested_by }} في {{ c.requested_at }}</span>
                     <p class="mt-1">{{ c.reason }}</p>
                     <p v-if="c.reviewed_by" class="text-xs text-slate-600">القرار: {{ c.reviewed_by }} في {{ c.reviewed_at }} {{ c.review_note ? '— ' + c.review_note : '' }}</p>
-                    <div v-if="detail.can.decide_correction && c.status === 'pending'" class="mt-2 flex flex-wrap gap-2">
+                    <div v-if="(detail.can.decide_correction_ids || []).includes(c.id) && c.status === 'pending'" class="mt-2 flex flex-wrap gap-2">
                         <input v-model="reviewNote[c.id]" class="field min-w-0 flex-1" maxlength="1000" placeholder="ملاحظة القرار (اختيارية)" aria-label="ملاحظة القرار" />
                         <button type="button" class="btn btn-primary btn-sm" :disabled="busy" @click="decide(c, 'approve')">اعتماد</button>
                         <button type="button" class="btn btn-danger btn-sm" :disabled="busy" @click="decide(c, 'reject')">رفض</button>

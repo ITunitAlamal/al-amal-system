@@ -25,6 +25,8 @@ final class NavigationRegistry
         // Oversight for heads, the executive director and delegates (each link has its own rule).
         'management' => ['الإدارة والمتابعة', 'chart', 40],
         'hr_group' => ['الموارد البشرية', 'users', 50],
+        // The department's own request types; both links open «متابعة القسم» with the type filter set.
+        'services_group' => ['الخدمات العامة والصيانة', 'wrench', 55],
         // One accounts group: its sections (purchasing, stores, accounting, payroll, budgets) are tabs of the accounts
         // page («أقسام الحسابات»), filtered by each user's finance permissions; their old links stay in the editor, hidden.
         'accounts_home' => ['الحسابات', 'coins', 60],
@@ -43,18 +45,23 @@ final class NavigationRegistry
     public const ITEMS = [
         'dashboard' => ['مساحتي', 'ui.preview', [], 'authenticated', 'layout', null, 10, true],
         'my_tasks' => ['مهامي', 'tasks.index', [], 'authenticated', 'inbox', null, 12, true],
+        // «متابعة القسم»: the requests of the unified department (HR, general services and maintenance). Kept inside
+        // «الموارد البشرية»; the department's own people see it at the top level (NavigationPriorities::LIFTED).
+        'hr_dashboard' => ['متابعة القسم', 'hr.dashboard', [], 'hr_dashboard', 'chart', 'hr_group', 70, true],
         'official_correspondence' => ['المراسلات الرسمية', 'correspondence.index', [], 'authenticated', 'mail', null, 16, true],
+        // Opens from «المراسلات الرسمية»; every row is filtered by CorrespondenceAccess, so any active user may open it.
+        'board_decisions' => ['سجل قرارات مجلس الإدارة', 'correspondence.decisions', [], 'authenticated', 'file-text', 'management', 15, false],
 
         'my_requests_all' => ['طلباتي', 'requests.index', [], 'authenticated', 'clipboard-list', 'my_requests', 10, true],
-        'leaves_requests' => ['الإجازات والموافقات', 'leaves.index', [], 'authenticated', 'calendar', 'my_requests', 20, true],
+        'leaves_requests' => ['الإجازات', 'leaves.index', [], 'authenticated', 'calendar', 'my_requests', 20, true],
         'leaves_balances' => ['أرصدة الإجازات', 'leaves.balances', [], 'authenticated', 'list', 'my_requests', 30, true],
-        'my_todo' => ['مهامي الشخصية', 'todo.index', [], 'authenticated', 'clipboard-list', 'my_requests', 40, true],
+        // The private to-do list; named apart from «مهامي», the official inbox.
+        'my_todo' => ['قائمتي الشخصية', 'todo.index', [], 'authenticated', 'clipboard-list', 'my_requests', 40, true],
         'my_profile' => ['ملفي الوظيفي', 'my.profile', [], 'employee_profile', 'file-text', 'my_requests', 50, true],
         'my_attendance' => ['دوامي الشهري', 'attendance.monthly', [], 'monthly_attendance', 'calendar', 'my_requests', 55, true],
         // New requests start from «طلباتي ← طلب جديد» and from «مساحتي».
         'leave_request' => ['طلب إجازة', 'leaves.create', [], 'leave_requester', 'calendar', 'my_requests', 60, false],
         'startable_workflows' => ['أنواع الطلبات المفعلة', NavigationBuilder::STARTABLE_WORKFLOWS, [], 'authenticated', 'handshake', 'my_requests', 70, false],
-        'maintenance_draft' => ['مسودة طلب صيانة', 'maintenance.requests.create', [], 'authenticated', 'wrench', 'my_requests', 80, false],
 
         'my_department' => ['قسمي', 'department.workspace', [], 'department_workspace', 'users', 'management', 10, true],
         'shift_roster' => ['جدول المناوبات', 'attendance.shifts', [], 'shift_roster', 'calendar', 'management', 15, true],
@@ -62,21 +69,26 @@ final class NavigationRegistry
         'kpi_dashboard' => ['مؤشرات الأداء', 'kpi.index', [], 'kpi_view', 'chart', 'management', 30, true],
         'approval_delegations' => ['التفويضات الإدارية', 'admin.approval-delegations.index', [], 'approval_delegations', 'key', 'management', 40, true],
 
-        'employee_profiles' => ['ملفات الموظفين', 'admin.employee-profiles.index', [], 'manage_employees', 'users', 'hr_group', 10, true],
+        'employee_profiles' => ['ملفات الموظفين', 'admin.employee-profiles.index', [], 'employee_files', 'users', 'hr_group', 10, true],
         'employee_accounts' => ['حسابات الموظفين والأدوار', 'admin.employees.index', [], 'manage_employees', 'key', 'hr_group', 20, true],
         'attendance' => ['الحضور والانصراف', 'admin.attendance.index', [], 'attendance_access', 'calendar', 'hr_group', 30, true],
         'attendance_compensatory' => ['العطل والعمل التعويضي', 'admin.attendance.compensatory.index', [], 'attendance_access', 'calendar', 'hr_group', 40, true],
         'attendance_operations' => ['عمليات الحضور والأجهزة', 'admin.attendance.operations', [], 'manage_employees', 'settings', 'hr_group', 50, true],
         // A button on «ملفات الموظفين».
         'employee_imports' => ['استيراد الموظفين', 'admin.employee-imports.index', [], 'manage_employees', 'list', 'hr_group', 60, false],
-        'hr_dashboard' => ['متابعة الموظفين والخدمات', 'hr.dashboard', [], 'hr_dashboard', 'chart', 'hr_group', 70, true],
+
+        'services_requests' => ['طلبات الخدمات العامة', 'hr.dashboard', ['type' => 'SERVICE'], 'hr_dashboard', 'clipboard-list', 'services_group', 10, true],
+        'maintenance_requests' => ['طلبات الصيانة', 'hr.dashboard', ['type' => 'MAINTENANCE'], 'hr_dashboard', 'wrench', 'services_group', 20, true],
 
         'finance_pending' => ['بانتظار إجرائي', 'finance.index', ['view' => 'pending'], 'finance_cycle', 'inbox', 'accounts_home', 10, true],
         'finance_home' => ['أقسام الحسابات', 'finance.index', [], 'finance_view', 'list', 'accounts_home', 20, true],
         'finance_approvals' => ['صندوق الاعتمادات المالية', 'finance.approvals', [], 'finance_approver', 'key', 'accounts_home', 30, true],
         'finance_rentals' => ['قبض الإيجارات وتسوياتها', 'finance.rentals', [], 'finance:finance.rentals.record', 'coins', 'accounts_home', 40, true],
+        'finance_payments' => ['الصرف', 'finance.index', ['view' => 'payments', 'kind' => 'payment'], 'finance_payments', 'banknote', 'accounts_home', 42, true],
+        'finance_collections' => ['القبض', 'finance.index', ['view' => 'receipts', 'kind' => 'receipt'], 'finance_receipts', 'hand-coins', 'accounts_home', 44, true],
         'finance_reports' => ['التقارير والتصدير', 'finance.index', ['view' => 'reports'], 'finance:finance.reports.view', 'file-spreadsheet', 'accounts_home', 50, true],
         'finance_payroll_runs' => ['مسير الرواتب والقسائم', 'finance.payroll-runs.index', [], 'finance:finance.payroll.record|finance.payroll.publish|finance.monitor', 'users', 'accounts_home', 60, true],
+        'finance_department_budgets' => ['ميزانيات الأقسام', 'finance.department-budgets.index', [], 'finance_department_budgets', 'chart', 'accounts_home', 65, true],
         // Finance settings: the head of Accounts and the system administrator only, never a top-level entry.
         'finance_staff' => ['موظفو القسم وصلاحياتهم', 'finance.staff', [], 'finance:finance.staff.assign', 'key', 'accounts_home', 70, true],
         // Sections of the accounts page (its own navigation, by permission); hidden from the menu by default.
@@ -93,7 +105,7 @@ final class NavigationRegistry
         'finance_counts' => ['الجرد', 'finance.index', ['view' => 'counts'], 'finance:finance.stock.count|finance.stock.count.approve', 'clipboard-list', 'accounts_home', 124, false],
         'finance_invoices' => ['فواتير الموردين', 'finance.index', ['view' => 'invoices'], 'finance:finance.purchase.invoice|finance.procurement.review', 'receipt', 'accounts_home', 130, false],
         'finance_treasuries' => ['الصناديق والبنوك', 'finance.index', ['view' => 'treasuries'], 'finance:finance.treasury.manage', 'coins', 'accounts_home', 131, false],
-        'finance_transactions' => ['سندات القبض والصرف', 'finance.index', ['view' => 'transactions'], 'finance:finance.transaction.draft', 'list', 'accounts_home', 132, false],
+        'finance_transactions' => ['سندات الصرف', 'finance.index', ['view' => 'payments', 'kind' => 'payment'], 'finance_payments', 'banknote', 'accounts_home', 132, false],
         'finance_receivables' => ['المستحقات', 'finance.index', ['view' => 'receivables'], 'finance:finance.receivable.manage', 'list', 'accounts_home', 133, false],
         'finance_transfers' => ['التحويلات', 'finance.index', ['view' => 'transfers'], 'finance:finance.transfer.execute', 'list', 'accounts_home', 134, false],
         'finance_advances' => ['العهد والسلف', 'finance.index', ['view' => 'advances'], 'finance:finance.advance.manage', 'list', 'accounts_home', 135, false],
@@ -139,12 +151,14 @@ final class NavigationRegistry
     /** Entries that cannot be hidden or restricted, so nobody locks themselves out of the menu or this page. */
     public const LOCKED = ['dashboard', 'navigation_admin'];
 
-    /** Section headings of the old single accounts group; the functional groups replaced them. */
+    /** Entries whose page no longer exists: section headings of the old single accounts group and retired screens. */
     public const RETIRED = ['finance_h_follow', 'finance_h_purchasing', 'finance_h_stores', 'finance_h_rentals', 'finance_h_records', 'finance_h_accounting',
         // Split into «المشتريات» and «المخازن» (2026-10-30).
         'purchasing_stores',
         // Merged into «خدماتي»، «الموارد البشرية» and «الحسابات» (2026-11-01).
-        'leaves', 'purchasing', 'stores', 'finance', 'payroll_group', 'budgets_group'];
+        'leaves', 'purchasing', 'stores', 'finance', 'payroll_group', 'budgets_group',
+        // «مسودة طلب صيانة»: its screen saved drafts that could never be sent; a maintenance request starts from «طلباتي».
+        'maintenance_draft'];
 
     public function __construct(private readonly AuditService $audit) {}
 

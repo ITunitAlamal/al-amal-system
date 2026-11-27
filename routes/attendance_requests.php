@@ -33,6 +33,8 @@ Route::middleware(['web', 'auth'])->group(function (): void {
         Route::post('/actions/{action}/submit', [HrActionController::class, 'submit'])->whereNumber('action')->middleware('throttle:20,1')->name('actions.submit');
         Route::post('/actions/{action}/decide', [HrActionController::class, 'decide'])->whereNumber('action')->middleware('throttle:20,1')->name('actions.decide');
         Route::post('/actions/{action}/cancel', [HrActionController::class, 'cancel'])->whereNumber('action')->middleware('throttle:20,1')->name('actions.cancel');
+        Route::post('/actions/{action}/cancel-request', [HrActionController::class, 'requestCancel'])->whereNumber('action')->middleware('throttle:20,1')->name('actions.cancel-request');
+        Route::post('/actions/{action}/cancel-request/decline', [HrActionController::class, 'declineCancel'])->whereNumber('action')->middleware('throttle:20,1')->name('actions.cancel-request.decline');
         Route::get('/actions/{action}/attachment', [HrActionController::class, 'attachment'])->whereNumber('action')->name('actions.attachment');
     });
 

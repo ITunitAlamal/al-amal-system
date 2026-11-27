@@ -20,8 +20,8 @@ use Illuminate\Validation\ValidationException;
 
 /**
  * «الورديات والإسناد» inside /admin/attendance: the roster grid, previews, bulk assignments, exemptions and emergency
- * changes. Assignments and exemptions are sent for the existing approval (executive director or system administrator);
- * an emergency change takes effect at once only when its author holds that approval authority.
+ * changes. HR prepares them (system administrator or HR head); assignments, exemptions and emergency changes are all
+ * sent for the approval of the executive director alone and are never approved by their own author.
  */
 final class AttendanceRosterController extends Controller
 {
@@ -119,10 +119,11 @@ final class AttendanceRosterController extends Controller
     /**
      * A manager-initiated change of one employee's shift on given days, with a stated reason and before/after snapshots.
      */
-    public function emergency(Request $request, AttendanceCalendar $calendar, AttendanceDailyService $daily, NotificationCenter $notifications): RedirectResponse
+    public function emergency(Request $request, AttendanceCalendar $calendar): RedirectResponse
     {
         $user = $request->user();
-        abort_unless($this->access->isHrOperator($user) || $this->access->canApproveRoster($user), 403);
+        // Prepared by HR: the executive director, who approves it, would otherwise leave it with nobody to decide.
+        abort_unless($this->access->isHrOperator($user), 403);
         abort_unless(AttendanceLedger::hasTable('attendance_shift_swaps'), 409, 'يلزم تنفيذ ترحيل الحضور المعتمد أولًا.');
         $data = $request->validate([
             'employee_id' => ['required', 'integer', Rule::exists('employees', 'id')->whereNull('deleted_at')],
@@ -135,27 +136,22 @@ final class AttendanceRosterController extends Controller
         if ($data['effect'] === 'schedule' && $data['start_time'] === $data['end_time']) {
             throw ValidationException::withMessages(['end_time' => 'يجب أن يختلف وقت البداية عن النهاية.']);
         }
-        $approved = $this->access->canApproveRoster($user);
         $before = collect($calendar->resolve([(int) $data['employee_id']], $data['starts_on'], $data['ends_on'])[(int) $data['employee_id']] ?? [])
             ->map(fn (?array $slot): string => isset($slot['in'], $slot['out']) ? $slot['in']->format('H:i').'–'.$slot['out']->format('H:i') : ($slot['status'] ?? 'none'))->all();
-        DB::transaction(function () use ($user, $data, $approved, $before, $daily, $notifications): void {
+        // Never self-approved: the change waits for another approver through AttendanceController::decide (requester ≠ decider).
+        DB::transaction(function () use ($user, $data, $before): void {
             $id = DB::table('attendance_overrides')->insertGetId([
                 'label' => 'تغيير طارئ: '.mb_substr($data['reason'], 0, 100), 'kind' => 'emergency_change', 'effect' => $data['effect'], 'employee_id' => $data['employee_id'],
                 'starts_on' => $data['starts_on'], 'ends_on' => $data['ends_on'], 'start_time' => $data['effect'] === 'schedule' ? $data['start_time'] : null,
                 'end_time' => $data['effect'] === 'schedule' ? $data['end_time'] : null, 'ends_next_day' => (bool) ($data['ends_next_day'] ?? false),
-                'status' => $approved ? 'approved' : 'pending', 'reason' => $data['reason'], 'created_by' => $user->id,
-                'approved_by' => $approved ? $user->id : null, 'approved_at' => $approved ? now() : null, 'created_at' => now(), 'updated_at' => now(),
+                'status' => 'pending', 'reason' => $data['reason'], 'created_by' => $user->id,
+                'approved_by' => null, 'approved_at' => null, 'created_at' => now(), 'updated_at' => now(),
             ]);
-            AttendanceAudit::record($user->id, 'override', $id, $approved ? 'emergency_applied' : 'submitted', ['before' => $before,
+            AttendanceAudit::record($user->id, 'override', $id, 'submitted', ['before' => $before,
                 'after' => $data['effect'] === 'schedule' ? $data['start_time'].'–'.$data['end_time'] : 'off', 'reason' => $data['reason']]);
-            if ($approved) {
-                $daily->refreshDays((int) $data['employee_id'], $data['starts_on'], $data['ends_on']);
-                $this->notifyEmployee($notifications, (int) $data['employee_id'], 'تغيير طارئ على جدول دوامك',
-                    'من '.$data['starts_on'].' إلى '.$data['ends_on'].': '.$data['reason'], 'emergency:'.$id);
-            }
         });
 
-        return back()->with('success', $approved ? 'طُبق التغيير الطارئ وأُبلغ الموظف.' : 'أُرسل التغيير الطارئ للاعتماد.');
+        return back()->with('success', 'أُرسل التغيير الطارئ لاعتماد المدير التنفيذي.');
     }
 
     /**

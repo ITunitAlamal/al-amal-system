@@ -40,7 +40,8 @@ function drop(event) { dragging.value = false; pick(event.dataTransfer?.files?.[
 const settings = useForm({ ...(props.fileSettings || {}) });
 function saveSettings() {
     settings.transform(data => ({ photo_max_kb: data.photo_max_kb, photo_min_px: data.photo_min_px, photo_max_px: data.photo_max_px, document_max_kb: data.document_max_kb,
-        employee_quota_mb: data.employee_quota_mb, self_photo_upload: data.self_photo_upload, self_view_pay: Boolean(data.self_view_pay) }))
+        employee_quota_mb: data.employee_quota_mb, self_photo_upload: data.self_photo_upload, self_view_pay: Boolean(data.self_view_pay),
+        document_expiry_alert_days: data.document_expiry_alert_days === '' || data.document_expiry_alert_days === undefined ? null : data.document_expiry_alert_days }))
         .put('/admin/employee-imports/settings', { preserveScroll: true });
 }
 const date = value => (value ? String(value).slice(0, 16) : '—');
@@ -115,6 +116,7 @@ const date = value => (value ? String(value).slice(0, 16) : '—');
                     <label class="text-sm">أكبر بُعد للصورة (بكسل)<input v-model.number="settings.photo_max_px" type="number" min="500" max="12000" class="field mt-1" /></label>
                     <label class="text-sm">أقصى حجم للوثيقة (ك.ب)<input v-model.number="settings.document_max_kb" type="number" min="100" max="51200" class="field mt-1" /></label>
                     <label class="text-sm">مساحة ملفات الموظف (م.ب)<input v-model.number="settings.employee_quota_mb" type="number" min="10" max="10240" class="field mt-1" /></label>
+                    <label class="text-sm">التنبيه قبل انتهاء الوثيقة (يوم)<input v-model.number="settings.document_expiry_alert_days" type="number" min="1" max="365" class="field mt-1" placeholder="فارغ: المنتهية فقط" /></label>
                     <label class="text-sm">رفع الموظف لصورته<select v-model="settings.self_photo_upload" class="field mt-1"><option value="review">مسموح بمراجعة الموارد البشرية</option><option value="disabled">غير مسموح</option></select></label>
                     <label class="flex items-center gap-2 text-sm md:col-span-3"><input v-model="settings.self_view_pay" type="checkbox" /> يرى الموظف راتبه وعلاواته في «ملفي الوظيفي» (الحساب البنكي يظهر له مقنّعًا دائمًا)</label>
                 </div>

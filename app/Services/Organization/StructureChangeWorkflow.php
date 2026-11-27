@@ -34,7 +34,7 @@ final class StructureChangeWorkflow implements WorkflowSubject
         }
         if ($target->code === 'applied') {
             $actor = User::findOrFail($actorId);
-            abort_unless($actor->roleAssignments()->whereHas('role', fn ($q) => $q->where('code', 'executive_director'))->exists(), 403, 'يعتمد تعديل الهيكل المدير التنفيذي.');
+            abort_unless($actor->roleAssignments()->effective()->whereHas('role', fn ($q) => $q->where('code', 'executive_director'))->exists(), 403, 'يعتمد تعديل الهيكل المدير التنفيذي.');
             $this->structure->apply($change, $actorId, 'executive_director');
         }
     }

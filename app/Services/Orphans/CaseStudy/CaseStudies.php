@@ -7,6 +7,7 @@ use App\Services\AuditService;
 use App\Services\Orphans\OrphanAccess;
 use App\Services\Orphans\Registration\RegistrationFieldSpec;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
@@ -18,7 +19,10 @@ use Illuminate\Validation\ValidationException;
  *
  * - Department staff fill it as a draft (nothing required), then submit it. The questionnaire's submission rules apply
  *   only then.
- * - The head reviews it or returns it with a note; the reviewer is never the assessor.
+ * - The head reviews it or returns it with a note; the reviewer is never the assessor. The review records the head's
+ *   recommendation (accept, reject or defer; req-04 §7 step 4), which still decides nothing by itself.
+ * - The head may assign the study to a researcher (req-04 «تعيين الباحث»); an assigned study is filled and submitted
+ *   by that researcher or the head only (ORP-19).
  * - Psychological and health answers are encrypted apart and readable only with the «health» capability. Without it
  *   they are neither shown nor changed by a save.
  * - The audit records who did what and when, never an answer.
@@ -26,6 +30,9 @@ use Illuminate\Validation\ValidationException;
 final class CaseStudies
 {
     public const STATUS = ['draft' => 'مسودة', 'submitted' => 'بانتظار المراجعة', 'returned' => 'معادة للاستكمال', 'reviewed' => 'مراجَعة'];
+
+    /** The head's recommendation on review (req-04 §7 step 4: «يوصي بالقبول أو الرفض أو التأجيل»). */
+    public const RECOMMENDATIONS = ['accept' => 'التوصية بالقبول', 'reject' => 'التوصية بالرفض', 'defer' => 'التوصية بالتأجيل'];
 
     private const MAX_ROWS = 30;
 
@@ -75,6 +82,7 @@ final class CaseStudies
         return DB::transaction(function () use ($study, $input, $lockVersion, $user, $mayHealth, $submit): object {
             $row = DB::table('household_case_studies')->where('id', $study->id)->lockForUpdate()->first();
             abort_unless(in_array($row->status, ['draft', 'returned'], true), 422, 'الدراسة مرسلة أو مراجَعة؛ لا تُعدل الآن.');
+            $this->assertAssignee($row, $user);
             abort_if((int) $row->lock_version !== $lockVersion, 409, 'حُفظت نسخة أحدث من هذه الدراسة في نافذة أخرى. أعد تحميل الصفحة.');
             $schema = CaseStudySchema::version((int) $row->schema_version);
             $answers = $this->clean($schema, (array) ($input['answers'] ?? []), $mayHealth);
@@ -110,13 +118,45 @@ final class CaseStudies
         });
     }
 
-    /** The head reviews a submitted study (never their own) or returns it with a note for completion. */
-    public function decide(object $study, string $decision, ?string $note, User $user): object
+    /** An assigned study is worked by its researcher or the head only; an unassigned one by any department editor. */
+    private function assertAssignee(object $row, User $user): void
+    {
+        $assigned = $row->assigned_to ?? null;
+        abort_if($assigned !== null && (int) $assigned !== (int) $user->id && ! $this->access->isHead($user), 403,
+            'هذه الدراسة مسندة إلى باحث آخر؛ يعدّلها ويرسلها الباحث المكلَّف أو رئيس القسم.');
+    }
+
+    /** The head assigns an open study to a researcher of the department (or clears the assignment). */
+    public function assign(object $study, ?int $researcherId, User $user): object
+    {
+        abort_unless($this->access->isHead($user), 403, 'تعيين الباحث لرئيس القسم.');
+        abort_unless(Schema::hasColumn('household_case_studies', 'assigned_to'), 422, 'تعيين الباحث غير متاح قبل تحديث قاعدة البيانات.');
+        if ($researcherId !== null && ! in_array($researcherId, array_column($this->access->staff(), 'id'), true)) {
+            throw ValidationException::withMessages(['assigned_to' => 'اختر باحثًا من موظفي القسم.']);
+        }
+
+        return DB::transaction(function () use ($study, $researcherId, $user): object {
+            $row = DB::table('household_case_studies')->where('id', $study->id)->lockForUpdate()->first();
+            abort_unless(in_array($row->status, ['draft', 'returned'], true), 422, 'يُعيَّن الباحث لدراسة مفتوحة فقط.');
+            DB::table('household_case_studies')->where('id', $row->id)->update(['assigned_to' => $researcherId, 'assigned_by' => $researcherId ? $user->id : null,
+                'lock_version' => $row->lock_version + 1, 'updated_at' => now()]);
+            $this->record('assigned', $row->id, $this->household(DB::table('households')->where('id', $row->household_id)->value('public_id')), $user);
+
+            return DB::table('household_case_studies')->where('id', $row->id)->first();
+        });
+    }
+
+    /** The head reviews a submitted study (never their own) with a recommendation, or returns it with a note for completion. */
+    public function decide(object $study, string $decision, ?string $note, User $user, ?string $recommendation = null): object
     {
         abort_unless($this->access->isHead($user), 403, 'مراجعة دراسة الحالة لرئيس القسم.');
         abort_unless(in_array($decision, ['review', 'return'], true), 422);
+        $withRecommendation = Schema::hasColumn('household_case_studies', 'review_recommendation');
+        if ($decision === 'review' && $withRecommendation && ! isset(self::RECOMMENDATIONS[(string) $recommendation])) {
+            throw ValidationException::withMessages(['recommendation' => 'اختر توصيتك: القبول أو الرفض أو التأجيل.']);
+        }
 
-        return DB::transaction(function () use ($study, $decision, $note, $user): object {
+        return DB::transaction(function () use ($study, $decision, $note, $user, $recommendation, $withRecommendation): object {
             $row = DB::table('household_case_studies')->where('id', $study->id)->lockForUpdate()->first();
             abort_unless($row->status === 'submitted', 422, 'الدراسة ليست بانتظار المراجعة.');
             abort_if((int) $row->assessor_id === (int) $user->id, 422, 'لا يراجع الباحث دراسته؛ يراجعها رئيس القسم أو من يقوم مقامه.');
@@ -125,7 +165,8 @@ final class CaseStudies
             }
             DB::table('household_case_studies')->where('id', $row->id)->update([
                 'status' => $decision === 'review' ? 'reviewed' : 'returned', 'review_note' => $note ? mb_substr(trim($note), 0, 2000) : null,
-                ...($decision === 'review' ? ['reviewed_by' => $user->id, 'reviewed_at' => now()] : []), 'lock_version' => $row->lock_version + 1, 'updated_at' => now(),
+                ...($decision === 'review' ? ['reviewed_by' => $user->id, 'reviewed_at' => now()] : []),
+                ...($decision === 'review' && $withRecommendation ? ['review_recommendation' => $recommendation] : []), 'lock_version' => $row->lock_version + 1, 'updated_at' => now(),
             ]);
             $this->record($decision === 'review' ? 'reviewed' : 'returned', $row->id, $this->household(DB::table('households')->where('id', $row->household_id)->value('public_id')), $user);
 

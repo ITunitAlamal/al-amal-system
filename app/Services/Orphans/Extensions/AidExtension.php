@@ -9,6 +9,7 @@ use App\Services\Orphans\Aid;
 use App\Services\Orphans\OrphanAccess;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 
 /** Plugs sponsorships and confirmed benefits into the dashboard, the files, the previews and the registry filters. */
 final class AidExtension
@@ -101,9 +102,15 @@ final class AidExtension
             $items[] = ['source' => 'استحقاق كفالة لم يُحَل للحسابات', 'subject' => $d->reference_no, 'assignee' => null, 'due' => $d->due_on, 'status' => 'إحالة',
                 'url' => '/orphans/aid/sponsorships/'.$d->public_id, 'urgency' => 1, 'at' => $d->created_at];
         }
-        if ($all || $this->access->canAssign($user)) {
+        // Referred dues past their date that Accounts has not fully collected: the staff follow up with the sponsor, the head escalates.
+        foreach (Aid::overdueDues()->join('sponsors as p', 'p.id', '=', 's.sponsor_id')->orderBy('d.due_on')->limit(20)
+            ->get(['s.public_id', 's.reference_no', 'd.due_on', 'd.amount', 'd.currency', 'd.referred_at', 'p.name']) as $d) {
+            $items[] = ['source' => 'استحقاق كفالة متأخر التحصيل', 'subject' => $d->reference_no.' — '.$d->name.' · '.$d->amount.' '.$d->currency, 'assignee' => null, 'due' => $d->due_on,
+                'status' => 'متابعة الكافل مع الحسابات', 'url' => '/orphans/aid/sponsorships/'.$d->public_id, 'urgency' => 2, 'at' => $d->referred_at];
+        }
+        if ($all || $this->access->canDecide($user)) {
             foreach (DB::table('assistance_requests')->where('status', 'requested')->orderBy('created_at')->limit(20)->get(['reference_no', 'description', 'created_at']) as $r) {
-                $items[] = ['source' => 'طلب مساعدة', 'subject' => $r->reference_no.' — '.\Illuminate\Support\Str::limit($r->description, 60), 'assignee' => null, 'due' => null,
+                $items[] = ['source' => 'طلب مساعدة', 'subject' => $r->reference_no.' — '.Str::limit($r->description, 60), 'assignee' => null, 'due' => null,
                     'status' => 'بانتظار القرار', 'url' => '/orphans/aid?tab=assistance', 'urgency' => 1, 'at' => $r->created_at];
             }
         }

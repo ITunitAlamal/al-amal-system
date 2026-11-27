@@ -22,7 +22,8 @@ final class RentalApplicationWorkflow implements WorkflowSubject
 
     private const STATUS_BY_STEP = ['officer' => 'returned', 'ed_decision' => 'in_review', 'waitlist' => 'waitlisted', 'approved' => 'approved', 'rejected' => 'rejected', 'withdrawn' => 'cancelled'];
 
-    public function __construct(private readonly RentalUnits $units, private readonly RentalsAccess $access, private readonly RentalAudit $audit) {}
+    public function __construct(private readonly RentalUnits $units, private readonly RentalsAccess $access, private readonly RentalAudit $audit,
+        private readonly RentalContracts $contracts) {}
 
     public function beforeMove(object $instance, object $from, object $target, int $actorId): void
     {
@@ -30,6 +31,10 @@ final class RentalApplicationWorkflow implements WorkflowSubject
         abort_unless($application, 404);
         if (in_array($from->code, ['officer', 'waitlist'], true)) {
             abort_unless($this->access->canManage(User::findOrFail($actorId)), 403, 'إعداد طلبات الاستئجار لمسؤول ملف الإيجارات.');
+        }
+        // The executive director decides only a documented application (approved document §4).
+        if ($target->code === 'ed_decision' && ($missing = $this->contracts->missingSupportingDocument('application', $application)) !== null) {
+            throw ValidationException::withMessages(['workflow' => $missing]);
         }
         if ($target->code === 'approved' && $application->unit_id) {
             $unit = DB::table('aims_property_units')->where('id', $application->unit_id)->lockForUpdate()->first();

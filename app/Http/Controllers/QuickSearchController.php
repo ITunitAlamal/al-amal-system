@@ -4,6 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Models\User;
 use App\Services\Configuration\NavigationBuilder;
+use App\Services\Hr\DepartmentFollowUp;
+use App\Services\Hr\HrServicesDashboard;
 use App\Services\Workflow\WorkflowInbox;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -12,7 +14,9 @@ use Illuminate\Support\Facades\DB;
 /**
  * Top-bar search. Each group is built from what the user may already open:
  * their menu pages, their own requests and tasks, their leave requests, and — only for those who
- * manage them — employee files and departments. Nothing outside the user's scope is queried.
+ * manage them — employee files and departments. Those who follow the unified department's work («متابعة القسم»)
+ * also find its requests by reference or title, limited to the requests they may open. Nothing outside the
+ * user's scope is queried.
  */
 class QuickSearchController extends Controller
 {
@@ -31,6 +35,12 @@ class QuickSearchController extends Controller
             ['label' => 'مهامي', 'items' => $this->myTasks($inbox, $user, $needle)],
             ['label' => 'إجازاتي', 'items' => $this->myLeaves($user, $like, $term)],
         ];
+        if (HrServicesDashboard::canView($user)) {
+            // The department's requests made by other people; the user's own and those waiting for them are listed above.
+            $listed = array_column([...$groups[1]['items'], ...$groups[2]['items']], 'url');
+            $groups[] = ['label' => 'متابعة القسم', 'items' => array_values(array_filter(app(DepartmentFollowUp::class)->search($user, $like, self::LIMIT),
+                fn (array $item): bool => ! in_array($item['url'], $listed, true)))];
+        }
         if ($user->canManageEmployees()) {
             $groups[] = ['label' => 'ملفات الموظفين', 'items' => $this->employees($like)];
         }

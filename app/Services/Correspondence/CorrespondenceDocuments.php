@@ -52,7 +52,7 @@ final class CorrespondenceDocuments
             if (! empty($replacements[$index])) {
                 $previous = DB::table('workflow_event_attachments as f')->join('correspondence_actions as a', 'a.id', '=', 'f.correspondence_action_id')
                     ->where('f.public_id', $replacements[$index])->where('a.correspondence_id', $letter->id)->first(['f.*']);
-                abort_unless($previous && $this->access->actionVisible($actor, (int) $previous->correspondence_action_id), 404);
+                abort_unless($previous && $this->access->actionVisible($actor, (int) $previous->correspondence_action_id, false), 404);
                 abort_if(DB::table('workflow_event_attachments')->where('replaces_attachment_id', $previous->id)->exists(), 409, 'يوجد إصدار أحدث لهذا المرفق؛ أعد تحميل المراسلة.');
             }
             $uuid = (string) Str::uuid();

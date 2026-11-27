@@ -9,6 +9,7 @@ use App\Services\Dashboard\Boards\FinanceUnitBoards;
 use App\Services\Dashboard\Boards\OrphansBoards;
 use App\Services\Dashboard\Boards\ServiceBoards;
 use App\Services\Finance\FinanceApprovalQueue;
+use App\Services\Hr\HrServicesDashboard;
 use App\Services\Rentals\RentalsDashboard;
 use App\Services\Workflow\ApprovalDelegations;
 use Illuminate\Support\Facades\Log;
@@ -16,7 +17,8 @@ use Illuminate\Support\Facades\Log;
 /**
  * The role dashboards of «مساحتي»: one board per real role the user holds, decided on the server from the same access
  * rules the modules use. A board that fails to build is returned as an error state (the others still show);
- * everyone without a role board gets the employee board.
+ * everyone without a role board gets the employee board, except the people of the unified department (HR, general
+ * services and maintenance), whose «مساحتي» already opens on their tasks.
  */
 final class RoleBoards
 {
@@ -27,13 +29,16 @@ final class RoleBoards
     public function plan(User $user): array
     {
         $plan = [];
+        // The head of the unified department reads its figures on «مساحتي» itself and on «متابعة القسم» (HomeController,
+        // DepartmentHome), so the «الموارد البشرية» board is not repeated for them; it still counts as that department's board.
+        $covered = $user->isHrDepartmentHead() ? ['hr'] : [];
         if (app(ApprovalDelegations::class)->isExecutive($user)) {
             $plan[] = ['executive', null];
         }
         foreach ($this->orphans->kinds($user) as $kind) {
             $plan[] = ['orphans', $kind];
         }
-        if ($user->canManageEmployees()) {
+        if ($user->canManageEmployees() && $covered === []) {
             $plan[] = ['hr', null];
         }
         $queue = app(FinanceApprovalQueue::class);
@@ -47,14 +52,15 @@ final class RoleBoards
         if (RentalsDashboard::canView($user) && ! app(ApprovalDelegations::class)->isExecutive($user)) {
             $plan[] = ['rentals', null];
         }
-        foreach (DepartmentHeadBoard::departments($user, array_column($plan, 0)) as $department) {
+        foreach (DepartmentHeadBoard::departments($user, [...array_column($plan, 0), ...$covered]) as $department) {
             $plan[] = ['department', $department];
         }
         if ($user->isSystemAdmin()) {
             // The administrator's own board opens first; business boards follow.
             array_unshift($plan, ['sysadmin', null]);
         }
-        if ($plan === []) {
+        // The employee board is the user's tasks; the people of the unified department already open «مساحتي» on them.
+        if ($plan === [] && $covered === [] && ! HrServicesDashboard::isMember($user)) {
             $plan[] = ['employee', null];
         }
 
@@ -68,9 +74,9 @@ final class RoleBoards
     }
 
     /** @return list<array<string, mixed>> */
-    public function for(User $user): array
+    public function for(User $user, array $exclude = []): array
     {
-        return $this->build($user, $this->plan($user));
+        return $this->build($user, array_values(array_filter($this->plan($user), fn (array $board): bool => ! in_array($board[0], $exclude, true))));
     }
 
     private function build(User $user, array $plan): array

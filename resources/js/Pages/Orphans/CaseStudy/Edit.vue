@@ -10,7 +10,7 @@ import { holds } from '../../../Support/fieldRules.js';
 // «دراسة الحالة»: a separate stage after registration. Everything is optional while drafting; the questionnaire's
 // required answers apply on «إرسال للمراجعة». Restricted sections arrive only for holders of the health capability.
 const props = defineProps({ household: Object, study: Object, history: Array, schema: Object, answers: Object, options: Object, persons: Array,
-    canHealth: Boolean, canEdit: Boolean, canReview: Boolean });
+    canHealth: Boolean, canEdit: Boolean, canReview: Boolean, recommendations: { type: Object, default: () => ({}) }, staff: { type: Array, default: () => [] } });
 const base = () => Object.fromEntries(Object.keys(props.schema).map(s => [s, { ...(props.answers?.[s] || {}) }]));
 const form = useForm({ answers: base(), assessed_on: props.study?.assessed_on || '', lock_version: props.study?.lock_version ?? 0 });
 const editable = computed(() => props.canEdit && props.study && ['draft', 'returned'].includes(props.study.status));
@@ -21,7 +21,9 @@ const progress = computed(() => Object.fromEntries(Object.entries(props.schema).
     const shown = s.questions.filter(visible);
     return [key, `${shown.filter(q => answered(key, q)).length}/${shown.length}`];
 })));
-const decision = useForm({ note: '' });
+const decision = useForm({ note: '', recommendation: '' });
+const assignForm = useForm({ assigned_to: props.study?.assigned_to ?? null });
+function assign() { assignForm.post(`${url.value}/assign`, { preserveScroll: true }); }
 const url = computed(() => `/orphans/case-studies/${props.study?.public_id}`);
 
 function start() { router.post(`/orphans/households/${props.household.public_id}/case-study`); }
@@ -60,10 +62,17 @@ onBeforeUnmount(() => window.clearInterval(timer));
             <template v-else>
                 <div class="card flex flex-wrap items-center gap-3 text-sm">
                     <span class="rounded-full bg-slate-100 px-2 py-0.5">{{ study.status_label }}</span>
+                    <span v-if="study.assignee">الباحث المكلَّف: {{ study.assignee }}</span>
                     <span v-if="study.assessor">الباحث: {{ study.assessor }}</span>
+                    <span v-if="study.recommendation" class="font-semibold">{{ study.recommendation }}</span>
                     <span v-if="study.reviewer">المراجع: {{ study.reviewer }} · {{ String(study.reviewed_at).slice(0, 10) }}</span>
                     <span class="text-slate-500">نسخة الاستمارة {{ study.version }}</span>
                     <span v-if="autoState" class="text-slate-600" role="status">{{ autoState }}</span>
+                </div>
+                <div v-if="canReview && ['draft', 'returned'].includes(study.status)" class="card flex flex-wrap items-end gap-2 text-sm">
+                    <label class="min-w-56 flex-1">تعيين الباحث<select v-model="assignForm.assigned_to" class="field mt-1"><option :value="null">غير مسند (أي موظف في القسم)</option><option v-for="s in staff" :key="s.id" :value="s.id">{{ s.name }}</option></select></label>
+                    <button type="button" class="btn btn-secondary" :disabled="assignForm.processing" @click="assign">حفظ التعيين</button>
+                    <span v-if="assignForm.errors.assigned_to" class="field-error">{{ assignForm.errors.assigned_to }}</span>
                 </div>
                 <p v-if="study.status === 'returned' && study.review_note" class="alert-warning">ملاحظة المراجعة: {{ study.review_note }}</p>
                 <p v-if="!canHealth" class="alert-info">الجانبان النفسي والصحي مقيدان بقدرة «البيانات الصحية»؛ لا يظهران لك، وما أدخله غيرك فيهما يبقى كما هو.</p>
@@ -94,6 +103,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
 
                 <div v-if="canReview && study.status === 'submitted' && !study.mine" class="card space-y-3">
                     <h2 class="card-title">مراجعة رئيس القسم</h2>
+                    <label class="block text-sm">التوصية (مطلوبة عند اعتماد المراجعة)<select v-model="decision.recommendation" class="field mt-1"><option value="">اختر</option><option v-for="(label, key) in recommendations" :key="key" :value="key">{{ label }}</option></select><span v-if="decision.errors.recommendation" class="field-error">{{ decision.errors.recommendation }}</span></label>
                     <label class="block text-sm">ملاحظة (مطلوبة عند الإعادة)<textarea v-model="decision.note" class="field mt-1" rows="2" maxlength="2000" /><span v-if="decision.errors.note" class="field-error">{{ decision.errors.note }}</span></label>
                     <div class="flex flex-wrap gap-2">
                         <button type="button" class="btn btn-primary" :disabled="decision.processing" @click="decide('review')">اعتماد المراجعة</button>

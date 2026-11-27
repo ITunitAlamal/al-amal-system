@@ -8,6 +8,8 @@ use App\Services\Attendance\AttendanceAccess;
 use App\Services\Attendance\AttendanceLedger;
 use App\Services\Attendance\AttendancePermissionService;
 use App\Services\Attendance\HrActionService;
+use App\Services\AuditService;
+use App\Services\Organization\EffectiveAssignments;
 use App\Support\Attendance\AttendanceLedgerXlsx;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
@@ -53,12 +55,17 @@ final class AttendanceEmployeeLedgerController extends Controller
         $registerPermission = $access->canDecideHr($user) && app(AttendancePermissionService::class)->available();
         $createAction = $access->canManageHrActions($user) && app(HrActionService::class)->available();
 
-        return response()->json($ledger->day($employee, $date, true, $access->canViewHrActions($user)) + [
+        $day = $ledger->day($employee, $date, true, $access->canViewHrActions($user));
+        // The pending manual corrections of the day this user decides (owner decision 8: the HR head, or the executive director).
+        $pending = collect($day['punches'])->flatMap(fn (array $punch): array => array_column($punch['manual'], 'id'))->all();
+
+        return response()->json($day + [
             'permission_types' => $registerPermission ? app(AttendancePermissionService::class)->types() : [],
             'hr_action_types' => $createAction ? app(HrActionService::class)->types() : [],
             'can' => [
                 'request_correction' => $user->isSystemAdmin() || $user->isHrDepartmentHead(),
-                'decide_correction' => $user->isSystemAdmin(),
+                'decide_correction_ids' => $pending === [] ? [] : ($access->correctionsToDecide((int) $user->id)?->whereIn('c.id', $pending)
+                    ->pluck('c.id')->map(fn ($id): int => (int) $id)->all() ?? []),
                 'revert_auto' => $user->isSystemAdmin() || $user->isHrDepartmentHead(),
                 'register_permission' => $registerPermission,
                 'create_hr_action' => $createAction,
@@ -75,7 +82,14 @@ final class AttendanceEmployeeLedgerController extends Controller
         $withHrActions = app(AttendanceAccess::class)->canViewHrActions($request->user()) && $request->boolean('with_actions');
         $rows = $ledger->filter($ledger->rows($this->scope($filters), $withDirections, $withHrActions), $filters['filter'] ?? null);
 
-        return self::workbookResponse($rows->all(), 'سجل دوام الموظفين — من '.$filters['from'].' إلى '.$filters['to'], 'AIMS_Attendance_'.$filters['from'].'_to_'.$filters['to'].'.xlsx', $withDirections, $withHrActions);
+        $response = self::workbookResponse($rows->all(), 'سجل دوام الموظفين — من '.$filters['from'].' إلى '.$filters['to'], 'AIMS_Attendance_'.$filters['from'].'_to_'.$filters['to'].'.xlsx', $withDirections, $withHrActions);
+        if ($response->isSuccessful()) {
+            app(AuditService::class)->event('attendance.ledger.exported', ['subject_type' => 'attendance_daily_results', 'sensitivity' => $withHrActions ? 'restricted' : 'personal',
+                'ip' => $request->ip(), 'metadata' => ['from' => $filters['from'], 'to' => $filters['to'], 'employee_id' => $filters['employee_id'] ?? null,
+                    'name' => $filters['q'] ?? null, 'filter' => $filters['filter'] ?? null, 'rows' => $rows->count(), 'with_hr_actions' => $withHrActions, 'format' => 'xlsx']]);
+        }
+
+        return $response;
     }
 
     /**
@@ -151,6 +165,6 @@ final class AttendanceEmployeeLedgerController extends Controller
             ->join('roles as r', 'r.id', '=', 'a.role_id')
             ->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('a.user_id', $id)->where('r.code', 'executive_director')
-            ->where('u.is_active', true)->exists();
+            ->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->exists();
     }
 }

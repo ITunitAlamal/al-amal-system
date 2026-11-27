@@ -2,12 +2,15 @@
 import { Link, useForm } from '@inertiajs/vue3';
 import { ref, computed, toRef } from 'vue';
 import AppLayout from '../../../Layouts/AppLayout.vue';
+import PunchTimeReview from '../../../Components/Attendance/PunchTimeReview.vue';
 import PageHeader from '../../../Components/PageHeader.vue';
 import EmptyState from '../../../Components/EmptyState.vue';
 
 const props = defineProps({
     canApproveImport: Boolean,
+    decidableCorrections: { type: Array, default: () => [] },
     unmatched: { type: Array, default: () => [] },
+    time_review: { type: Array, default: () => [] },
     sync_runs: { type: Array, default: () => [] },
     mappings: { type: Array, default: () => [] },
     grace_minutes: { type: Number, default: null },
@@ -63,7 +66,7 @@ const statusLabels = { success: 'ناجحة', failed: 'فاشلة', running: 'ق
                 <Link href="/admin/attendance" class="btn btn-secondary">إدارة الحضور والأجهزة</Link>
             </PageHeader>
             <section class="card space-y-3">
-                <h2 class="card-title">تصحيح اتجاه البصمة — طلب وموافقة إدارية</h2>
+                <h2 class="card-title">تصحيح اتجاه البصمة — طلب وقرار رئيس قسم الموارد البشرية</h2>
                 <p>بيانات جهاز البصمة الأصلية محفوظة دون تعديل. ابحث باسم الموظف ضمن أحدث 100 حركة، ثم قدم طلب تصحيح مبررًا.</p>
                 <input v-model="searchPunch" class="form-input w-full" placeholder="ابحث باسم الموظف" aria-label="البحث باسم الموظف" />
                 <div class="flex flex-wrap gap-3 items-center">
@@ -85,8 +88,9 @@ const statusLabels = { success: 'ناجحة', failed: 'فاشلة', running: 'ق
                 <p v-for="(error, key) in revokeForm.errors" :key="key" class="field-error">{{error}}</p>
                 <div class="max-h-80 overflow-auto"><table class="w-full text-right text-sm"><thead><tr><th>رقم</th><th>البصمة</th><th>الأصلي</th><th>المطلوب</th><th>الحالة</th><th>السبب</th><th>قرار الإدارة</th></tr></thead>
                     <tbody><tr v-for="c in corrections" :key="c.id"><td>{{c.id}}</td><td>{{c.punch_id}}</td><td>{{c.original_direction}}</td><td>{{c.corrected_direction}}</td><td>{{c.status}}</td><td>{{c.reason}}</td><td>
-                        <template v-if="canApproveImport && c.status === 'pending'"><button class="btn btn-secondary" :disabled="decisionForm.processing" @click="decideCorrection(c,'approve')">اعتماد</button> <button class="btn btn-secondary" :disabled="decisionForm.processing" @click="decideCorrection(c,'reject')">رفض</button></template>
-                        <button v-if="canApproveImport && c.status === 'approved'" class="btn btn-secondary" :disabled="revokeForm.processing" @click="revokeCorrection(c)">إلغاء الاعتماد</button>
+                        <template v-if="decidableCorrections.includes(c.id) && c.status === 'pending'"><button class="btn btn-secondary" :disabled="decisionForm.processing" @click="decideCorrection(c,'approve')">اعتماد</button> <button class="btn btn-secondary" :disabled="decisionForm.processing" @click="decideCorrection(c,'reject')">رفض</button></template>
+                        <button v-if="decidableCorrections.includes(c.id) && c.status === 'approved'" class="btn btn-secondary" :disabled="revokeForm.processing" @click="revokeCorrection(c)">إلغاء الاعتماد</button>
+                        <span v-else-if="c.status === 'pending' && !decidableCorrections.includes(c.id)" class="text-xs text-slate-500">يقرره رئيس قسم الموارد البشرية، أو المدير التنفيذي إن كان رئيس القسم مقدمه أو صاحب البصمة.</span>
                     </td></tr></tbody></table></div>
             </section>
             <section class="card space-y-3">
@@ -97,6 +101,7 @@ const statusLabels = { success: 'ناجحة', failed: 'فاشلة', running: 'ق
                 <p v-for="(error, key) in review.errors" :key="key" class="field-error">{{error}}</p>
                 <p v-for="(error, key) in approval.errors" :key="key" class="field-error">{{error}}</p>
             </section>
+            <PunchTimeReview :events="time_review" />
             <section class="card">
                 <h2 class="card-title">فترة السماح بالتأخير</h2>
                 <p>{{ grace_minutes === null ? 'لم تُعتمد فترة السماح بعد.' : `${grace_minutes} دقيقة` }}</p>

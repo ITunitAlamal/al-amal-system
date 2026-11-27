@@ -14,9 +14,10 @@ use Illuminate\Validation\ValidationException;
  *   request (created_by) → head review (reviewed_by) → director / board approval → supplier choice and order (orders.created_by)
  *   → goods receipt (receipts.received_by) → invoice (invoices.created_by) → external payment voucher (external_recorded_by).
  *   - order: not the requester or any approver (FinanceProcurementController)
- *   - receipt: not the order's issuer or the requester (FinanceCompletionController::purchaseReceipt)
- *   - invoice: not the requester, the order's issuer or anyone who received its goods (here)
- *   - external voucher: not the requester, the order's issuer or a receiver (here)
+ *   - receipt: not the order's issuer, the request's creator or the employee who asked for it from «طلباتي»
+ *     (FinanceCompletionController::purchaseReceipt, with orderOrigin())
+ *   - invoice: not the requester, the order's issuer or anyone who received its goods (orderActors())
+ *   - external voucher: not the requester, the order's issuer or a receiver (orderActors())
  * Payroll: the person who recorded a run never reviews or publishes it. Stock count: the counter never approves it.
  */
 final class FinanceSod
@@ -37,18 +38,35 @@ final class FinanceSod
     /** Users who performed the procurement steps behind a purchase order. @return array<int, string> user id => step */
     public function orderActors(int $orderId): array
     {
+        $actors = [];
+        foreach (DB::table('finance_purchase_receipts')->where('order_id', $orderId)->pluck('received_by') as $receiver) {
+            $actors[(int) $receiver] = 'استلام أصناف الأمر';
+        }
+
+        return $this->orderOrigin($orderId) + $actors;
+    }
+
+    /**
+     * Users behind the order itself: its issuer, the request's creator and the employee who asked for the purchase
+     * from «طلباتي» (for such a request the creator is the procurement officer, not the requester). None of them
+     * receives the goods; one storekeeper may still receive several partial deliveries of the same order.
+     *
+     * @return array<int, string> user id => step
+     */
+    public function orderOrigin(int $orderId): array
+    {
         $order = DB::table('finance_purchase_orders')->find($orderId);
         if (! $order) {
             return [];
         }
         $purchase = DB::table('finance_purchase_requests')->find($order->purchase_request_id);
-        $actors = [];
-        foreach (DB::table('finance_purchase_receipts')->where('order_id', $orderId)->pluck('received_by') as $receiver) {
-            $actors[(int) $receiver] = 'استلام أصناف الأمر';
-        }
-        $actors[(int) $order->created_by] = 'إصدار أمر الشراء';
+        $actors = [(int) $order->created_by => 'إصدار أمر الشراء'];
         if ($purchase) {
             $actors[(int) $purchase->created_by] = 'إنشاء طلب الشراء';
+            $requester = FinanceOperations::requesterOf($purchase);
+            if ($requester !== null) {
+                $actors[$requester] = 'تقديم طلب الشراء';
+            }
         }
 
         return $actors;

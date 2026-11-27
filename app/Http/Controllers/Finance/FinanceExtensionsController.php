@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Services\Finance\FinanceGuard;
 use App\Services\Finance\FinanceMoney;
 use App\Services\Finance\FinanceSettlementService;
+use App\Services\Finance\FinanceSourceBridge;
+use App\Services\Rentals\RentalLedger;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
@@ -27,7 +29,7 @@ final class FinanceExtensionsController extends Controller
 
     public function allocate(Request $r, int $id)
     {
-        $this->guard->assert($r->user(), 'finance.transaction.execute');
+        $this->guard->assert($r->user(), 'finance.receipt.execute');
         $d = $r->validate(['allocations' => 'required|array|min:1', 'allocations.*.module' => 'required|string|max:55',
             'allocations.*.reference' => 'required|integer|min:1', 'allocations.*.amount' => 'required|regex:/^\d{1,12}(\.\d{1,2})?$/']);
         foreach ($d['allocations'] as &$allocation) {
@@ -48,6 +50,7 @@ final class FinanceExtensionsController extends Controller
             }
             $total = 0;
             $seen = [];
+            $rentalDues = [];
             foreach ($d['allocations'] as $a) {
                 $key = $a['module'].'|'.$a['reference'];
                 if (isset($seen[$key])) {
@@ -63,18 +66,23 @@ final class FinanceExtensionsController extends Controller
                 if ($a['module'] !== 'finance') {
                     $this->fail('module', 'المصدر غير متصل فعليًا؛ لا يمكن اعتبار استحقاقه محصلًا');
                 }
-                $receivable = DB::table('finance_receivables')->where('id', $a['reference'])->lockForUpdate()->first();
+                // A rent due is locked before its receivable, the order the rentals paths use (terminate, settlement),
+                // so the two never deadlock. Its remainder also counts the receipts and settlements at /finance/rentals.
+                $receivable = DB::table('finance_receivables')->where('id', $a['reference'])->first();
+                if ($receivable && $receivable->source_module === 'rentals') {
+                    DB::table('aims_rental_dues')->where('id', (int) $receivable->source_reference)->lockForUpdate()->first();
+                }
+                $receivable = $receivable ? DB::table('finance_receivables')->where('id', $a['reference'])->lockForUpdate()->first() : null;
                 if (! $receivable || $receivable->currency !== $tx->currency) {
                     $this->fail('receivable', 'المستحق غير موجود أو العملة مختلفة');
                 }
-                $past = DB::table('finance_payment_allocations')->where('receivable_module', 'finance')->where('receivable_id', (string) $a['reference'])->whereNull('reversed_by_transaction_id')->get();
-                $applied = 0;
-                foreach ($past as $al) {
-                    $applied += $this->cents($al->amount);
+                if ($receivable->cancelled_at !== null) {
+                    $this->fail('receivable', 'ألغى القسم المصدر هذا المستحق ('.$receivable->cancel_reason.')؛ لا يُخصص له قبض');
                 }
-                if ($applied + $amount > $this->cents($receivable->amount)) {
+                if ($amount > app(FinanceSourceBridge::class)->openCents($receivable)) {
                     $this->fail('allocations', 'التخصيص يتجاوز الرصيد المتبقي للمستحق');
                 }
+                $rentalDues[] = $receivable->source_module === 'rentals' ? (int) $receivable->source_reference : null;
                 $total += $amount;
             }
             if ($used + $total > $this->cents($tx->amount)) {
@@ -84,6 +92,10 @@ final class FinanceExtensionsController extends Controller
                 DB::table('finance_payment_allocations')->insert([
                     'transaction_id' => $id, 'receivable_module' => $a['module'], 'receivable_id' => $a['reference'],
                     'amount' => $a['amount'], 'created_at' => now(), 'updated_at' => now()]);
+            }
+            // A rent due paid off here closes in the rentals file as it does after an external receipt.
+            foreach (array_filter($rentalDues) as $dueId) {
+                app(RentalLedger::class)->refreshStatus($dueId);
             }
             $this->guard->audit('transaction', $id, $r->user()->id, 'allocate', ['amount' => FinanceMoney::format($total)]);
 

@@ -31,6 +31,12 @@ function completeVisit(v, status) {
     if (status === 'completed' && summary === null) return;
     router.post(`/orphans/registry/assessments/${v.id}`, { status, summary }, { preserveScroll: true });
 }
+// The head's review of a completed visit: only an approved one feeds campaign scoring.
+function reviewVisit(v, outcome) {
+    const note = outcome === 'rejected' ? window.prompt('سبب عدم الاعتماد:') : null;
+    if (outcome === 'rejected' && !note) return;
+    router.post(`/orphans/registry/assessments/${v.id}/review`, { outcome, note }, { preserveScroll: true });
+}
 const aid = () => props.modules.filter(m => m.tab === 'aid');
 </script>
 
@@ -70,8 +76,10 @@ const aid = () => props.modules.filter(m => m.tab === 'aid');
                         <div v-if="abilities.health" class="sm:col-span-3"><dt class="text-xs text-slate-500">ملاحظات مقيدة</dt><dd>{{ file.restricted_notes || '—' }}</dd></div>
                     </dl>
                     <form v-else class="mt-3 grid gap-3 sm:grid-cols-2" @submit.prevent="fileForm.put(`/orphans/registry/orphans/${file.public_id}/file`, { preserveScroll: true, onSuccess: () => { editingFile = false; } })">
-                        <label class="text-sm">حالة الملف<select v-model="fileForm.status" class="field mt-1"><option v-for="(label, key) in options.statuses" :key="key" :value="key">{{ label }}</option></select></label>
-                        <label class="text-sm">سبب الحالة<input v-model="fileForm.status_reason" class="field mt-1" maxlength="300"></label>
+                        <template v-if="abilities.decide">
+                            <label class="text-sm">حالة الملف<select v-model="fileForm.status" class="field mt-1"><option v-for="(label, key) in options.statuses" :key="key" :value="key">{{ label }}</option></select></label>
+                            <label class="text-sm">سبب الحالة<input v-model="fileForm.status_reason" class="field mt-1" maxlength="300"></label></template>
+                        <p v-else class="text-sm text-slate-600 sm:col-span-2">حالة الملف: {{ file.status_label }} — اعتمادها أو إيقافها أو إنهاؤها قرار لرئيس القسم.</p>
                         <label class="text-sm">فئة اليتم<select v-model="fileForm.orphan_class_value_id" class="field mt-1"><option :value="null">تُشتق من حالة الوالدين المتحقق منها</option><option v-for="c in options.classes" :key="c.id" :value="c.id">{{ c.name }}</option></select></label>
                         <label class="text-sm">موعد المراجعة<input v-model="fileForm.review_due_on" type="date" class="field mt-1"></label>
                         <label v-if="abilities.assign" class="text-sm">الموظف المسؤول<select v-model="fileForm.assigned_to" class="field mt-1"><option :value="null">غير محدد</option><option v-for="s in staff" :key="s.id" :value="s.id">{{ s.name }}</option></select></label>
@@ -131,14 +139,16 @@ const aid = () => props.modules.filter(m => m.tab === 'aid');
 
             <section v-if="tab === 'assessment'" class="card space-y-3" role="tabpanel">
                 <h3 class="card-title">التقييم الاجتماعي والزيارات</h3>
-                <p class="text-xs text-slate-500">التقييم الاجتماعي العام مستقل عن درجة الأولوية الخاصة بأي حملة.</p>
+                <p class="text-xs text-slate-500">التقييم الاجتماعي العام مستقل عن درجة الأولوية الخاصة بأي حملة؛ ولا يدخل مستوى الاحتياج في ترشيح الحملات إلا بعد اعتماد رئيس القسم.</p>
                 <ul class="space-y-2 text-sm">
                     <li v-for="v in assessments" :key="v.id" class="rounded-xl border border-slate-200 p-3">
                         <div class="flex flex-wrap items-center gap-2"><StatusBadge :label="{ visit: 'زيارة', assessment: 'تقييم', follow_up: 'متابعة' }[v.kind]" tone="info" />
                             <StatusBadge :label="{ scheduled: 'مجدولة', completed: 'منجزة', cancelled: 'ملغاة' }[v.status]" :tone="{ scheduled: 'warning', completed: 'success', cancelled: 'muted' }[v.status]" />
                             <span class="text-slate-500">{{ v.status === 'completed' ? v.completed_on : v.scheduled_on }} · {{ v.assignee || 'غير مسند' }}</span>
-                            <span v-if="abilities.edit && v.status === 'scheduled'" class="ms-auto flex gap-1"><button type="button" class="btn btn-sm btn-primary" @click="completeVisit(v, 'completed')">إنجاز</button><button type="button" class="btn btn-sm btn-secondary" @click="completeVisit(v, 'cancelled')">إلغاء</button></span></div>
-                        <p v-if="v.summary" class="mt-1 text-slate-700">{{ v.summary }}</p><p v-if="v.needs_level" class="text-slate-600">مستوى الاحتياج: {{ v.needs_level }}</p>
+                            <StatusBadge v-if="v.status === 'completed' && v.needs_level && 'review_outcome' in v" :label="{ approved: 'معتمدة من رئيس القسم', rejected: 'غير معتمدة' }[v.review_outcome] || 'بانتظار مراجعة رئيس القسم'" :tone="{ approved: 'success', rejected: 'danger' }[v.review_outcome] || 'warning'" />
+                            <span v-if="v.can_review" class="ms-auto flex gap-1"><button type="button" class="btn btn-sm btn-primary" @click="reviewVisit(v, 'approved')">اعتماد</button><button type="button" class="btn btn-sm btn-secondary" @click="reviewVisit(v, 'rejected')">عدم اعتماد</button></span>
+                            <span v-if="abilities.edit && v.can_complete && v.status === 'scheduled'" class="ms-auto flex gap-1"><button type="button" class="btn btn-sm btn-primary" @click="completeVisit(v, 'completed')">إنجاز</button><button type="button" class="btn btn-sm btn-secondary" @click="completeVisit(v, 'cancelled')">إلغاء</button></span></div>
+                        <p v-if="v.summary" class="mt-1 text-slate-700">{{ v.summary }}</p><p v-if="v.needs_level" class="text-slate-600">مستوى الاحتياج: {{ v.needs_level }}<span v-if="v.completed_name" class="text-slate-500"> · أنجزها {{ v.completed_name }}</span></p><p v-if="v.review_note" class="text-slate-600">ملاحظة المراجعة: {{ v.review_note }}</p>
                     </li>
                     <li v-if="!assessments.length" class="text-slate-500">لا توجد زيارات أو تقييمات.</li>
                 </ul>

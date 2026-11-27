@@ -204,11 +204,13 @@ final class FinanceAccessGrants
         });
     }
 
-    /** Active executive directors. @return list<int> */
+    /**
+     * The executive director who decides sensitive grants: the same person FinanceGuard::isExecutiveDirector accepts
+     * for purchases and payroll (the structural seat of EXEC), so the two can never diverge. @return list<int>
+     */
     public function executives(): array
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->distinct()->pluck('a.user_id')->map(fn ($id): int => (int) $id)->all();
+        return $this->guard->executiveDirectorIds();
     }
 
     public function canDecide(User $user, object $grant): bool
@@ -279,11 +281,17 @@ final class FinanceAccessGrants
                 throw ValidationException::withMessages(['code' => 'دور القالب غير مثبت.']);
             }
             $scope = $this->guard->departmentId();
-            if (! DB::table('department_user_roles')->where('user_id', $grant->user_id)->where('role_id', $role)->where('department_id', $scope)->exists()) {
-                DB::table('department_user_roles')->insert(['user_id' => $grant->user_id, 'role_id' => $role, 'department_id' => $scope, 'created_at' => now(), 'updated_at' => now()]);
-            }
+            // The template role follows the assignment's period (as close() removes it with the assignment), so a grant
+            // that starts later neither opens permissions nor makes its holder a workflow assignee before it starts.
+            $period = ['starts_on' => $grant->valid_from, 'ends_on' => $grant->valid_until, 'updated_at' => now()];
+            $existing = DB::table('department_user_roles')->where('user_id', $grant->user_id)->where('role_id', $role)->where('department_id', $scope)->value('id');
+            $existing
+                ? DB::table('department_user_roles')->where('id', $existing)->update($period)
+                : DB::table('department_user_roles')->insert(['user_id' => $grant->user_id, 'role_id' => $role, 'department_id' => $scope, ...$period, 'created_at' => now()]);
         } else {
             $previous = DB::table('finance_user_permissions')->where('user_id', $grant->user_id)->where('permission_code', $grant->code)->first();
+            // A future grant must not restore an inherited role permission while an earlier denial still applies.
+            DB::table('finance_access_grants')->where('id', $grant->id)->update(['previous_effect' => $previous?->effect]);
             DB::table('finance_user_permissions')->updateOrInsert(['user_id' => $grant->user_id, 'permission_code' => $grant->code], [
                 'effect' => 'grant', 'reason' => $grant->reason, 'decided_by' => $by, 'valid_until' => $grant->valid_until, 'grant_id' => $grant->id,
                 'updated_at' => now(), 'created_at' => $previous->created_at ?? now(),

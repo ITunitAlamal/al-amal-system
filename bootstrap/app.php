@@ -2,6 +2,7 @@
 
 use App\Http\Middleware\AuditContext;
 use App\Http\Middleware\EnsurePasswordChanged;
+use App\Http\Middleware\EnsureStaffActive;
 use App\Http\Middleware\HandleInertiaRequests;
 use App\Http\Middleware\NormalizeDigits;
 use App\Http\Middleware\PortalHostBoundary;
@@ -26,6 +27,8 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->redirectGuestsTo(fn (Request $request) => $request->is('guardian', 'guardian/*') ? route('guardian.welcome') : route('login'));
         $middleware->web(append: [
             NormalizeDigits::class,
+            // A deactivated staff account loses its open session on its next request.
+            EnsureStaffActive::class,
             HandleInertiaRequests::class,
             EnsurePasswordChanged::class,
         ]);

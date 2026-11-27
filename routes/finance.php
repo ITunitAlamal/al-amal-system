@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Finance\DepartmentBudgetController;
 use App\Http\Controllers\Finance\FinanceCompletionController as C;
 use App\Http\Controllers\Finance\FinanceDocumentCycleController as D;
 use App\Http\Controllers\Finance\FinanceExtensionsController as E;
@@ -14,11 +15,17 @@ use Illuminate\Support\Facades\Route;
 
 Route::middleware('auth')->prefix('finance')->name('finance.')->group(function () {
     Route::get('/', [F::class, 'index'])->name('index');
+    Route::get('/department-budgets', [DepartmentBudgetController::class, 'index'])->name('department-budgets.index');
+    Route::post('/department-budgets', [DepartmentBudgetController::class, 'store'])->name('department-budgets.store');
+    Route::patch('/department-budgets/{id}', [DepartmentBudgetController::class, 'update'])->whereNumber('id')->name('department-budgets.update');
     Route::get('/approvals', [C::class, 'approvals'])->name('approvals');
     Route::get('/bootstrap', [C::class, 'bootstrap'])->name('bootstrap');
     Route::get('/cycle', [D::class, 'cycle'])->name('cycle');
     Route::get('/archive', [D::class, 'archive'])->name('archive');
     Route::post('/invoices/{id}/external-voucher', [D::class, 'externalVoucher'])->whereNumber('id')->name('invoice.external-voucher');
+    Route::get('/sponsorships', [D::class, 'sponsorships'])->name('sponsorships');
+    Route::post('/sponsorships/receipts', [D::class, 'sponsorshipReceipt'])->name('sponsorships.receipts');
+    Route::post('/sponsorships/receipts/{id}/reverse', [D::class, 'reverseSponsorshipReceipt'])->whereNumber('id')->name('sponsorships.receipts.reverse');
     Route::get('/rentals', [FinanceRentalsController::class, 'index'])->name('rentals');
     Route::post('/rentals/receipts', [FinanceRentalsController::class, 'store'])->name('rentals.receipts');
     Route::post('/rentals/receipts/{id}/reverse', [FinanceRentalsController::class, 'reverse'])->whereNumber('id')->name('rentals.receipts.reverse');
@@ -33,6 +40,7 @@ Route::middleware('auth')->prefix('finance')->name('finance.')->group(function (
     Route::post('/purchases/{id}/valuation', [C::class, 'purchaseValuation'])->whereNumber('id')->name('purchase.valuation');
     Route::post('/purchases/{id}/items', [F::class, 'purchaseLines'])->whereNumber('id')->name('purchase.items');
     Route::post('/purchases/{id}/decision/{decision}', [F::class, 'purchaseDecision'])->whereNumber('id')->whereIn('decision', ['reject', 'return'])->name('purchase.decision');
+    Route::post('/purchases/{id}/cancel', [F::class, 'purchaseCancel'])->whereNumber('id')->middleware('throttle:20,1')->name('purchase.cancel');
     Route::post('/purchases/{id}/{action}', [F::class, 'purchaseAction'])->whereNumber('id')->whereIn('action', ['submit', 'review', 'director', 'board'])->name('purchase.action');
     Route::post('/purchase-rules', [C::class, 'purchaseRules'])->name('purchase.rules');
     Route::post('/orders/{id}/receipts', [C::class, 'purchaseReceipt'])->whereNumber('id')->name('purchase.receipt');
@@ -96,6 +104,8 @@ Route::middleware('auth')->prefix('finance')->name('finance.')->group(function (
 });
 
 // Finance staff and board treasurer: administrative assignments only.
+Route::middleware('auth')->get('/departments/budgets', [DepartmentBudgetController::class, 'summary'])->name('department.budgets');
+
 Route::middleware('auth')->prefix('admin/finance')->name('admin.finance.')->group(function () {
     Route::get('/access', [FinanceSetupController::class, 'index'])->name('access');
     Route::post('/assign', [FinanceSetupController::class, 'assign'])->name('assign');

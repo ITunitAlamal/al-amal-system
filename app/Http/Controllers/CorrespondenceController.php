@@ -4,6 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Models\User;
 use App\Services\AuditService;
+use App\Services\Correspondence\BoardDecisions;
+use App\Services\Correspondence\ConfidentialGrants;
 use App\Services\Correspondence\CorrespondenceAccess;
 use App\Services\Correspondence\CorrespondenceEditions;
 use App\Services\Correspondence\CorrespondenceInbox;
@@ -115,6 +117,40 @@ final class CorrespondenceController extends Controller
             'isAdmin' => $request->user()->isSystemAdmin(),
             'canCreate' => $this->access->canCreate($request->user()),
             'canCreateExternalArchive' => $this->access->canCreateExternalArchive($request->user()),
+            'canSeeDecisions' => $this->seesDecisionRegister($request->user()),
+        ]);
+    }
+
+    private function seesDecisionRegister(User $user): bool
+    {
+        $decisions = app(BoardDecisions::class);
+
+        return $decisions->installed() && ($decisions->visibleTo($user)
+            || collect(['board_secretary', 'secretariat', 'executive_director'])->contains(fn (string $role): bool => $this->access->role($user, $role)));
+    }
+
+    /**
+     * «سجل قرارات مجلس الإدارة»: the recorded Board decisions the user may open (CorrespondenceAccess), with their
+     * number, date, meeting, executing departments and follow-up state. Each row opens the decision letter.
+     */
+    public function decisions(Request $request, BoardDecisions $decisions): Response
+    {
+        abort_unless($request->user()->is_active, 403);
+        $filters = $request->validate([
+            'q' => ['nullable', 'string', 'max:150'], 'state' => ['nullable', 'in:open,overdue,closed'], 'department_id' => ['nullable', 'integer'],
+        ]);
+        if (! $decisions->installed()) {
+            return Inertia::render('Correspondence/Decisions', ['records' => null, 'counts' => [], 'filters' => $filters, 'departments' => []]);
+        }
+        if ($request->user()->isSystemAdmin()) {
+            $this->audit->recordRow('correspondence.technical_list', 'official_correspondences', 0, null, ['box' => 'board_decisions'], (int) $request->user()->id);
+        }
+
+        return Inertia::render('Correspondence/Decisions', [
+            'records' => $decisions->register($request->user(), $filters)->paginate(25)->withQueryString(),
+            'counts' => $decisions->counts($request->user()),
+            'filters' => $filters,
+            'departments' => $this->access->departments()->sortBy('name')->map(fn (object $department): array => ['id' => (int) $department->id, 'name' => $department->name])->values(),
         ]);
     }
 
@@ -166,7 +202,7 @@ final class CorrespondenceController extends Controller
         abort_unless($letter, 404);
         abort_unless($letter->status === 'draft' && (int) $letter->author_id === (int) $request->user()->id, 403);
 
-        return Inertia::render('Correspondence/Form', $this->formData($request) + ['letter' => $letter]);
+        return Inertia::render('Correspondence/Form', $this->formData($request) + ['letter' => $letter, 'decision' => app(BoardDecisions::class)->draftFields((int) $letter->id)]);
     }
 
     public function store(Request $request): RedirectResponse
@@ -185,6 +221,11 @@ final class CorrespondenceController extends Controller
 
     public function action(Request $request, string $publicId): RedirectResponse
     {
+        if ($request->input('action') === 'refer') {
+            $referral = $this->registry->refer($request->user(), $publicId, $request->all());
+
+            return to_route('correspondence.show', $publicId)->with('success', 'أُرسلت الإحالة '.$referral->reference.'، وأصبح بإمكان المستلم الاطلاع على الأصل.');
+        }
         $letter = $this->registry->act($request->user(), $publicId, $request->all(), $request->file('attachments', []));
 
         return to_route('correspondence.show', $letter->public_id);
@@ -192,7 +233,7 @@ final class CorrespondenceController extends Controller
 
     public function recipients(Request $request): JsonResponse
     {
-        $data = $request->validate(['department_id' => ['required', 'integer'], 'type_value_id' => ['required', 'integer'], 'classification_value_id' => ['required', 'integer'], 'letter' => ['nullable', 'uuid'], 'action' => ['nullable', Rule::in(['reopen', 'reassign'])], 'q' => ['nullable', 'string', 'max:100']]);
+        $data = $request->validate(['department_id' => ['required', 'integer'], 'type_value_id' => ['required', 'integer'], 'classification_value_id' => ['required', 'integer'], 'letter' => ['nullable', 'uuid'], 'action' => ['nullable', Rule::in(['reopen', 'reassign', 'refer'])], 'q' => ['nullable', 'string', 'max:100']]);
         $source = (int) $data['department_id'];
         $letter = null;
         if (! empty($data['letter'])) {
@@ -202,8 +243,15 @@ final class CorrespondenceController extends Controller
             $data['classification_value_id'] = $letter->classification_value_id;
         }
         $governanceAction = $data['action'] ?? null;
+        $refer = $governanceAction === 'refer';
         $task = $letter ? DB::table('correspondence_tasks')->where('correspondence_id', $letter->id)->first() : null;
-        if ($governanceAction) {
+        if ($refer) {
+            // A referral is a new letter of type «إحالة» from the referring department (CorrespondenceRegistry::refer).
+            $referralSource = $letter ? $this->access->referralSource($request->user(), $letter) : null;
+            abort_unless($referralSource !== null, 403);
+            $source = $referralSource;
+            $data['type_value_id'] = (int) $this->registry->constants('correspondence_types')->where('v.code', 'referral')->value('v.id');
+        } elseif ($governanceAction) {
             abort_unless($letter && ($governanceAction === 'reopen'
                 ? $this->access->canReopen($request->user(), $letter)
                 : $this->access->canReassign($request->user(), $letter, $task)), 403);
@@ -220,10 +268,17 @@ final class CorrespondenceController extends Controller
                     || (! $this->access->role($request->user(), 'executive_director') && (int) $department->id !== (int) $task->department_id))) {
                     continue;
                 }
-                if (! $this->access->canRoute($request->user(), $source, $user, (int) $department->id, (int) $data['type_value_id'], (int) $data['classification_value_id'], ! $letter || $letter->status === 'draft')) {
+                // Same limits as CorrespondenceRegistry::refer: Board work stays in the department, sensitive mail goes to the director.
+                if ($refer && ($letter->channel === 'external'
+                    ? $classification !== 'internal' && ! $this->access->role($user, 'executive_director')
+                    : ! $this->access->within((int) $department->id, $source))) {
                     continue;
                 }
-                if ($letter && $classification !== 'internal' && ($governanceAction || $source !== (int) $department->id) && ! $this->access->visible($user)->where('c.id', $letter->id)->exists()) {
+                if (! $this->access->canRoute($request->user(), $source, $user, (int) $department->id, (int) $data['type_value_id'], (int) $data['classification_value_id'], $refer || ! $letter || $letter->status === 'draft')) {
+                    continue;
+                }
+                // A referral shows the record to its recipient with the same classification; other hand-overs do not widen it.
+                if (! $refer && $letter && $classification !== 'internal' && ($governanceAction || $source !== (int) $department->id) && ! $this->access->visible($user, false)->where('c.id', $letter->id)->exists()) {
                     continue;
                 }
                 $choices[] = ['id' => $user->id, 'department_id' => $department->id, 'label' => $user->name.' — '.$department->name, 'name' => $user->name, 'department' => $department->name];
@@ -239,14 +294,15 @@ final class CorrespondenceController extends Controller
         $letter = $this->access->visible($actor)->where('c.public_id', $publicId)->first();
         abort_unless($letter, 404);
         $task = DB::table('correspondence_tasks')->where('correspondence_id', $letter->id)->first();
-        $owner = $task && (int) $task->assigned_to === (int) $actor->id && $task->status === 'open' && $this->access->actionVisible($actor, (int) $task->action_id);
+        $owner = $task && (int) $task->assigned_to === (int) $actor->id && $task->status === 'open' && $this->access->actionVisible($actor, (int) $task->action_id, false);
         if ($owner && $this->registry->markOpened($actor, $letter)) {
             $task = DB::table('correspondence_tasks')->where('id', $task->id)->first();
         }
-        $actions = DB::table('correspondence_actions as a')->join('users as u', 'u.id', '=', 'a.actor_id')->leftJoin('users as r', 'r.id', '=', 'a.recipient_id')->where('a.correspondence_id', $letter->id);
-        if (! $actor->isSystemAdmin() && $letter->channel !== 'external') {
-            $actions->whereIn('a.id', $this->access->accessQuery($actor)->select('access.action_id'));
-        }
+        // The Secretariat sees the whole history of its external archive, the administrator that of ordinary records,
+        // someone it was referred to what was shared with them, an exceptional grantee what the issuer sees
+        // (CorrespondenceAccess::visibleActions).
+        $actions = DB::table('correspondence_actions as a')->join('users as u', 'u.id', '=', 'a.actor_id')->leftJoin('users as r', 'r.id', '=', 'a.recipient_id')->where('a.correspondence_id', $letter->id)
+            ->whereIn('a.id', $this->access->visibleActions($actor, $letter)->select('a.id'));
         $history = $actions->orderBy('a.id')->get(['a.id', 'a.public_id', 'a.action', 'a.is_original', 'a.note', 'a.created_at', 'u.name as actor_name', 'r.name as recipient_name']);
         $attachments = DB::table('workflow_event_attachments')->whereIn('correspondence_action_id', $history->pluck('id'))->get(['public_id', 'correspondence_action_id', 'original_filename', 'file_size', 'document_version', 'created_at'])->groupBy('correspondence_action_id');
         foreach ($history as $entry) {
@@ -280,7 +336,7 @@ final class CorrespondenceController extends Controller
                 $workflow = app(WorkflowProgress::class)->view($instance, 'public_status');
                 $workflowRevision = $instance->revision;
                 if ($owner) {
-                    $workflowActions = app(WorkflowEngine::class)->availableActions($instance, $actor);
+                    $workflowActions = $this->withDecisionFields($this->withExecutingDepartments(app(WorkflowEngine::class)->availableActions($instance, $actor)), (int) $letter->id);
                 }
                 $allowed = $workflowActions !== [] ? ['workflow'] : [];
             }
@@ -294,7 +350,23 @@ final class CorrespondenceController extends Controller
         if ($this->access->canReassign($actor, $letter, $task)) {
             $allowed[] = 'reassign';
         }
+        if ($this->access->referralSource($actor, $letter) !== null) {
+            $allowed[] = 'refer';
+        }
+        // The record this letter refers to, and the referrals made from this one, as far as the viewer may open them.
+        $parentLetter = $letter->parent_id
+            ? $this->access->visible($actor)->where('c.id', $letter->parent_id)->first(['c.public_id', 'c.reference', 'c.subject', 'c.channel'])
+            : null;
+        $referrals = $this->access->visible($actor)->where('c.parent_id', $letter->id)->where('c.status', '<>', 'draft')
+            ->leftJoin('correspondence_tasks as t', 't.correspondence_id', '=', 'c.id')->leftJoin('users as holder', 'holder.id', '=', 't.assigned_to')
+            ->orderBy('c.id')->limit(50)->get(['c.public_id', 'c.reference', 'c.subject', 'c.status', 't.status as task_status', 'holder.name as holder_name']);
         $this->audit->recordRow($actor->isSystemAdmin() ? 'correspondence.technical_view' : 'correspondence.view', 'official_correspondences', $letter->id, null, null, (int) $actor->id);
+        $grants = app(ConfidentialGrants::class);
+        $exceptional = $this->access->grantInUse($actor, $letter);
+        if ($exceptional !== null) {
+            $grants->recordUse($actor, $letter, $exceptional, 'view', $request->ip());
+        }
+        $manageGrants = $grants->canManage($actor, $letter);
 
         $effectiveEdition = app(CorrespondenceEditions::class)->effective((int) $letter->id);
         abort_if($effectiveEdition && ! app(CorrespondenceEditions::class)->canView($actor, $effectiveEdition), 403);
@@ -302,13 +374,79 @@ final class CorrespondenceController extends Controller
         return Inertia::render('Correspondence/Show', [
             'effectiveEdition' => $effectiveEdition ? collect((array) $effectiveEdition)->only(['subject', 'body', 'version', 'approved_at'])->all() : null,
             'canProposeEdition' => Schema::hasTable('correspondence_editions') && $author && $letter->issued_at && ! in_array($letter->status, ['withdrawn', 'archived'], true),
-            'editions' => Schema::hasTable('correspondence_editions') ? DB::table('correspondence_editions')->where('correspondence_id', $letter->id)->when(! $actor->isSystemAdmin(), fn ($query) => $query->whereIn('action_id', $this->access->accessQuery($actor)->select('access.action_id')))->orderByDesc('version')->get(['public_id', 'version', 'status']) : [],
+            'editions' => Schema::hasTable('correspondence_editions') ? DB::table('correspondence_editions')->where('correspondence_id', $letter->id)->whereIn('action_id', $this->access->visibleActions($actor, $letter)->select('a.id'))->orderByDesc('version')->get(['public_id', 'version', 'status']) : [],
             'letter' => $letter, 'history' => $history, 'task' => $task, 'allowed' => array_values(array_unique($allowed)),
+            'decision' => app(BoardDecisions::class)->forLetter((int) $letter->id),
             'sourceDepartment' => $owner ? $task->department_id : ($this->access->role($actor, 'executive_director') ? $actor->department_id : $letter->department_id), 'workflow' => $workflow, 'workflowActions' => $workflowActions,
             'workflowRevision' => $workflowRevision, 'settings' => $this->access->settings(),
             'replyTo' => $owner && in_array('reply', $allowed, true) ? $this->replyTarget($actor, $letter, $task) : null,
             'meta' => $this->letterMeta($letter, $task), 'canPrintAudit' => $actor->isSystemAdmin(),
+            'parentLetter' => $parentLetter, 'referrals' => $referrals,
+            'exceptionalAccess' => $exceptional !== null ? DB::table('correspondence_confidential_grants')->where('id', $exceptional)->value('ends_at') : null,
+            'confidentialAccess' => $manageGrants ? ['grants' => $grants->listFor($letter), 'candidates' => $grants->candidates($actor)] : null,
         ]);
+    }
+
+    /**
+     * For an action that charges a department head with executing a Board decision: the departments of each
+     * selectable head who heads more than one, so the executive director names the executing department.
+     *
+     * @param  list<array<string, mixed>>  $actions
+     * @return list<array<string, mixed>>
+     */
+    private function withExecutingDepartments(array $actions): array
+    {
+        $targets = DB::table('workflow_transitions as t')->join('workflow_steps as s', 's.id', '=', 't.to_step_id')
+            ->whereIn('t.id', array_column($actions, 'id'))->pluck('s.code', 't.id');
+        $decisions = app(BoardDecisions::class);
+        foreach ($actions as &$action) {
+            if (($targets[$action['id']] ?? null) !== 'execute' || empty($action['pick_options'])) {
+                continue;
+            }
+            $heads = User::query()->whereIn('id', array_column($action['pick_options'], 'id'))->get();
+            $action['executing_departments'] = $heads->mapWithKeys(fn (User $head): array => [$head->id => $decisions->headedDepartments($head)])
+                ->filter(fn (array $departments): bool => count($departments) > 1)->all();
+        }
+
+        return $actions;
+    }
+
+    /**
+     * When the Secretariat returned a decision not yet registered to the board secretary, his action back to
+     * registration carries the decision data, so he completes or corrects it there (BoardDecisions::correct).
+     *
+     * @param  list<array<string, mixed>>  $actions
+     * @return list<array<string, mixed>>
+     */
+    private function withDecisionFields(array $actions, int $letterId): array
+    {
+        $decisions = app(BoardDecisions::class);
+        if ($actions === [] || ! $decisions->installed()
+            || ! DB::table('board_decisions')->where('correspondence_id', $letterId)->whereNull('recorded_at')->exists()) {
+            return $actions;
+        }
+        $fromRecord = DB::table('workflow_transitions as t')->join('workflow_steps as s', 's.id', '=', 't.from_step_id')
+            ->whereIn('t.id', array_column($actions, 'id'))->where('s.code', 'record')->pluck('t.id')->map(fn ($id): int => (int) $id)->all();
+        foreach ($actions as &$action) {
+            $action['decision_fields'] = in_array((int) $action['id'], $fromRecord, true);
+        }
+
+        return $actions;
+    }
+
+    /** The executive director opens a confidential record to one person until a date (ConfidentialGrants). */
+    public function grantConfidential(Request $request, string $publicId): RedirectResponse
+    {
+        app(ConfidentialGrants::class)->issue($request->user(), $publicId, $request->only(['user_id', 'ends_on', 'reason']), $request->ip());
+
+        return to_route('correspondence.show', $publicId)->with('success', 'مُنح الاطلاع الاستثنائي حتى التاريخ المحدد وسُجل في سجل النظام.');
+    }
+
+    public function revokeConfidential(Request $request, string $publicId, int $grant): RedirectResponse
+    {
+        app(ConfidentialGrants::class)->revoke($request->user(), $grant, (string) $request->input('revoke_reason', ''), $request->ip());
+
+        return to_route('correspondence.show', $publicId)->with('success', 'أُلغي الاطلاع الاستثنائي وسُجل في سجل النظام.');
     }
 
     /**
@@ -463,6 +601,11 @@ final class CorrespondenceController extends Controller
         $issue = $actions->firstWhere('action', 'issue');
         $printedAt = now((string) config('app.timezone'));
 
+        $exceptional = $this->access->grantInUse($actor, $letter);
+        if ($exceptional !== null) {
+            app(ConfidentialGrants::class)->recordUse($actor, $letter, $exceptional, 'print', $request->ip(), ['appendix' => $appendix]);
+        }
+
         $response = Inertia::render('Correspondence/Print', [
             'document' => [
                 'reference' => $letter->reference, 'subject' => $edition?->subject ?? $letter->subject, 'body' => $edition?->body ?? $letter->body,
@@ -491,9 +634,13 @@ final class CorrespondenceController extends Controller
     public function download(Request $request, string $attachment): StreamedResponse
     {
         $file = DB::table('workflow_event_attachments as f')->join('correspondence_actions as a', 'a.id', '=', 'f.correspondence_action_id')->where('f.public_id', $attachment)->first(['f.*', 'a.correspondence_id']);
-        abort_unless($file && $this->access->actionVisible($request->user(), (int) $file->correspondence_action_id)
-            && $this->access->visible($request->user())->where('c.id', $file->correspondence_id)->exists(), 404);
+        $letter = $file ? $this->access->visible($request->user())->where('c.id', $file->correspondence_id)->first() : null;
+        abort_unless($letter && $this->access->actionVisible($request->user(), (int) $file->correspondence_action_id), 404);
         abort_unless(Storage::disk($file->storage_disk)->exists($file->storage_path), 404);
+        $exceptional = $this->access->grantInUse($request->user(), $letter);
+        if ($exceptional !== null) {
+            app(ConfidentialGrants::class)->recordUse($request->user(), $letter, $exceptional, 'download', $request->ip(), ['attachment_id' => (int) $file->id]);
+        }
         $this->audit->recordRow('correspondence.attachment.download', 'workflow_event_attachments', $file->id, null, ['action_id' => $file->correspondence_action_id], (int) $request->user()->id);
 
         return Storage::disk($file->storage_disk)->download($file->storage_path, $file->original_filename, ['Content-Type' => 'application/octet-stream', 'X-Content-Type-Options' => 'nosniff', 'Cache-Control' => 'private, no-store']);

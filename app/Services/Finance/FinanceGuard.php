@@ -3,6 +3,7 @@
 namespace App\Services\Finance;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -13,13 +14,14 @@ final class FinanceGuard
      * covers them (SRS §2.4 and §3.1.4.1, ED requirements doc §2): they need the role permission and assignment.
      */
     public const BUSINESS_DECISIONS = [
-        'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute',
+        'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute', 'finance.payment.record',
+        'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute',
         'finance.procurement.review', 'finance.procurement.director_approve', 'finance.procurement.board_approve',
         'finance.budget.approve', 'finance.payroll.approve', 'finance.fund.approve',
         'finance.transfer.approve', 'finance.transfer.execute', 'finance.reversal.approve', 'finance.stock.count.approve',
         // Recording collections and settlement postings from the accounting software is a financial record the
         // administrator's technical role must never make (no fictitious postings).
-        'finance.rentals.record',
+        'finance.rentals.record', 'finance.sponsorships.record',
         // Salary data and payslip publication (2026-11-01): never through the technical role.
         'finance.payroll.record', 'finance.payroll.publish', 'finance.payroll.authorize',
     ];
@@ -52,16 +54,34 @@ final class FinanceGuard
      */
     private array $overrides = [];
 
+    /** @var array<int, list<string>> */
+    private array $specializations = [];
+
+    /** @var array<int, list<string>> */
+    private array $rolePermissions = [];
+
     /** @return array<string, string> permission code => 'grant'|'deny' */
     public function overridesFor(User $user): array
     {
         if (! isset($this->overrides[$user->id])) {
-            // A dated grant stops by itself the day after its end date; a withdrawal ('deny') has no end.
-            $this->overrides[$user->id] = Schema::hasTable('finance_user_permissions')
-                ? DB::table('finance_user_permissions')->where('user_id', $user->id)
-                    ->where(fn ($q) => $q->whereNull('valid_until')->orWhere('valid_until', '>=', today()->toDateString()))
-                    ->pluck('effect', 'permission_code')->all()
-                : [];
+            // A dated grant starts and stops on its own; a prior withdrawal stays in force until a future grant starts.
+            $query = Schema::hasTable('finance_user_permissions')
+                ? DB::table('finance_user_permissions as p')->where('p.user_id', $user->id)
+                    ->where(fn ($q) => $q->whereNull('p.valid_until')->orWhere('p.valid_until', '>=', today()->toDateString()))
+                : null;
+            $columns = ['p.effect', 'p.permission_code'];
+            if ($query && Schema::hasTable('finance_access_grants')) {
+                $query->leftJoin('finance_access_grants as g', 'g.id', '=', 'p.grant_id')
+                    ->where(fn ($q) => $q->where('p.effect', 'deny')->orWhereNull('p.grant_id')
+                        ->orWhere(fn ($grant) => $grant->where('g.state', 'applied')
+                            ->where(fn ($date) => $date->where('g.valid_from', '<=', today()->toDateString())->orWhere('g.previous_effect', 'deny'))));
+                $columns = [...$columns, 'g.valid_from as grant_valid_from', 'g.previous_effect'];
+            }
+            $this->overrides[$user->id] = $query?->get($columns)->mapWithKeys(function (object $row): array {
+                $priorDenial = $row->effect === 'grant' && ($row->grant_valid_from ?? null) > today()->toDateString() && ($row->previous_effect ?? null) === 'deny';
+
+                return [$row->permission_code => $priorDenial ? 'deny' : $row->effect];
+            })->all() ?? [];
         }
 
         return $this->overrides[$user->id];
@@ -73,7 +93,8 @@ final class FinanceGuard
      */
     public const ACCOUNTING_PERMISSIONS = [
         'finance.treasury.manage', 'finance.budget.manage', 'finance.budget.transfer', 'finance.budget.approve',
-        'finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute',
+        'finance.payment.draft', 'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute',
+        'finance.receipt.draft', 'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute',
         'finance.receivable.manage', 'finance.payroll.manage', 'finance.payroll.approve', 'finance.cheque.manage',
         'finance.transfer.execute', 'finance.transfer.approve', 'finance.reconcile', 'finance.fund.manage', 'finance.fund.approve',
         'finance.advance.manage', 'finance.reversal.request', 'finance.reversal.approve',
@@ -114,8 +135,24 @@ final class FinanceGuard
             return false;
         }
 
-        return $this->heads[$user->id] ??= DB::table('departments')->where('id', $this->departmentId())
-            ->where('head_user_id', $user->id)->whereNull('deleted_at')->exists();
+        return $this->heads[$user->id] ??= $this->holdsStructuralSeat($user, 'id', $this->departmentId(), 'department_head');
+    }
+
+    /**
+     * head_user_id of the department plus an effective assignment of the matching role in that department, as
+     * User::headedDepartmentId and OrphanAccess::isDesignatedExecutive require. head_user_id alone is not enough.
+     */
+    private function holdsStructuralSeat(User $user, string $column, int|string|null $value, string $role): bool
+    {
+        if ($value === null) {
+            return false;
+        }
+
+        return DB::table('departments as d')->where("d.$column", $value)->where('d.head_user_id', $user->id)->whereNull('d.deleted_at')
+            ->whereExists(fn ($q) => $q->selectRaw('1')->from('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
+                ->whereColumn('a.department_id', 'd.id')->whereColumn('a.user_id', 'd.head_user_id')->where('r.code', $role)
+                ->whereRaw(EffectiveAssignments::sql('a')))
+            ->exists();
     }
 
     /**
@@ -134,8 +171,22 @@ final class FinanceGuard
             return false;
         }
 
-        return $this->executives[$user->id] ??= DB::table('departments')->where('code', 'EXEC')
-            ->where('head_user_id', $user->id)->whereNull('deleted_at')->exists();
+        return $this->executives[$user->id] ??= $this->holdsStructuralSeat($user, 'code', 'EXEC', 'executive_director');
+    }
+
+    /**
+     * The one definition of the executive director in Accounts, as a list: the active users isExecutiveDirector()
+     * accepts (appointed head of EXEC with an effective executive_director assignment there). A user who keeps the
+     * role after a new appointment, or holds it as acting without the seat, is not one.
+     *
+     * @return list<int>
+     */
+    public function executiveDirectorIds(): array
+    {
+        $candidates = DB::table('departments')->where('code', 'EXEC')->whereNull('deleted_at')->whereNotNull('head_user_id')->pluck('head_user_id');
+
+        return User::whereIn('id', $candidates)->where('is_active', true)->get()
+            ->filter(fn (User $user): bool => $this->isExecutiveDirector($user))->map(fn (User $user): int => (int) $user->id)->values()->all();
     }
 
     private ?int $departmentId = null;
@@ -163,7 +214,14 @@ final class FinanceGuard
         if (! $user || ! $user->is_active) {
             return false;
         }
+        if (isset(FinancePermissionCatalog::LEGACY_TRANSACTION_PERMISSIONS[$permission])) {
+            return false;
+        }
         if (in_array($permission, self::ACCOUNTING_PERMISSIONS, true) && $this->documentaryMode()) {
+            return false;
+        }
+        // The Board treasurer's approval is a business decision the technical role never makes, whatever its rows say.
+        if ($permission === 'finance.procurement.board_approve' && $user->isSystemAdmin()) {
             return false;
         }
         $override = $this->overridesFor($user)[$permission] ?? null;
@@ -184,18 +242,62 @@ final class FinanceGuard
         // All other users require an explicit role permission or a per-user grant, plus an active finance assignment.
         // A job title or department membership alone never grants anything here.
         $hasRolePermission = $override === 'grant'
-            || $user->roleAssignments()->whereHas('role.permissions', fn ($q) => $q->where('code', $permission))->exists();
+            || $this->hasActiveRolePermission($user, $permission);
         if (! $hasRolePermission) {
             return false;
         }
         if ($permission === 'finance.procurement.board_approve') {
             return DB::table('finance_board_approvers')->where('user_id', $user->id)->where('is_active', true)->exists();
         }
-        if (in_array($permission, ['finance.procurement.director_approve', 'finance.transaction.approve', 'finance.budget.approve', 'finance.payroll.approve', 'finance.fund.approve', 'finance.transfer.approve', 'finance.reversal.approve'], true)) {
-            return $this->activeAssignments((int) $user->id, 'director_approver')->exists();
+        if (in_array($permission, ['finance.procurement.director_approve', 'finance.payment.approve', 'finance.receipt.approve', 'finance.budget.approve', 'finance.payroll.approve', 'finance.fund.approve', 'finance.transfer.approve', 'finance.reversal.approve'], true)) {
+            return in_array('director_approver', $this->specializationsFor($user), true);
         }
 
-        return $this->activeAssignments((int) $user->id)->exists();
+        return $this->specializationsFor($user) !== [];
+    }
+
+    /** @return list<string> */
+    private function specializationsFor(User $user): array
+    {
+        return $this->specializations[$user->id] ??= $this->activeAssignments((int) $user->id)->pluck('specialization')->all();
+    }
+
+    /** A template's permission is available only while that same specialization is active today. */
+    private function hasActiveRolePermission(User $user, string $permission): bool
+    {
+        if (! isset($this->rolePermissions[$user->id])) {
+            $roles = array_column(FinancePermissionCatalog::TEMPLATES, 1);
+            $activeRoles = array_values(array_map(fn (string $specialization): string => FinancePermissionCatalog::TEMPLATES[$specialization][1],
+                array_values(array_intersect($this->specializationsFor($user), array_keys(FinancePermissionCatalog::TEMPLATES)))));
+            // Only appointments in force today (starts_on/ends_on), for template and other roles alike.
+            $this->rolePermissions[$user->id] = $user->roleAssignments()->effective()
+                ->whereHas('role', fn ($q) => $q->where(fn ($role) => $role->whereNotIn('code', $roles)->orWhereIn('code', $activeRoles)))
+                ->with('role.permissions')->get()->flatMap(fn ($assignment) => $assignment->role->permissions->pluck('code'))->unique()->values()->all();
+        }
+
+        return in_array($permission, $this->rolePermissions[$user->id], true);
+    }
+
+    /** A closed mapping: receipt and payment permissions never imply one another. */
+    public static function transactionPermission(string $kind, string $action): string
+    {
+        abort_unless(in_array($kind, ['payment', 'receipt'], true) && in_array($action, ['draft', 'review', 'approve', 'execute'], true), 403);
+
+        return 'finance.'.$kind.'.'.$action;
+    }
+
+    public function allowsTransaction(?User $user, string $kind, string $action): bool
+    {
+        return $this->allows($user, self::transactionPermission($kind, $action));
+    }
+
+    /** Access to the internal vouchers of one kind, including the head's consolidated monitoring. */
+    public function canViewTransactions(?User $user, string $kind): bool
+    {
+        self::transactionPermission($kind, 'draft');
+
+        return $this->allows($user, 'finance.monitor')
+            || collect(['draft', 'review', 'approve', 'execute'])->contains(fn (string $action): bool => $this->allowsTransaction($user, $kind, $action));
     }
 
     public function assert(?User $user, string $permission): void

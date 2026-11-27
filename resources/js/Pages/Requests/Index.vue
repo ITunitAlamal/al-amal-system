@@ -3,6 +3,7 @@ import { formatDate } from '../../Support/dates.js';
 import { computed, reactive } from 'vue';
 import { Link, router } from '@inertiajs/vue3';
 import AppLayout from '../../Layouts/AppLayout.vue';
+import AppIcon from '../../Components/AppIcon.vue';
 import EmptyState from '../../Components/EmptyState.vue';
 import PageHeader from '../../Components/PageHeader.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
@@ -35,6 +36,9 @@ function clear() {
     Object.assign(form, { q: '', type: '', status: '', from: '', to: '' });
     router.get('/requests', {}, { preserveState: true, preserveScroll: true, replace: true });
 }
+// The request is on a step held by its requester: returned for editing (start step), waiting for them to confirm the
+// work, or on a step of its module that is theirs to do.
+const waitsForMe = item => item.awaitsMe ?? ['returned', 'verify'].includes(item.statusKey);
 function formattedDate(value) {
     return formatDate(value, { day: 'numeric', month: 'short', year: 'numeric' }, '—');
 }
@@ -62,7 +66,7 @@ function formattedDate(value) {
                         <span class="text-gold-600 transition group-hover:-translate-x-1" aria-hidden="true">←</span>
                     </Link>
                     <Link href="/requests/payslip" class="group flex items-center justify-between rounded-xl border border-navy-100 bg-navy-50/50 p-4 font-semibold text-navy-800 transition hover:border-gold-300 hover:bg-gold-50">
-                        <span>طلب قسيمة راتب</span>
+                        <span class="flex items-center gap-3"><AppIcon name="file-text" :size="24" /><span>إصدار قسيمة راتب <span class="text-sm font-normal">(فيشة)</span></span></span>
                         <span class="text-gold-600 transition group-hover:-translate-x-1" aria-hidden="true">←</span>
                     </Link>
                 </div>
@@ -109,12 +113,15 @@ function formattedDate(value) {
                     <li v-for="item in items" :key="item.key" class="rounded-xl border border-slate-100 p-4 transition hover:border-navy-200">
                         <div class="flex flex-wrap items-start justify-between gap-3">
                             <div class="min-w-0">
-                                <Link :href="item.url" class="font-semibold text-navy-800 hover:text-blue-700 hover:underline">{{ item.title }}</Link>
+                                <a v-if="item.printable" :href="item.url" target="_blank" rel="noopener" class="font-semibold text-navy-800 hover:text-blue-700 hover:underline">{{ item.title }}</a>
+                                <Link v-else :href="item.url" class="font-semibold text-navy-800 hover:text-blue-700 hover:underline">{{ item.title }}</Link>
                                 <p class="mt-1 text-xs text-slate-500">{{ item.kind }} · <span dir="ltr">{{ item.reference || '—' }}</span> · {{ formattedDate(item.createdAt) }}</p>
                             </div>
                             <div class="flex items-center gap-2">
                                 <StatusBadge :label="item.status" :tone="item.tone" />
-                                <Link :href="item.url" class="btn btn-secondary btn-sm">التفاصيل</Link>
+                                <!-- A ready payslip is a printable page outside the application layout: it opens in its own tab. -->
+                                <a v-if="item.printable" :href="item.url" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">عرض وطباعة</a>
+                                <Link v-else :href="item.url" class="btn btn-sm" :class="waitsForMe(item) ? 'btn-primary' : 'btn-secondary'">{{ waitsForMe(item) ? 'اتخاذ إجراء' : 'عرض' }}</Link>
                             </div>
                         </div>
                         <StatusStepper v-if="item.steps.length" class="mt-3" :steps="item.steps" compact />
@@ -125,7 +132,8 @@ function formattedDate(value) {
                                 <span v-if="item.summary.overdue" class="ms-2 font-semibold text-red-700">· تجاوزت المهلة</span>
                             </div>
                         </dl>
-                        <p v-if="item.summary.reason" class="alert-warning mt-2 text-xs">السبب: {{ item.summary.reason }}</p>
+                        <!-- On a verification step the note came with the completed work; it is not a reason for a return. -->
+                        <p v-if="item.summary.reason" class="alert-warning mt-2 text-xs">{{ item.summary.reasonLabel || 'السبب' }}: {{ item.summary.reason }}</p>
                     </li>
                 </ul>
 

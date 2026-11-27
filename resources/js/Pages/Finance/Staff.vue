@@ -99,6 +99,7 @@ const withdraw = p => act(`/finance/staff/${selectedId.value}/withdraw`, { code:
         <div class="mx-auto max-w-6xl space-y-5">
             <PageHeader eyebrow="قسم الحسابات" title="موظفو القسم وصلاحياتهم"
                 :description="role === 'head' ? 'تُسنِد لموظفي الحسابات ووحداتها قوالب الأدوار وصلاحياتها. لا يُسند أحد لنفسه، والصلاحيات الحساسة والاستثناءات من فصل المهام يقررها المدير التنفيذي.' : 'إسناد اختصاصات موظفي الحسابات. صلاحيتك التقنية لا تمنح قرار الصلاحيات الحساسة؛ يقررها المدير التنفيذي.'" />
+            <p class="text-sm text-slate-600">المشتريات والمخازن والرواتب والصرف والقبض اختصاصات مستقلة داخل قسم الحسابات. يمكن جمع عدة اختصاصات وصلاحيات لموظف واحد؛ الإسناد الجديد يُضاف إلى إسناداته الحالية.</p>
             <div v-if="error" class="alert-error" role="alert">{{ error }}</div>
             <div v-if="message" class="alert-success" role="status">{{ message }}</div>
 

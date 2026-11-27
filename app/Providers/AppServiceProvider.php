@@ -8,6 +8,7 @@ use App\Services\Orphans\Extensions\AidExtension;
 use App\Services\Orphans\Extensions\CampaignExtension;
 use App\Services\Orphans\Extensions\PortalSection;
 use App\Services\Orphans\OrphanAccess;
+use App\Services\Progress\TransactionTracker;
 use App\Services\Validation\TypeSafePresenceVerifier;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Database\Events\ConnectionEstablished;
@@ -28,6 +29,8 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(AttendanceDeviceProber::class, AttendanceDeviceHealthProbe::class);
         // One access resolver per request so role/capability lookups are cached across a page.
         $this->app->scoped(OrphanAccess::class);
+        // One task inbox per request: the «مهامي» badge shared with every page reuses the list a page already read.
+        $this->app->scoped(TransactionTracker::class);
         // Department modules that add sections to the orphan/guardian files or filters to the registry.
         $this->app->tag([PortalSection::class, AidExtension::class], 'orphans.profile_sections');
         foreach (['orphans.sponsorship_coverage', 'orphans.benefit_summaries', 'orphans.registry_filters', 'orphans.action_items'] as $tag) {

@@ -31,6 +31,7 @@ const actions = {
     archive: 'أرشفة',
     withdraw: 'سحب',
     workflow: 'إجراء في المسار المؤسسي',
+    refer: 'إحالة للمتابعة',
 };
 const statuses = {
     draft: 'مسودة',

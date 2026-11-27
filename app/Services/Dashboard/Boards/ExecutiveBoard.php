@@ -4,6 +4,7 @@ namespace App\Services\Dashboard\Boards;
 
 use App\Models\User;
 use App\Services\Progress\TransactionTracker;
+use App\Services\Rentals\RentalsDashboard;
 use App\Services\WorkflowVisibilityService;
 use Illuminate\Support\Facades\DB;
 
@@ -51,6 +52,7 @@ final class ExecutiveBoard
                     detail: 'من '.(clone $visible)->count().' معاملة جارية (دون السرية)'),
                 BoardKit::metric('حملات إغاثية تحتاج متابعة', DB::table('campaigns')->whereIn('status', ['pending_executive', 'distributing', 'reconciling'])->count(), null,
                     detail: 'بانتظار اعتماد الكشف أو قيد التوزيع أو التسوية', url: '/orphans/campaigns'),
+                ...$this->rentals($user),
             ],
             'trend' => BoardKit::trend('الوارد إليك والمنجز منك أسبوعيًا', 'الوارد = مراحل أُسندت إليك في مسارات العمل؛ المنجز = إجراءات اتخذتها (اعتماد، إعادة، رفض…). نوافذ 7 أيام تنتهي اليوم.', [
                 ['label' => 'وارد', 'values' => BoardKit::weekly($incoming, 'occurred_at')],
@@ -63,5 +65,29 @@ final class ExecutiveBoard
                 ['key' => 'submitted', 'label' => 'التاريخ'], ['key' => 'age', 'label' => 'العمر']], $rows, 'لا توجد قرارات بانتظارك الآن.', '/tasks'),
             'actions' => [['label' => 'صندوق المهام', 'url' => '/tasks', 'icon' => 'inbox'], ['label' => 'الحملات الإغاثية', 'url' => '/orphans/campaigns', 'icon' => 'boxes']],
         ];
+    }
+
+    /**
+     * One compact rentals tile (TRANSFORM §11): contracts with arrears, with occupancy and contracts ending without
+     * renewal in its detail, from the rentals block's own summary. Nothing while no unit or property is registered.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function rentals(User $user): array
+    {
+        try {
+            $r = app(RentalsDashboard::class)->summary($user);
+        } catch (\Throwable) {
+            return [BoardKit::unavailable('الإيجارات', 'تعذر قراءة ملخص الإيجارات الآن.')];
+        }
+        if (! $r['registered']) {
+            return [];
+        }
+        $portfolio = collect($r['portfolio'])->keyBy('key');
+
+        return [BoardKit::metric('عقود إيجار عليها متأخرات', (int) $r['overdue']['contracts'], 'down',
+            detail: 'الإشغال: '.$portfolio['rented']['value'].' مؤجرة من '.$portfolio['units']['value'].' عينًا · تنتهي خلال '.$r['expiring']['days']
+                .' يومًا دون تجديد: '.$r['expiring']['withoutRenewal'],
+            url: RentalsDashboard::canView($user) ? $r['overdue']['url'] : null)];
     }
 }

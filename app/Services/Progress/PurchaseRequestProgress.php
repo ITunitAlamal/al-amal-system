@@ -55,6 +55,12 @@ final class PurchaseRequestProgress
         $flow[] = $step('استلام المواد', $receipt ? 'done' : ($order ? 'current' : 'upcoming'), $receipt ? 'محضر '.$receipt->number : 'المخازن', $receipt?->created_at);
         $flow[] = $step('فاتورة المورد', $invoice ? 'done' : ($receipt ? 'current' : 'upcoming'), $invoice ? 'فاتورة '.$invoice->invoice_no : 'الحسابات', $invoice?->created_at);
         $flow[] = $step('الدفع للمورد', $payment ? 'done' : ($invoice ? 'current' : 'upcoming'), $invoice?->external_voucher_no ? 'سند '.$invoice->external_voucher_no : 'الحسابات', $payment?->created_at);
+        if ($state === 'cancelled') {
+            $flow = array_map(fn (array $item): array => $item['state'] === 'current' ? [...$item, 'state' => 'upcoming'] : $item, $flow);
+
+            return ['steps' => $flow, 'summary' => ['status' => 'ملغى', 'tone' => 'muted', 'where' => 'أُلغي الطلب بعد اعتماده'.(($purchase->cancellation_reason ?? null) ? ': '.$purchase->cancellation_reason : ''),
+                'next' => 'لا إجراءات متبقية', 'dueAt' => null, 'overdue' => false, 'partial' => $events->isEmpty()]];
+        }
         if ($state === 'rejected') {
             $flow = array_map(fn (array $item): array => $item['state'] === 'current' ? [...$item, 'state' => 'upcoming'] : $item, $flow);
 

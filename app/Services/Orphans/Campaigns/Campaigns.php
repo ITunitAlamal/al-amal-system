@@ -8,8 +8,10 @@ use App\Services\Finance\FinanceGuard;
 use App\Services\Finance\FinanceOperations;
 use App\Services\Finance\StockExact;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Orphans\Aid;
 use App\Services\Orphans\OrphanAccess;
 use App\Services\Orphans\Registry;
+use App\Services\Orphans\RegistryQueries;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -142,7 +144,7 @@ final class Campaigns
         $primary = (clone $rows)->whereIn('outcome', ['primary']);
         $byRegion = (clone $primary)->leftJoin('master_data_values as g', 'g.id', '=', 'campaign_candidates.governorate_value_id')
             ->selectRaw("coalesce(g.name_ar, 'غير محدد') as label, count(*) as n")->groupBy('g.name_ar')->orderByDesc('n')->get();
-        $bands = app(\App\Services\Orphans\RegistryQueries::class)->values('orphan_age_bands');
+        $bands = app(RegistryQueries::class)->values('orphan_age_bands');
         $ages = (clone $primary)->pluck('age')->all();
         $byAge = array_map(function ($band) use ($ages): array {
             $meta = json_decode((string) DB::table('master_data_values')->where('id', $band['id'])->value('metadata'), true) ?: [];
@@ -263,15 +265,42 @@ final class Campaigns
             'candidate_id' => $c->id, 'created_at' => now(), 'updated_at' => now()]);
     }
 
-    /** The head (or acting head) recommends and refers the draft to the executive director; it freezes for review. */
+    /**
+     * «رفع لرئيس القسم»: the preparer tells the head that a draft is ready. The list stays a draft (still editable);
+     * only the head refers it to the executive director (submit). The request is kept on the draft, so it stays in
+     * the head's work queue (CampaignExtension) whether or not the notification is delivered.
+     */
+    public function requestReview(object $list, ?string $note, User $actor): int
+    {
+        $campaign = DB::table('campaigns')->find($list->campaign_id);
+        abort_unless($this->canPrepare($actor, $campaign), 403, 'إعداد الكشوف يحتاج قدرة «إعداد الحملات والكشوف».');
+        abort_unless($list->status === 'draft' && $list->entry_count > 0, 409, 'لا يُرفع إلا كشف مسودة غير فارغ.');
+        $heads = array_values(array_diff($this->access->headUserIds(), [(int) $actor->id]));
+        abort_if($heads === [], 409, 'لا يوجد رئيس قسم (أو قائم بأعماله) يراجع الكشف؛ يلزم تعيينه في الهيكل.');
+        $updated = DB::table('campaign_lists')->where('id', $list->id)->where('status', 'draft')->update(['review_requested_at' => now(), 'review_requested_by' => $actor->id, 'updated_at' => now()]);
+        abort_if($updated === 0, 409, 'لم يعد الكشف مسودة؛ أعد تحميل الصفحة.');
+        $this->audit->recordRow('orphans.campaign.list_review_requested', 'campaign_lists', $list->id, null, ['version' => $list->version, 'note' => $note], $actor->id, request()?->ip());
+
+        return $this->notifications->notifyMany($heads, 'orphans_campaign_review', ['title' => 'كشف الحملة '.$campaign->reference_no.' (الإصدار '.$list->version.') جاهز لمراجعتك',
+            'body' => $note, 'url' => '/orphans/campaigns/'.$campaign->public_id.'?tab=list&list='.$list->id, 'dedupe' => 'campaign-review-'.$list->id.'-'.$list->lock_version]);
+    }
+
+    /**
+     * The head (or acting head) reviews the draft, recommends it and refers it to the executive director; it freezes
+     * for review. The head's review is a mandatory stage of the approved campaign workflow (AIMS 2.0 spec), so a
+     * preparer cannot send a list to the director directly.
+     */
     public function submit(object $list, ?string $note, User $actor): void
     {
-        abort_unless($this->access->isHead($actor) || $this->access->allows($actor, 'campaigns'), 403, 'رفع الكشف للمدير التنفيذي لرئيس القسم أو معدّ الحملة المخول.');
+        $this->access->assertDecide($actor, 'رفع الكشف للمدير التنفيذي لرئيس القسم بعد مراجعته؛ يرفعه معدّ الحملة إلى رئيس القسم أولًا.');
         abort_unless($list->status === 'draft' && $list->entry_count > 0, 409, 'لا يُرفع إلا كشف مسودة غير فارغ.');
         DB::transaction(function () use ($list, $note, $actor): void {
+            $locked = DB::table('campaign_lists')->where('id', $list->id)->where('status', 'draft')->lockForUpdate()->first();
+            abort_unless($locked, 409, 'لم يعد الكشف مسودة؛ أعد تحميل الصفحة.');
+            $this->assertEligibleEntries($locked);
             $this->refreshList($list->id);
             DB::table('campaign_lists')->where('id', $list->id)->update(['status' => 'pending_executive', 'submitted_at' => now(),
-                ...($this->access->isHead($actor) ? ['recommended_by' => $actor->id, 'recommended_at' => now(), 'recommendation_note' => $note] : []), 'updated_at' => now()]);
+                'recommended_by' => $actor->id, 'recommended_at' => now(), 'recommendation_note' => $note, 'review_requested_at' => null, 'review_requested_by' => null, 'updated_at' => now()]);
             $request = DB::table('campaign_change_requests')->where('proposed_list_id', $list->id)->first();
             if ($request) {
                 DB::table('campaign_change_requests')->where('id', $request->id)->update(['status' => 'pending', 'diff' => json_encode($this->diff($request->base_list_id, $list->id), JSON_UNESCAPED_UNICODE), 'updated_at' => now()]);
@@ -285,10 +314,10 @@ final class Campaigns
             'url' => '/orphans/campaigns/'.$campaign->public_id.'?tab=approval', 'dedupe' => 'campaign-list-'.$list->id]);
     }
 
-    /** Returns a submitted version to draft (preparers only, before the executive director decides). */
+    /** Returns a submitted version to draft (the head who refers it, before the executive director decides). */
     public function withdraw(object $list, User $actor): void
     {
-        abort_unless($this->access->isHead($actor) || $this->access->allows($actor, 'campaigns'), 403);
+        $this->access->assertDecide($actor, 'سحب الكشف من المدير التنفيذي لرئيس القسم.');
         abort_unless($list->status === 'pending_executive', 409, 'الكشف ليس بانتظار القرار.');
         DB::table('campaign_lists')->where('id', $list->id)->update(['status' => 'draft', 'submitted_at' => null, 'recommended_by' => null, 'recommended_at' => null, 'lock_version' => $list->lock_version + 1, 'updated_at' => now()]);
         if (! DB::table('campaign_change_requests')->where('proposed_list_id', $list->id)->exists()) {
@@ -301,17 +330,24 @@ final class Campaigns
 
     /**
      * EXECUTIVE DIRECTOR ONLY: approves or rejects the exact version (and its exact diff when it is a change request).
-     * The role is checked here and again by the database trigger; no delegation, no system-admin path.
+     * Only the original, officially designated director (head of EXEC holding the role there) decides; this is checked
+     * here and again by the database trigger. No delegation, acting role or system-admin path.
      */
     public function decide(object $list, string $decision, ?string $note, string $expectedHash, User $actor): void
     {
-        abort_unless($this->access->isExecutive($actor), 403, 'اعتماد كشوف الحملات وتعديلاتها حصري للمدير التنفيذي.');
-        abort_unless($list->status === 'pending_executive', 409, 'الكشف ليس بانتظار قرار المدير التنفيذي.');
-        abort_unless(hash_equals((string) $list->content_hash, $expectedHash), 409, 'تغيّر محتوى الكشف منذ عرضه؛ أعد مراجعته قبل القرار.');
+        abort_unless($this->access->isDesignatedExecutive($actor), 403, 'اعتماد كشوف الحملات وتعديلاتها أو رفضها حصري للمدير التنفيذي المعيّن رسميًا.');
         if ($decision === 'reject' && blank($note)) {
             throw ValidationException::withMessages(['note' => 'سبب الرفض مطلوب.']);
         }
-        DB::transaction(function () use ($list, $decision, $note, $actor): void {
+        DB::transaction(function () use ($list, $decision, $note, $expectedHash, $actor): void {
+            $list = DB::table('campaign_lists')->where('id', $list->id)->lockForUpdate()->first();
+            abort_unless($list && $list->status === 'pending_executive', 409, 'الكشف ليس بانتظار قرار المدير التنفيذي.');
+            abort_unless(hash_equals((string) $list->content_hash, $expectedHash), 409, 'تغيّر محتوى الكشف منذ عرضه؛ أعد مراجعته قبل القرار.');
+            if ($decision === 'approve') {
+                // No approval without the head's review (also enforced by the database guard, 000028).
+                abort_unless($list->recommended_by && $list->recommended_at, 409, 'لم يراجع رئيس القسم هذا الكشف ولم يوصِ به؛ يسحبه رئيس القسم ويعيد رفعه بعد مراجعته.');
+                $this->assertEligibleEntries($list);
+            }
             $request = DB::table('campaign_change_requests')->where('proposed_list_id', $list->id)->lockForUpdate()->first();
             if ($decision === 'approve') {
                 if ($request) {
@@ -407,16 +443,53 @@ final class Campaigns
 
     /* ---------- Stores, delivery, reconciliation ---------- */
 
-    /** Issue/return through the Stores ledger (finance_stock_movements); nothing is counted twice. */
+    /**
+     * Issue/return through the Stores ledger (finance_stock_movements); nothing is counted twice. Under a lock on the
+     * campaign item and in exact scaled integers: an issue never exceeds the approved list's need for the item (its
+     * primary entries, plus those without an item) less what is already issued (net of returns), a return never
+     * exceeds that net issue, and a return comes back into the store at the average cost at which the net issue left it.
+     */
     public function stock(object $campaign, object $item, string $kind, string $quantity, User $actor): void
     {
         abort_unless(app(FinanceGuard::class)->allows($actor, $kind === 'issue' ? 'finance.stock.issue' : 'finance.stock.receive'), 403, 'صرف المواد وإرجاعها لأمين المخازن المخول في الحسابات.');
         abort_unless(in_array($campaign->status, ['approved', 'distributing', 'reconciling'], true), 409, 'لا تُصرف مواد قبل اعتماد المدير التنفيذي للكشف.');
         abort_unless($campaign->warehouse_id && $item->stock_item_id, 422, 'اربط الحملة بمخزن والصنف بصنف مخزني أولًا.');
         DB::transaction(function () use ($campaign, $item, $kind, $quantity, $actor): void {
+            DB::table('campaign_items')->where('id', $item->id)->lockForUpdate()->first();
+            $requested = StockExact::scaled($quantity, 3);
+            if ($requested <= 0) {
+                throw ValidationException::withMessages(['quantity' => 'الكمية غير صالحة.']);
+            }
+            // Net issued quantity (3 places) and its stock value (3 + 4 places), read from the movements themselves.
+            $net = 0;
+            $value = 0;
+            foreach (DB::table('campaign_stock_issues as s')->join('finance_stock_movements as m', 'm.id', '=', 's.stock_movement_id')
+                ->where('s.item_id', $item->id)->get(['s.kind', 'm.quantity', 'm.unit_cost']) as $row) {
+                $sign = $row->kind === 'issue' ? 1 : -1;
+                $q = StockExact::scaled((string) $row->quantity, 3);
+                $net += $sign * $q;
+                $value += $sign * $q * StockExact::scaled((string) $row->unit_cost, 4);
+            }
+            $issued = StockExact::decimal(max(0, $net), 3);
+            if ($kind === 'issue') {
+                // A primary entry without an item (imported without a variant, a reserve moved to primary) still
+                // needs goods: it counts toward the sole item of a one-item campaign, and toward every item's cap
+                // of a multi-item campaign, since the list does not say which item it takes.
+                $needed = StockExact::scaled((string) DB::table('campaign_list_entries as e')->join('campaign_lists as l', 'l.id', '=', 'e.list_id')
+                    ->where('l.campaign_id', $campaign->id)->where('l.status', 'approved')->where('e.kind', 'primary')
+                    ->where(fn ($q) => $q->where('e.item_id', $item->id)->orWhereNull('e.item_id'))
+                    ->selectRaw('coalesce(sum(e.quantity), 0) as q')->value('q'), 3);
+                if ($net + $requested > $needed) {
+                    throw ValidationException::withMessages(['quantity' => 'الصرف يتجاوز احتياج الكشف المعتمد من هذا الصنف: المطلوب '.StockExact::decimal($needed, 3).'، والمصروف صافيًا '.$issued.'.']);
+                }
+            } elseif ($requested > $net) {
+                throw ValidationException::withMessages(['quantity' => 'الإرجاع يتجاوز صافي ما صُرف لهذه الحملة من هذا الصنف ('.$issued.').']);
+            }
+            $returnCost = $kind === 'issue' ? [] : ['unit_cost' => StockExact::decimal(intdiv(max(0, $value) + intdiv($net, 2), $net), 4)];
             $movement = app(FinanceOperations::class)->stockMovement(['warehouse_id' => $campaign->warehouse_id, 'stock_item_id' => $item->stock_item_id, 'kind' => $kind === 'issue' ? 'issue' : 'return_in',
-                'quantity' => $quantity, 'reference_type' => 'campaign', 'reference_id' => $campaign->reference_no, 'note' => ($kind === 'issue' ? 'صرف لحملة ' : 'إرجاع من حملة ').$campaign->reference_no], $actor->id);
-            DB::table('campaign_stock_issues')->insert(['campaign_id' => $campaign->id, 'item_id' => $item->id, 'kind' => $kind, 'quantity' => $quantity, 'stock_movement_id' => $movement, 'recorded_by' => $actor->id, 'created_at' => now()]);
+                'quantity' => StockExact::decimal($requested, 3), ...$returnCost, 'reference_type' => 'campaign', 'reference_id' => $campaign->reference_no,
+                'note' => ($kind === 'issue' ? 'صرف لحملة ' : 'إرجاع من حملة ').$campaign->reference_no], $actor->id);
+            DB::table('campaign_stock_issues')->insert(['campaign_id' => $campaign->id, 'item_id' => $item->id, 'kind' => $kind, 'quantity' => StockExact::decimal($requested, 3), 'stock_movement_id' => $movement, 'recorded_by' => $actor->id, 'created_at' => now()]);
             if ($kind === 'issue' && $campaign->status === 'approved') {
                 DB::table('campaigns')->where('id', $campaign->id)->update(['status' => 'distributing', 'updated_at' => now()]);
             }
@@ -484,13 +557,13 @@ final class Campaigns
     /** Authorized correction of a recorded outcome: a new correction event; the benefit (if any) is reversed. */
     public function correct(object $delivery, string $reason, User $actor): void
     {
-        abort_unless($this->access->canAssign($actor), 403, 'تصحيح تسليم مؤكد لرئيس القسم.');
+        $this->access->assertDecide($actor, 'تصحيح تسليم مؤكد لرئيس القسم.');
         abort_if($delivery->kind === 'correction' || DB::table('campaign_deliveries')->where('corrects_id', $delivery->id)->exists(), 409, 'لا يمكن تصحيح هذا الحدث.');
         DB::transaction(function () use ($delivery, $reason, $actor): void {
             DB::table('campaign_deliveries')->insert(['public_id' => (string) Str::ulid(), 'campaign_id' => $delivery->campaign_id, 'list_entry_id' => $delivery->list_entry_id, 'unit_key' => $delivery->unit_key,
                 'idempotency_key' => (string) Str::uuid(), 'kind' => 'correction', 'quantity' => 0, 'note' => $reason, 'recorded_by' => $actor->id, 'occurred_at' => now(), 'corrects_id' => $delivery->id, 'created_at' => now()]);
             if ($benefit = DB::table('benefit_records')->where('campaign_delivery_id', $delivery->id)->where('kind', 'delivery')->first()) {
-                app(\App\Services\Orphans\Aid::class)->reverseBenefit($benefit, 'تصحيح تسليم حملة: '.$reason, $actor);
+                app(Aid::class)->reverseBenefit($benefit, 'تصحيح تسليم حملة: '.$reason, $actor);
             }
             $this->audit->recordRow('orphans.campaign.delivery_corrected', 'campaign_deliveries', $delivery->id, null, ['reason' => $reason], $actor->id, request()?->ip());
         });
@@ -525,7 +598,7 @@ final class Campaigns
 
     public function close(object $campaign, ?string $note, User $actor): void
     {
-        abort_unless($this->access->canAssign($actor), 403, 'إغلاق الحملة لرئيس القسم.');
+        $this->access->assertDecide($actor, 'إغلاق الحملة لرئيس القسم.');
         abort_unless($campaign->status === 'reconciling', 409, 'أغلق الحملة بعد تسجيل التسوية.');
         $last = DB::table('campaign_reconciliations')->where('campaign_id', $campaign->id)->orderByDesc('id')->value('summary');
         $variance = collect(json_decode((string) $last, true) ?: [])->sum(fn ($r) => abs($r['variance']));
@@ -543,6 +616,25 @@ final class Campaigns
         $entries = DB::table('campaign_list_entries')->where('list_id', $listId)->orderBy('kind')->orderBy('position')->get(['kind', 'unit_key', 'item_id', 'quantity']);
         $hash = hash('sha256', $entries->map(fn ($e) => $e->kind.'|'.$e->unit_key.'|'.($e->item_id ?? 0).'|'.(float) $e->quantity)->implode("\n"));
         DB::table('campaign_lists')->where('id', $listId)->where('status', 'draft')->update(['content_hash' => $hash, 'entry_count' => $entries->count(), 'updated_at' => now()]);
+    }
+
+    /**
+     * Refuses a list with entries that no longer pass the base eligibility rule, naming them (up to 20). In a change
+     * request, a unit carried over from the approved version that already has a delivery event is exempt, so the
+     * amended list still covers deliveries already recorded against it.
+     */
+    private function assertEligibleEntries(object $list): void
+    {
+        $offenders = NominationEngine::ineligibleEntries((int) $list->id);
+        if ($offenders !== [] && ($list->source ?? null) === 'change_request' && $list->base_list_id) {
+            $carried = DB::table('campaign_list_entries')->where('list_id', $list->base_list_id)->pluck('unit_key')->flip();
+            $offenders = array_values(array_filter($offenders, fn (object $e): bool => ! isset($carried[$e->unit_key])
+                || $this->entryState((int) $list->campaign_id, $e->unit_key) === 'prepared'));
+        }
+        if ($offenders !== []) {
+            throw ValidationException::withMessages(['entries' => 'في الكشف '.count($offenders).' مستفيد لم يعد مؤهلًا (ملف معتمد مبدئيًا أو منتهٍ أو مؤرشف، أو أسرة/وصي دون ملف مؤهل)؛ احذفهم بطلب تعديل أو مسودة ثم أعد الرفع: '
+                .collect($offenders)->take(20)->map(fn (object $e): string => $this->entryLabel($e))->implode('، ')]);
+        }
     }
 
     private function nextVersion(int $campaignId): int

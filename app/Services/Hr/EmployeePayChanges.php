@@ -13,13 +13,20 @@ use Illuminate\Validation\ValidationException;
 /**
  * Pay and bank records of an employee. Imported figures are reference data («baseline»); a change is a request
  * from HR with its reference document, approved by the executive director on the workflow engine
- * (EMPLOYEE_PAY_CHANGE). On approval the current record is closed the day before the new one takes effect, so
- * history is never overwritten. None of this is a payroll payment or an accounting entry.
+ * (EMPLOYEE_PAY_CHANGE) — or by the Head of Accounts when the employee is the executive director himself. On
+ * approval the current record is closed the day before the new one takes effect, so history is never overwritten.
+ * None of this is a payroll payment or an accounting entry.
  */
 final class EmployeePayChanges
 {
     public const STATUS_LABELS = ['in_review' => 'بانتظار قرار المدير التنفيذي', 'returned' => 'مُعاد للموارد البشرية', 'approved' => 'معتمد',
         'rejected' => 'مرفوض', 'withdrawn' => 'مسحوب'];
+
+    /** The status label, naming the Head of Accounts as decider of the executive director's own change. */
+    public static function statusLabel(string $status, bool $executiveSubject): string
+    {
+        return $status === 'in_review' && $executiveSubject ? 'بانتظار قرار رئيس قسم الحسابات' : (self::STATUS_LABELS[$status] ?? $status);
+    }
 
     public function __construct(private readonly EmployeeAccess $access, private readonly WorkflowEngine $engine) {}
 
@@ -47,6 +54,7 @@ final class EmployeePayChanges
     public function propose(User $actor, Employee $employee, array $data, ?string $ip): int
     {
         abort_unless($this->access->canRequestPayChange($actor), 403, 'طلب تعديل الراتب أو الحساب البنكي لرئيس الموارد البشرية.');
+        abort_if($employee->user_id !== null && (int) $employee->user_id === (int) $actor->id, 403, 'لا يطلب الموظف تعديل راتبه أو حسابه البنكي بنفسه.');
         $row = $this->row($employee, $data);
 
         return DB::transaction(function () use ($actor, $employee, $row, $ip): int {

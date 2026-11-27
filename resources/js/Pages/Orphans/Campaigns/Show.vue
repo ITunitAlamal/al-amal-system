@@ -28,8 +28,10 @@ function edit(action, data) {
 }
 const listAction = (list, action, extra = {}) => router.post(`/orphans/campaigns/${props.campaign.public_id}/lists/${list.public_id}`, { action, ...extra }, { preserveScroll: true });
 function submit() { const note = window.prompt('توصية رئيس القسم (اختياري):', ''); if (note === null) return; listAction(props.current, 'submit', { note }); }
+// The preparer hands the draft to the head; only the head refers it, with the recommendation, to the executive director.
+function requestReview() { const note = window.prompt('ملاحظة لرئيس القسم (اختياري):', ''); if (note === null) return; listAction(props.current, 'request_review', { note }); }
 function decide(action) {
-    if (!props.abilities.executive || !props.approval) return;
+    if (!props.abilities.designated_executive || !props.approval) return;
     ask({ title: action === 'approve' ? 'اعتماد الكشف بقرار المدير التنفيذي' : 'رفض الكشف',
         description: `الإصدار ${props.approval.list.version}. ${props.approval.change ? 'هذا تعديل على كشف معتمد؛ راجع مقارنة التغييرات قبل القرار.' : 'هذا هو الكشف الرسمي الأول.'} الاعتماد لا يُسجل تسليمًا للمستفيدين.`,
         required: action === 'reject', danger: action === 'reject',
@@ -74,10 +76,12 @@ function closeCampaign() { const note = window.prompt('ملاحظة الإغلا
                         <button v-for="(label, key) in { primary: 'الكشف الأساسي', reserve: 'الاحتياط', review: 'للمراجعة/مستبعدون' }" :key="key" type="button" :class="['btn btn-sm', view === key ? 'btn-primary' : 'btn-secondary']" @click="go({ view: key, page: 1 })">{{ label }}</button>
                     </div>
                 </div>
-                <div v-if="current && isDraft && abilities.prepare" class="flex flex-wrap gap-2 px-4">
-                    <button type="button" class="btn btn-primary" @click="submit">رفع للمدير التنفيذي{{ abilities.head ? ' (مع التوصية)' : '' }}</button>
-                    <span class="text-xs text-slate-500">بعد الرفع يُقفل الكشف للمراجعة؛ الاعتماد حصري للمدير التنفيذي.</span></div>
-                <div v-if="current?.status === 'pending_executive' && abilities.prepare && !abilities.executive" class="px-4"><button type="button" class="btn btn-sm btn-secondary" @click="listAction(current, 'withdraw')">سحب للتعديل</button></div>
+                <div v-if="current && isDraft && (abilities.decide || abilities.prepare)" class="flex flex-wrap items-center gap-2 px-4">
+                    <button v-if="abilities.decide" type="button" class="btn btn-primary" @click="submit">رفع للمدير التنفيذي بتوصيتك</button>
+                    <button v-else type="button" class="btn btn-primary" @click="requestReview">رفع لرئيس القسم للمراجعة</button>
+                    <span class="text-xs text-slate-500">{{ abilities.decide ? 'بعد الرفع يُقفل الكشف للمراجعة؛ الاعتماد حصري للمدير التنفيذي.' : 'يراجع رئيس القسم الكشف ويرفعه بتوصيته للمدير التنفيذي؛ يبقى مسودة حتى ذلك.' }}</span>
+                    <span v-if="current.review_requested_at" class="text-xs text-gold-800">رُفع لمراجعة رئيس القسم في {{ current.review_requested_at }}</span></div>
+                <div v-if="current?.status === 'pending_executive' && abilities.decide" class="px-4"><button type="button" class="btn btn-sm btn-secondary" @click="listAction(current, 'withdraw')">سحب للتعديل</button></div>
                 <div class="overflow-x-auto px-4 pb-4">
                     <EmptyState v-if="!entries || !entries.data.length" title="لا توجد أسطر في هذا العرض" description="تُنشأ مسودة الكشف من خطوة «المراجعة والمحاكاة»." />
                     <table v-else class="data-table min-w-[900px]">
@@ -136,10 +140,13 @@ function closeCampaign() { const note = window.prompt('ملاحظة الإغلا
                         <div><h3 class="font-semibold text-navy-800">الكميات والمخزون</h3><table class="data-table mt-1"><thead><tr><th scope="col">الصنف</th><th scope="col">المخطط</th><th scope="col">في الكشف</th><th scope="col">المتاح</th></tr></thead>
                             <tbody><tr v-for="(i, k) in approval.items" :key="k"><td>{{ i.label }}</td><td>{{ i.planned }}</td><td>{{ i.listed }}</td><td :class="i.available !== null && i.available < i.listed ? 'text-red-700' : ''">{{ i.available ?? 'غير مرتبط' }}</td></tr></tbody></table></div>
                         <div><h3 class="font-semibold text-navy-800">التوزيع الجغرافي والحصص</h3><ul class="mt-1 space-y-1 text-sm"><li v-for="r in approval.regions" :key="r.label">{{ r.label }}: {{ r.n }}<span v-if="approval.quotas.find(q => q.label === r.label)"> / حصة {{ approval.quotas.find(q => q.label === r.label).quantity }}</span></li></ul>
-                            <p class="mt-2 text-sm">تنبيهات تكرار مفتوحة: {{ approval.duplicates }}</p><p v-if="approval.rules" class="text-sm">نمط الترشيح: {{ { general: 'عام', scored: 'بالنقاط', hybrid: 'مختلط' }[approval.rules.mode] }} · إصدار القواعد {{ approval.rules.version }}</p></div>
+                            <p class="mt-2 text-sm">تنبيهات تكرار مفتوحة: {{ approval.duplicates }} · مُستثناة أو معالجة: {{ approval.duplicate_decisions?.length || 0 }}</p>
+                            <details v-if="approval.duplicate_decisions?.length" class="mt-1 text-sm"><summary class="cursor-pointer font-semibold">تنبيهات التكرار المُبتّ فيها</summary>
+                                <ul class="ms-5 list-disc"><li v-for="d in approval.duplicate_decisions" :key="d.id"><span class="font-mono text-xs" dir="ltr">{{ d.unit_key }}</span> — {{ d.detail }} — <b>{{ d.status === 'exception_granted' ? 'استثناء' : 'معالج' }}</b> ({{ d.decided_name || '—' }}): {{ d.decision_note }}</li></ul></details><p v-if="approval.rules" class="text-sm">نمط الترشيح: {{ { general: 'عام', scored: 'بالنقاط', hybrid: 'مختلط' }[approval.rules.mode] }} · إصدار القواعد {{ approval.rules.version }}</p></div>
                     </div>
                     <p class="font-mono text-xs text-slate-400" dir="ltr">content {{ approval.list.content_hash?.slice(0, 16) }}…</p>
-                    <div v-if="abilities.executive" class="flex flex-wrap gap-2"><button type="button" class="btn btn-primary" @click="decide('approve')">{{ approval.change ? 'اعتماد التعديل' : 'اعتماد الكشف' }}</button><button type="button" class="btn btn-danger" @click="decide('reject')">رفض</button></div>
+                    <p v-if="!approval.list.recommended_by" class="alert-warning">لم يراجع رئيس القسم هذا الإصدار ولم يوصِ به؛ لا يُعتمد قبل أن يسحبه رئيس القسم ويعيد رفعه بتوصيته.</p>
+                    <div v-if="abilities.designated_executive" class="flex flex-wrap gap-2"><button v-if="approval.list.recommended_by" type="button" class="btn btn-primary" @click="decide('approve')">{{ approval.change ? 'اعتماد التعديل' : 'اعتماد الكشف' }}</button><button type="button" class="btn btn-danger" @click="decide('reject')">رفض</button></div>
                     <p v-else class="alert-info">بانتظار قرار المدير التنفيذي. لا يملك غيره صلاحية الاعتماد.</p>
                 </template>
             </section>
@@ -196,12 +203,12 @@ function closeCampaign() { const note = window.prompt('ملاحظة الإغلا
                     <ul class="divide-y divide-slate-100 text-sm"><li v-for="d in delivery.recent" :key="d.public_id" class="flex flex-wrap items-center gap-2 py-1.5">
                         <StatusBadge :label="{ delivered: 'سُلّم', undelivered: 'لم يُسلَّم', returned: 'مُرتجع', correction: 'تصحيح' }[d.kind]" :tone="d.kind === 'delivered' ? 'success' : 'muted'" />
                         <span class="font-mono text-xs" dir="ltr">{{ d.unit_key }}</span><span>{{ d.recipient_name }}</span><span class="text-slate-500">{{ d.occurred_at?.slice(0, 16) }} · {{ d.recorded_by_name }}</span>
-                        <button v-if="abilities.assign && d.kind !== 'correction'" type="button" class="btn btn-sm btn-secondary ms-auto" @click="correct(d)">تصحيح</button></li></ul></div>
+                        <button v-if="abilities.decide && d.kind !== 'correction'" type="button" class="btn btn-sm btn-secondary ms-auto" @click="correct(d)">تصحيح</button></li></ul></div>
                 <div class="card space-y-2"><h2 class="card-title">التسوية والإغلاق</h2>
                     <div v-for="r in reconciliations" :key="r.id" class="text-sm"><p class="text-slate-500">{{ r.created_at?.slice(0, 16) }} — {{ r.note || 'دون ملاحظة' }}</p>
                         <ul class="ms-5 list-disc"><li v-for="(s, i) in r.summary" :key="i">{{ s.item }}: مصروف {{ s.issued }} · مُسلّم {{ s.delivered }} · مُرتجع {{ s.returned }} · فرق {{ s.variance }}</li></ul></div>
                     <div class="flex gap-2"><button v-if="abilities.assign || abilities.campaigns" type="button" class="btn btn-secondary" :disabled="!['distributing', 'reconciling', 'approved'].includes(campaign.status)" @click="reconcile">تسجيل التسوية</button>
-                        <button v-if="abilities.assign" type="button" class="btn btn-primary" :disabled="campaign.status !== 'reconciling'" @click="closeCampaign">إغلاق الحملة</button></div></div>
+                        <button v-if="abilities.decide" type="button" class="btn btn-primary" :disabled="campaign.status !== 'reconciling'" @click="closeCampaign">إغلاق الحملة</button></div></div>
             </section>
 
             <section v-if="tab === 'access'" class="card space-y-3">
@@ -216,10 +223,11 @@ function closeCampaign() { const note = window.prompt('ملاحظة الإغلا
             </section>
 
             <section v-if="tab === 'duplicates'" class="card space-y-2">
-                <h2 class="card-title">تنبيهات المساعدة المماثلة</h2><p class="text-sm text-slate-600">التنبيه لا يستبعد أحدًا تلقائيًا؛ يُراجع ويُمنح استثناء بمبرر أو يُعالج بتعديل المسودة.</p>
+                <h2 class="card-title">تنبيهات المساعدة المماثلة</h2><p class="text-sm text-slate-600">التنبيه لا يستبعد أحدًا تلقائيًا؛ يُعالج بحذف المستفيد من الكشف الأساسي، أو يمنح رئيس القسم استثناءً بمبرر يراه المدير التنفيذي عند الاعتماد.</p>
                 <ul class="divide-y divide-slate-100 text-sm"><li v-for="a in duplicates" :key="a.id" class="flex flex-wrap items-center gap-2 py-2"><span class="font-mono text-xs" dir="ltr">{{ a.unit_key }}</span><span>{{ a.detail }}</span>
                     <StatusBadge :label="{ open: 'مفتوح', exception_granted: 'استثناء ممنوح', resolved: 'معالج' }[a.status]" :tone="a.status === 'open' ? 'warning' : 'muted'" />
-                    <span v-if="a.status === 'open' && abilities.prepare" class="ms-auto flex gap-1"><button type="button" class="btn btn-sm btn-secondary" @click="decideDuplicate(a, 'exception_granted')">استثناء</button><button type="button" class="btn btn-sm btn-secondary" @click="decideDuplicate(a, 'resolved')">معالج</button></span></li>
+                    <span v-if="a.decision_note" class="text-xs text-slate-500">— {{ a.decision_note }}</span>
+                    <span v-if="a.status === 'open' && (abilities.prepare || abilities.decide)" class="ms-auto flex gap-1"><button v-if="abilities.decide" type="button" class="btn btn-sm btn-secondary" @click="decideDuplicate(a, 'exception_granted')">استثناء</button><button type="button" class="btn btn-sm btn-secondary" @click="decideDuplicate(a, 'resolved')">معالج</button></span></li>
                     <li v-if="!duplicates.length" class="text-slate-500">لا توجد تنبيهات.</li></ul>
             </section>
             <ChangeHistory subject-type="campaigns" :subject-id="campaign.public_id" />

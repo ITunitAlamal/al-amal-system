@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Services\Attendance\AttendanceDailyService;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
@@ -120,7 +121,7 @@ final class LeaveDecisionService
             ->join('roles as role', 'role.id', '=', 'a.role_id')
             ->where('d.code', 'HR')->where('d.is_active', true)->whereNull('d.deleted_at')
             // The HR head is whoever heads the HR department with the head role there; their primary department may differ.
-            ->where('role.code', 'department_head')->where('u.is_active', true)
+            ->where('role.code', 'department_head')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))
             ->distinct()->pluck('u.id')->map(fn ($id): int => (int) $id)->all();
     }
 

@@ -8,8 +8,9 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * Rental contract on the central engine (approved document §5): new contracts, renewals and amendments alike.
- * The file officer prepares, the executive director approves, then the officer attaches the signed copy and the
- * handover record and activates; only then does the contract occupy its units and produce dues.
+ * The file officer prepares, the executive director approves (the units are rechecked and the vacant ones reserved
+ * for the contract), then a rentals officer attaches the signed copy and the handover record, records the handover
+ * meter readings and activates; only then does the contract occupy its units and produce dues.
  */
 final class RentalContractWorkflow implements WorkflowSubject
 {
@@ -28,6 +29,14 @@ final class RentalContractWorkflow implements WorkflowSubject
         if (in_array($from->code, ['officer', 'signing'], true)) {
             abort_unless($this->access->canManage(User::findOrFail($actorId)), 403, 'إعداد العقود وتفعيلها لمسؤول ملف الإيجارات.');
         }
+        // A renewal or an amendment moves forward only while its parent is still in force and not being terminated.
+        if (in_array($target->code, ['ed_approval', 'signing', 'active'], true)) {
+            $this->contracts->assertParentOpen($contract);
+        }
+        // The executive director approves only a contract whose units are still free for it (TRANSFORM §16).
+        if ($target->code === 'signing') {
+            $this->contracts->assertUnitsAvailable($contract);
+        }
     }
 
     public function afterMove(object $instance, object $from, object $target, object $transition, int $actorId, ?string $comment): void
@@ -42,8 +51,13 @@ final class RentalContractWorkflow implements WorkflowSubject
                 $update += ['approved_by' => $actorId, 'approved_at' => now()];
             }
             DB::table('aims_rental_contracts')->where('id', $contract->id)->update($update);
+            if ($target->code === 'signing') {
+                $this->contracts->reserveUnits($contract, $actorId, (string) $instance->reference_no);
+            }
             if (in_array($target->code, ['rejected', 'cancelled'], true)) {
                 $this->contracts->releaseReservation($contract, $actorId);
+                $this->contracts->cancelPlannedDues($contract, ($target->code === 'rejected' ? 'رفض العقد ' : 'إلغاء العقد ').$contract->number
+                    .' ('.$instance->reference_no.')');
             }
         }
         $after = DB::table('aims_rental_contracts')->where('id', $contract->id)->value('status');

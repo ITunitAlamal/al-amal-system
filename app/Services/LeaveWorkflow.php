@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Models\Employee;
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Workflow\AssigneeResolver;
 use App\Services\Workflow\WorkflowEngine;
 use App\Services\Workflow\WorkflowSubject;
@@ -22,7 +23,12 @@ use Illuminate\Validation\ValidationException;
  * nobody approves their own leave.
  *
  * The engine moves the request between steps; this class keeps the leave record in step in the same
- * transaction: its status, the decision log, the balance debit on final approval and the notices.
+ * transaction: its status, the decision log, the balance debit when the leave is registered (the end step) and
+ * the notices.
+ *
+ * Who may act on a step is decided by the engine alone (the step's active assignee). So when the HR head hands
+ * «تسجيل الإجازة وخصم الرصيد» to an HR employee (StepAssignments), that employee opens this one request, registers
+ * it, and is recorded as the actor in the decision log and on the balance debit; no other leave access is given.
  */
 final class LeaveWorkflow implements WorkflowSubject
 {
@@ -43,7 +49,7 @@ final class LeaveWorkflow implements WorkflowSubject
     public function isExecutive(User $user): bool
     {
         return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $user->id)->where('r.code', 'executive_director')->exists();
+            ->where('a.user_id', $user->id)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists();
     }
 
     /**

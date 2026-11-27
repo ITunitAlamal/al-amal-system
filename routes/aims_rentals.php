@@ -20,6 +20,8 @@ Route::middleware(['web', 'auth'])->prefix('admin/rentals')->name('admin.rentals
         Route::post('/terminations', 'termination')->name('terminations.store');
         Route::post('/settlements', 'settlement')->name('settlements.store');
         Route::post('/maintenance', 'maintenance')->name('maintenance.store');
+        Route::post('/maintenance/{id}/release', 'maintenanceRelease')->whereNumber('id')->name('maintenance.release');
+        Route::put('/maintenance/{id}/cost', 'maintenanceCost')->whereNumber('id')->name('maintenance.cost');
         Route::post('/readings', 'reading')->name('readings.store');
         Route::post('/notices', 'notice')->name('notices.store');
         Route::post('/notices/{id}/issue', 'noticeIssue')->whereNumber('id')->name('notices.issue');
@@ -35,6 +37,7 @@ Route::middleware(['web', 'auth'])->prefix('admin/rentals')->name('admin.rentals
         Route::get('/records/{type}/{id}', 'show')->whereIn('type', $types)->whereNumber('id')->name('records.show');
         Route::put('/records/{type}/{id}', 'update')->whereIn('type', $types)->whereNumber('id')->name('records.update');
         Route::post('/records/{type}/{id}/submit', 'submit')->whereIn('type', $types)->whereNumber('id')->name('records.submit');
+        Route::post('/records/{type}/{id}/withdraw', 'withdraw')->whereIn('type', $types)->whereNumber('id')->name('records.withdraw');
         Route::post('/files/{owner}/{id}', 'document')->whereIn('owner', ['property', 'unit', 'tenant', ...$types, 'reading'])->whereNumber('id')->name('documents.store');
         Route::get('/documents/{document}', 'download')->whereNumber('document')->name('documents.download');
         Route::post('/cases/{id}/outcome', 'outcome')->whereNumber('id')->name('cases.outcome');

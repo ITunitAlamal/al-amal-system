@@ -11,6 +11,7 @@ use App\Services\AuditService;
 use App\Services\Configuration\GazaGeography;
 use App\Services\Orphans\ArabicText;
 use App\Services\Orphans\Campaigns\Campaigns;
+use App\Services\Orphans\Campaigns\NominationEngine;
 use App\Services\Orphans\Identity;
 use App\Services\Orphans\OrphanAccess;
 use App\Services\Orphans\Persons;
@@ -506,6 +507,10 @@ final class ImportPipeline
                 $issues[] = ['code' => 'duplicate_in_file', 'severity' => 'warning', 'field' => null, 'message' => 'المستفيد مكرر في الملف (الصف '.$sameInFile.').'];
             }
             if ($batch->purpose === 'campaign_candidates') {
+                // Candidates only: reconciliation and donor sheets must still report real deliveries to files closed since.
+                if (! NominationEngine::eligibleUnit($unit['key'])) {
+                    $issues[] = ['code' => 'not_eligible', 'severity' => 'error', 'field' => null, 'message' => 'المستفيد غير مؤهل للحملات (ملف معتمد مبدئيًا أو منتهٍ أو مؤرشف، أو أسرة/وصي دون ملف مؤهل).'];
+                }
                 $approved = DB::table('campaign_list_entries as e')->join('campaign_lists as l', 'l.id', '=', 'e.list_id')->where('l.campaign_id', $batch->campaign_id)->where('l.status', 'approved')->where('e.unit_key', $unit['key'])->exists();
                 if ($approved) {
                     $issues[] = ['code' => 'already_listed', 'severity' => 'warning', 'field' => null, 'message' => 'مدرج مسبقًا في الكشف المعتمد.'];
@@ -759,7 +764,7 @@ final class ImportPipeline
      */
     public function approve(object $batch, User $actor, ?array $rowIds = null): void
     {
-        $this->access->assert($actor, 'import');
+        $this->access->assertDecision($actor, 'import');
         abort_unless(in_array($batch->status, self::REVIEWABLE, true), 409, 'الدفعة ليست في مرحلة المراجعة.');
         $scope = null;
         if ($rowIds) {
@@ -1068,8 +1073,11 @@ final class ImportPipeline
     /** Adds one matched beneficiary to the campaign's draft list, or to a change-request draft if a list is approved. */
     private function proposeCandidate(object $batch, object $row, array $n, User $actor): array
     {
-        $campaign = DB::table('campaigns')->find($batch->campaign_id);
+        $campaign = DB::table('campaigns')->lockForUpdate()->find($batch->campaign_id);
         $svc = app(Campaigns::class);
+        abort_unless($campaign && $svc->canPrepare($actor, $campaign), 403, 'إدراج المقترحات في الكشف يحتاج قدرة «إعداد الحملات والكشوف».');
+        abort_if(in_array($campaign->status, ['pending_executive', 'closed', 'cancelled'], true), 409, 'الحملة لا تقبل إضافات في حالتها الحالية.');
+        abort_unless(NominationEngine::eligibleUnit((string) ($n['unit_key'] ?? '')), 422, 'المستفيد لم يعد مؤهلًا للحملات (حالة ملفه تغيّرت).');
         $approved = DB::table('campaign_lists')->where('campaign_id', $campaign->id)->where('status', 'approved')->first();
         $draft = DB::table('campaign_lists')->where('campaign_id', $campaign->id)->where('status', 'draft')->lockForUpdate()->first();
         abort_if(DB::table('campaign_lists')->where('campaign_id', $campaign->id)->where('status', 'pending_executive')->exists(), 409, 'يوجد كشف بانتظار قرار المدير التنفيذي؛ لا يُضاف إليه.');

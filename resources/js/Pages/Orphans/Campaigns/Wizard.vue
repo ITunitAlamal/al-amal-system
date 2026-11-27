@@ -30,7 +30,14 @@ function toggleCriterion(key) {
     const i = rules.criteria.findIndex(x => x.key === key);
     if (i >= 0) rules.criteria.splice(i, 1); else rules.criteria.push({ key, weight: 0, map: {}, cap: 8, max_age: 18, days: 180 });
 }
-const mapOptions = key => ({ orphan_class: props.options.classes, current_income_band: props.options.income_bands, father_pre_death_income: props.options.income_bands, needs_level: props.options.needs })[key] || [];
+const mapOptions = key => ({ orphan_class: props.options.classes, current_income_band: props.options.income_bands, father_pre_death_income: props.options.income_bands, needs_level: props.options.needs,
+    housing_tenure: props.options.tenures, shelter_type: props.options.shelters, building_condition: props.options.building_conditions, education_need: props.options.enrollment })[key] || [];
+// Criteria grouped by the seven approved dimensions, with each dimension's weight subtotal. Education reads the child's
+// own record, so it is offered only when the beneficiary unit is the orphan.
+const dimensionOf = key => props.options.criteria.find(cr => cr.key === key)?.dimension;
+const criteriaGroups = computed(() => Object.entries(props.options.dimensions || {}).map(([key, label]) => ({ key, label,
+    criteria: props.options.criteria.filter(cr => cr.dimension === key && (cr.key !== 'education_need' || props.campaign?.beneficiary_unit === 'orphan')),
+    weight: rules.criteria.filter(x => dimensionOf(x.key) === key).reduce((s, x) => s + Number(x.weight || 0), 0) })).filter(group => group.criteria.length));
 const report = computed(() => props.run?.report);
 const bars = obj => Object.entries(obj || {}).map(([label, count]) => ({ key: label, label, count: Number(count), filter: {} }));
 const outcomeLabels = { primary: 'الكشف الأساسي', reserve: 'الاحتياط', review: 'للمراجعة', ineligible: 'غير مؤهل', insufficient_priority: 'أولوية غير كافية' };
@@ -121,17 +128,21 @@ function createDraft() { if (!draft.processing) { draft.run = props.run.public_i
                     <label class="flex items-center gap-1">نافذة تنبيه تكرار المساعدة المماثلة (أيام)<input v-model.number="rules.gates.same_type_window_days" type="number" min="0" class="field max-w-28"></label>
                 </div>
                 <fieldset v-if="rules.mode !== 'general'" class="space-y-2"><legend class="field-label">المعايير والأوزان — المجموع: <span :class="Math.abs(weightSum - 100) < 0.001 ? 'text-emerald-700' : 'text-red-700'">{{ weightSum }}</span> / 100</legend>
-                    <div v-for="cr in options.criteria" :key="cr.key" class="rounded-xl border border-slate-200 p-3 text-sm">
-                        <label class="flex items-center gap-2 font-semibold"><input type="checkbox" :checked="rules.criteria.some(x => x.key === cr.key)" @change="toggleCriterion(cr.key)"> {{ cr.label }}</label>
-                        <template v-for="x in rules.criteria.filter(x => x.key === cr.key)" :key="x.key">
-                            <div class="mt-2 flex flex-wrap items-center gap-3"><label>الوزن<input v-model.number="x.weight" type="number" min="0" max="100" class="field ms-2 max-w-24"></label>
-                                <label v-if="cr.type === 'cap'">الحد الأعلى للمعالين<input v-model.number="x.cap" type="number" min="1" class="field ms-2 max-w-24"></label>
-                                <label v-if="cr.type === 'age'">أقصى عمر<input v-model.number="x.max_age" type="number" min="1" class="field ms-2 max-w-24"></label>
-                                <label v-if="cr.type === 'days'">عدد الأيام للحد الأقصى<input v-model.number="x.days" type="number" min="1" class="field ms-2 max-w-24"></label></div>
-                            <div v-if="cr.type === 'map'" class="mt-2 flex flex-wrap gap-3"><span v-if="!mapOptions(cr.key).length" class="text-xs text-gold-800">لا توجد قيم في «ثوابت النظام» لهذا المعيار.</span>
-                                <label v-for="o in mapOptions(cr.key)" :key="o.id" class="text-xs">{{ o.name }}<input v-model.number="x.map[o.id]" type="number" min="0" max="100" class="field mt-1 max-w-24" placeholder="0–100"></label></div>
-                        </template>
-                    </div></fieldset>
+                    <div v-for="group in criteriaGroups" :key="group.key" class="space-y-2">
+                        <h3 class="text-sm font-semibold text-navy-800">{{ group.label }} <span class="font-normal text-slate-500">— وزن البعد {{ group.weight }}</span></h3>
+                        <div v-for="cr in group.criteria" :key="cr.key" class="rounded-xl border border-slate-200 p-3 text-sm">
+                            <label class="flex items-center gap-2 font-semibold"><input type="checkbox" :checked="rules.criteria.some(x => x.key === cr.key)" @change="toggleCriterion(cr.key)"> {{ cr.label }}</label>
+                            <template v-for="x in rules.criteria.filter(x => x.key === cr.key)" :key="x.key">
+                                <div class="mt-2 flex flex-wrap items-center gap-3"><label>الوزن<input v-model.number="x.weight" type="number" min="0" max="100" class="field ms-2 max-w-24"></label>
+                                    <label v-if="cr.type === 'cap'">الحد الأعلى للمعالين<input v-model.number="x.cap" type="number" min="1" class="field ms-2 max-w-24"></label>
+                                    <label v-if="cr.type === 'age'">أقصى عمر<input v-model.number="x.max_age" type="number" min="1" class="field ms-2 max-w-24"></label>
+                                    <label v-if="cr.type === 'days'">عدد الأيام للحد الأقصى<input v-model.number="x.days" type="number" min="1" class="field ms-2 max-w-24"></label></div>
+                                <div v-if="cr.type === 'map'" class="mt-2 flex flex-wrap gap-3"><span v-if="!mapOptions(cr.key).length" class="text-xs text-gold-800">لا توجد قيم في «ثوابت النظام» لهذا المعيار.</span>
+                                    <label v-for="o in mapOptions(cr.key)" :key="o.id" class="text-xs">{{ o.name }}<input v-model.number="x.map[o.id]" type="number" min="0" max="100" class="field mt-1 max-w-24" placeholder="0–100"></label></div>
+                            </template>
+                        </div>
+                    </div>
+                    <p class="text-xs text-slate-500">الأبعاد السبعة المعتمدة؛ يختار معدّ الحملة معاييرها وأوزانها لكل حملة، ولا توجد أوزان ثابتة في النظام.</p></fieldset>
                 <p v-for="(e, k) in rules.errors" :key="k" class="field-error">{{ e }}</p>
                 <p class="text-xs text-slate-500">تُحفظ القواعد كإصدار ثابت؛ أي تغيير يُنشئ إصدارًا جديدًا. لا تُستخدم التشخيصات الطبية في الترتيب.</p>
                 <button type="submit" class="btn btn-primary" :disabled="rules.processing">حفظ المعايير والمتابعة</button>

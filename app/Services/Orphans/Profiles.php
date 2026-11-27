@@ -65,7 +65,12 @@ final class Profiles
             'care' => $this->care($person->id, $viewer),
             'economic' => $this->economic(['person_id' => $person->id]),
             'assessments' => DB::table('social_assessments as s')->leftJoin('users as u', 'u.id', '=', 's.assigned_to')->leftJoin('master_data_values as n', 'n.id', '=', 's.needs_level_value_id')
-                ->where('s.orphan_id', $orphan->id)->orderByDesc('s.id')->get(['s.*', 'u.name as assignee', 'n.name_ar as needs_level'])->map(fn ($s) => (array) $s)->all(),
+                ->leftJoin('users as cb', 'cb.id', '=', 's.completed_by')
+                ->where('s.orphan_id', $orphan->id)->orderByDesc('s.id')->get(['s.*', 'u.name as assignee', 'n.name_ar as needs_level', 'cb.name as completed_name'])
+                // Mirrors RegistryController::completeAssessment (assignee, else who scheduled it, or the head) and ::reviewAssessment.
+                ->map(fn ($s) => [...(array) $s, 'can_complete' => $this->access->canDecide($viewer) || (int) ($s->assigned_to ?? $s->created_by) === (int) $viewer->id,
+                    'can_review' => property_exists($s, 'review_outcome') && $s->review_outcome === null && $s->status === 'completed'
+                        && $this->access->canDecide($viewer) && (int) $s->completed_by !== (int) $viewer->id])->all(),
             'documents' => $this->documents(['person_id' => $person->id], $viewer),
             'status_events' => $this->statusEvents($person->id, $viewer),
             'siblings' => $this->siblings($orphan),

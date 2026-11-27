@@ -45,10 +45,22 @@ final class ScopedDelegations
         self::$policy = null;
     }
 
-    /** Whether an active delegation gives the user this permission (in the department, or anywhere when null). */
+    /**
+     * Permissions whose file is not divided by department: a delegation opens such a file only when it is scoped to
+     * the whole department that owns it, never through one of its units («الإيجارات» belongs to the assets department).
+     *
+     * @var array<string, string> permission code => owning department code
+     */
+    public const WHOLE_FILE_OWNERS = ['rentals.view' => 'ASSETS', 'rentals.manage' => 'ASSETS'];
+
+    /**
+     * Whether an active delegation gives the user this permission in this department (or one of its units). A null
+     * department means organization-wide, which a delegation never grants: it is always scoped to one department or
+     * unit. Callers that only need "somewhere" use grantsInAnyScope() and then filter by delegatedDepartments().
+     */
     public function grants(User $user, string $code, ?int $departmentId = null): bool
     {
-        if (! isset($this->enabledPolicy()[$code]) || ! $user->is_active) {
+        if ($departmentId === null || ! isset($this->enabledPolicy()[$code]) || ! $user->is_active) {
             return false;
         }
         foreach ($this->activeFor($user) as $row) {
@@ -56,12 +68,30 @@ final class ScopedDelegations
                 continue;
             }
             $scope = (int) $row->scope_department_id;
-            if ($departmentId === null || $departmentId === $scope || (int) DB::table('departments')->where('id', $departmentId)->value('parent_id') === $scope) {
+            if ($departmentId === $scope || (int) DB::table('departments')->where('id', $departmentId)->value('parent_id') === $scope) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * Whether a delegation gives the user this permission in some scope. For a file not divided by department
+     * (WHOLE_FILE_OWNERS) only a delegation scoped to the owning department itself counts.
+     */
+    public function grantsInAnyScope(User $user, string $code): bool
+    {
+        if (! $user->is_active) {
+            return false;
+        }
+        $scopes = $this->delegatedDepartments($user, $code);
+        if ($scopes === [] || ! isset(self::WHOLE_FILE_OWNERS[$code])) {
+            return $scopes !== [];
+        }
+        $owner = DB::table('departments')->where('code', self::WHOLE_FILE_OWNERS[$code])->where('is_active', true)->whereNull('deleted_at')->value('id');
+
+        return $owner !== null && in_array((int) $owner, $scopes, true);
     }
 
     /** @return list<int> scopes (with their units) where the user holds this permission by delegation */
@@ -237,7 +267,7 @@ final class ScopedDelegations
         foreach (DB::table('departments')->whereIn('id', $roots)->orderBy('name')->get(['id', 'name', 'node_type']) as $department) {
             $people = DB::table('users as u')->where('u.is_active', true)->where('u.id', '<>', $user->id)
                 ->where(fn ($q) => $q->whereExists(fn ($e) => $e->from('employees')->whereColumn('employees.user_id', 'u.id')->where('employees.department_id', $department->id)->whereNull('employees.deleted_at'))
-                    ->orWhereExists(fn ($r) => $r->from('department_user_roles')->whereColumn('department_user_roles.user_id', 'u.id')->where('department_user_roles.department_id', $department->id)))
+                    ->orWhereExists(fn ($r) => $r->from('department_user_roles')->whereColumn('department_user_roles.user_id', 'u.id')->where('department_user_roles.department_id', $department->id)->whereRaw(EffectiveAssignments::sql())))
                 ->orderBy('u.name')->get(['u.id', 'u.name']);
             $scopes[] = ['id' => (int) $department->id, 'name' => $department->name, 'type' => OrganizationStructure::TYPES[$department->node_type] ?? '', 'people' => $people];
             foreach (DB::table('departments')->where('parent_id', $department->id)->where('node_type', 'unit')->where('is_active', true)->whereNull('deleted_at')->orderBy('name')->get(['id', 'name']) as $unit) {
@@ -252,7 +282,7 @@ final class ScopedDelegations
 
     public function isExecutive(User $user): bool
     {
-        return $user->is_active && $user->roleAssignments()->whereHas('role', fn ($q) => $q->where('code', 'executive_director'))->exists();
+        return $user->is_active && $user->roleAssignments()->effective()->whereHas('role', fn ($q) => $q->where('code', 'executive_director'))->exists();
     }
 
     /** @return list<object> */
@@ -284,7 +314,7 @@ final class ScopedDelegations
         }
 
         return ($employee && (int) $employee->department_id === $department)
-            || DB::table('department_user_roles')->where('user_id', $user->id)->where('department_id', $department)->exists();
+            || EffectiveAssignments::apply(DB::table('department_user_roles')->where('user_id', $user->id)->where('department_id', $department))->exists();
     }
 
     private function isHeadOrExecutive(User $user): bool

@@ -110,7 +110,7 @@ class User extends Authenticatable
             return $this->systemAdminSnapshot;
         }
 
-        return $this->roleAssignments()
+        return $this->roleAssignments()->effective()
             ->whereNull('department_id')
             ->whereHas('role', function ($query) {
                 $query->where('code', 'system_admin');
@@ -153,7 +153,7 @@ class User extends Authenticatable
             return null;
         }
 
-        $holdsHeadRole = $this->roleAssignments()
+        $holdsHeadRole = $this->roleAssignments()->effective()
             ->where('department_id', $department->id)
             ->whereHas('role', function ($query) {
                 $query->where('code', 'department_head');
@@ -220,7 +220,7 @@ class User extends Authenticatable
             return true;
         }
 
-        return $this->roleAssignments()
+        return $this->roleAssignments()->effective()
             ->whereHas(
                 'role.permissions',
                 function ($query) use ($permissionCode) {
@@ -229,7 +229,8 @@ class User extends Authenticatable
             )
             ->exists()
             || $this->holdsThroughDepartmentHeadship($permissionCode)
-            || app(ScopedDelegations::class)->grants($this, $permissionCode);
+            // A scoped delegation counts only where it is scoped (whole-file permissions: the owning department).
+            || app(ScopedDelegations::class)->grantsInAnyScope($this, $permissionCode);
     }
 
     /**
@@ -238,7 +239,7 @@ class User extends Authenticatable
      */
     public function holdsDecisionPermission(string $permissionCode): bool
     {
-        return $this->is_active && $this->roleAssignments()
+        return $this->is_active && $this->roleAssignments()->effective()
             ->whereHas('role.permissions', fn ($query) => $query->where('code', $permissionCode))
             ->exists();
     }
@@ -289,7 +290,7 @@ class User extends Authenticatable
             return $this->canManageOrganization();
         }
 
-        return $this->roleAssignments()
+        return $this->roleAssignments()->effective()
             ->where(function ($query) use ($departmentId) {
                 if ($departmentId === null) {
                     $query->whereNull('department_id');

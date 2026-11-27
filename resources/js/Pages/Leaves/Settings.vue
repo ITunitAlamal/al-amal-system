@@ -174,7 +174,7 @@ const date = value => (value ? new Intl.DateTimeFormat(arabicLatinDigitsLocale, 
 
             <section v-if="canConfigure" class="card space-y-3">
                 <h2 class="card-title">العطل الرسمية</h2>
-                <p class="text-sm text-slate-600">يُستثنى التاريخ المسجل فقط في وضع «أيام العمل». لا توجد عطل مفترضة أو مستوردة تلقائيًا.</p>
+                <p class="text-sm text-slate-600">يُستثنى التاريخ المسجل من أيام الإجازة فقط في وضع «أيام العمل»، ويظهر في الحضور عطلةً رسمية. تُضاف العطل وتُحذف في أي وقت ويُعاد احتساب حضور ذلك اليوم، ما لم تشمل التاريخَ إجازةٌ تُحتسب بأيام العمل. لا توجد عطل مفترضة أو مستوردة تلقائيًا.</p>
                 <form class="flex flex-wrap items-end gap-3" @submit.prevent="addHoliday">
                     <div><label for="holiday-date" class="field-label">التاريخ</label><input id="holiday-date" v-model="holiday.holiday_date" type="date" required class="field" /></div>
                     <div class="min-w-48 flex-1"><label for="holiday-name" class="field-label">اسم العطلة</label><input id="holiday-name" v-model="holiday.name_ar" required class="field" /></div>

@@ -4,6 +4,8 @@ namespace App\Services\Hr;
 
 use App\Models\Employee;
 use App\Models\User;
+use App\Services\Notifications\NotificationCenter;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -17,6 +19,10 @@ use ZipArchive;
  * uploaded name), their type is checked from the content, and they are served only through authorised, audited
  * routes. Earlier versions are kept; nothing is deleted. No antivirus engine is installed on this server, so every
  * file is recorded as «not scanned» and the screens say so.
+ *
+ * A document or a self-uploaded photo that waits for the HR head is a task in their «مهامي» (reviewQueues) and
+ * they are told when it arrives; the employee is told the outcome, with the note. Notices carry the document's
+ * type and title only, never its content.
  */
 final class EmployeeFiles
 {
@@ -29,9 +35,18 @@ final class EmployeeFiles
 
     public const PHOTO_TYPES = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'webp' => 'image/webp'];
 
+    /** To the HR head: an employee document or photo waits for review. */
+    public const EVENT_REVIEW_NEEDED = 'employee_file_review';
+
+    /** To the employee: their document was verified or rejected. */
+    public const EVENT_DOCUMENT_REVIEWED = 'employee_document_reviewed';
+
+    /** To the employee: their photo was approved or rejected. */
+    public const EVENT_PHOTO_REVIEWED = 'employee_photo_reviewed';
+
     private const DISPLAY_SIZE = 512;
 
-    public function __construct(private readonly EmployeeAccess $access) {}
+    public function __construct(private readonly EmployeeAccess $access, private readonly NotificationCenter $notifications) {}
 
     public function settings(): object
     {
@@ -84,6 +99,10 @@ final class EmployeeFiles
                     'reviewed_by' => $manage ? $actor->id : null, 'reviewed_at' => $manage ? now() : null, 'created_at' => now(), 'updated_at' => now(),
                 ]);
                 $this->log($actor, $manage ? 'employee_photo.replaced' : 'employee_photo.submitted', 'employee_photos', $id, ['employee_id' => $employee->id], $ip);
+                if (! $manage) {
+                    $this->notifyReviewers($actor, $employee, 'صورة شخصية بانتظار المراجعة: '.EmployeeNames::display($employee),
+                        'راجع الصورة ثم اعتمدها أو ارفضها مع السبب.', 'photo', 'emp-photo:'.$id.':review');
+                }
             });
         } catch (\Throwable $exception) {
             Storage::disk('local')->delete([$original, $displayPath]);
@@ -139,6 +158,8 @@ final class EmployeeFiles
             DB::table('employee_photos')->where('id', $photoId)->update(['status' => $approve ? 'current' : 'rejected', 'reviewed_by' => $actor->id,
                 'reviewed_at' => now(), 'review_note' => $note, 'updated_at' => now()]);
             $this->log($actor, $approve ? 'employee_photo.approved' : 'employee_photo.rejected', 'employee_photos', $photoId, ['employee_id' => $employee->id], $ip);
+            $this->notifyEmployee($actor, $employee, self::EVENT_PHOTO_REVIEWED, $approve ? 'اعتُمدت صورتك الشخصية' : 'رُفضت صورتك الشخصية',
+                $approve ? 'تظهر الآن في ملفك الوظيفي.' : 'السبب: '.trim((string) $note).' — يمكنك رفع صورة أخرى.', 'photo', 'emp-photo:'.$photoId.':reviewed');
         });
     }
 
@@ -213,7 +234,7 @@ final class EmployeeFiles
 
         $path = Storage::disk('local')->putFileAs('hr/employees/'.$employee->id.'/documents', $file, Str::uuid().'.'.$extension);
         try {
-            return DB::transaction(function () use ($actor, $employee, $file, $meta, $supersedesId, $classification, $mime, $path, $ip): int {
+            return DB::transaction(function () use ($actor, $employee, $file, $meta, $supersedesId, $type, $classification, $mime, $path, $ip): int {
                 $version = 1;
                 if ($supersedesId !== null) {
                     $previous = DB::table('employee_documents')->where('id', $supersedesId)->where('employee_id', $employee->id)->lockForUpdate()->first();
@@ -233,6 +254,8 @@ final class EmployeeFiles
                 ]);
                 $this->log($actor, $supersedesId ? 'employee_document.versioned' : 'employee_document.uploaded', 'employee_documents', $id,
                     ['employee_id' => $employee->id, 'type' => $meta['document_type_value_id'], 'classification' => $classification, 'version' => $version, 'supersedes' => $supersedesId], $ip);
+                $this->notifyReviewers($actor, $employee, 'وثيقة موظف بانتظار التوثيق: '.EmployeeNames::display($employee),
+                    $type['name'].' — وثّقها أو ارفضها مع السبب.', 'documents', 'emp-doc:'.$id.':review');
 
                 return $id;
             });
@@ -378,6 +401,13 @@ final class EmployeeFiles
             DB::table('employee_documents')->where('id', $documentId)->update(['verification_status' => $status, 'verified_by' => $actor->id, 'verified_at' => now(),
                 'verification_note' => $note, 'updated_at' => now()]);
             $this->log($actor, 'employee_document.'.$status, 'employee_documents', $documentId, ['employee_id' => $employee->id, 'before' => $document->verification_status], $ip);
+            // Saving the same decision again tells the employee nothing new.
+            if ($document->verification_status !== $status || trim((string) $document->verification_note) !== trim((string) $note)) {
+                $this->notifyEmployee($actor, $employee, self::EVENT_DOCUMENT_REVIEWED,
+                    ($status === 'verified' ? 'وُثّقت وثيقتك: ' : 'رُفضت وثيقتك: ').$this->documentLabel($document),
+                    trim((string) $note) !== '' ? ($status === 'verified' ? 'ملاحظة: ' : 'السبب: ').trim((string) $note) : null,
+                    'documents', 'emp-doc:'.$documentId.':'.$status.':'.now()->timestamp);
+            }
         });
     }
 
@@ -407,6 +437,72 @@ final class EmployeeFiles
             'Content-Type' => $document->mime, 'X-Content-Type-Options' => 'nosniff', 'Cache-Control' => 'private, no-store',
             'Content-Security-Policy' => "default-src 'none'; sandbox",
         ]);
+    }
+
+    // ---------------------------------------------------------------- review queue and notices
+
+    /**
+     * What waits for this user's review, as queries without columns or order: current documents not verified yet
+     * and self-uploaded photos. Null for anyone verify() and reviewPhoto() would refuse, so «مهامي» lists and
+     * counts exactly what the server accepts.
+     *
+     * @return array{documents: Builder, photos: Builder}|null
+     */
+    public function reviewQueues(User $user): ?array
+    {
+        if (! $this->access->canVerify($user)) {
+            return null;
+        }
+
+        return [
+            'documents' => DB::table('employee_documents as d')->join('employees as e', 'e.id', '=', 'd.employee_id')->whereNull('e.deleted_at')
+                ->where('d.verification_status', 'pending')->where('d.is_current', true)->whereNull('d.archived_at'),
+            'photos' => DB::table('employee_photos as p')->join('employees as e', 'e.id', '=', 'p.employee_id')->whereNull('e.deleted_at')
+                ->where('p.status', 'pending_review'),
+        ];
+    }
+
+    /** Where the reviewer acts on one employee's documents or photo: the employee file, opened on that tab. */
+    public static function reviewUrl(int $employeeId, string $tab): string
+    {
+        return route('admin.employee-profiles.show', ['employee' => $employeeId, 'tab' => $tab], false);
+    }
+
+    /**
+     * Tells whoever verifies (the appointed HR head) that something waits for them; never the person who uploaded it.
+     */
+    private function notifyReviewers(User $actor, Employee $employee, string $title, string $body, string $tab, string $dedupe): void
+    {
+        $headId = DB::table('departments')->where('code', 'HR')->where('is_active', true)->value('head_user_id');
+        $head = $headId && (int) $headId !== (int) $actor->id ? User::query()->find($headId) : null;
+        if ($head && $this->access->canVerify($head)) {
+            $this->notifications->notify((int) $head->id, self::EVENT_REVIEW_NEEDED, [
+                'title' => $title, 'body' => $body, 'url' => self::reviewUrl((int) $employee->id, $tab), 'dedupe' => $dedupe,
+            ]);
+        }
+    }
+
+    /**
+     * Tells the employee the outcome of a review of their own file. Nothing when the reviewer is that employee,
+     * or when the file has no account.
+     */
+    private function notifyEmployee(User $actor, Employee $employee, string $event, string $title, ?string $body, string $tab, string $dedupe): void
+    {
+        if ($employee->user_id === null || (int) $employee->user_id === (int) $actor->id) {
+            return;
+        }
+        $this->notifications->notify((int) $employee->user_id, $event, [
+            'title' => $title, 'body' => $body, 'url' => route('my.profile', ['tab' => $tab], false), 'dedupe' => $dedupe,
+        ]);
+    }
+
+    /** The document's type, with its title for an ordinary document; a confidential title stays out of notices. */
+    private function documentLabel(object $document): string
+    {
+        $type = trim((string) DB::table('master_data_values')->where('id', $document->document_type_value_id)->value('name_ar'));
+        $title = $document->classification === 'normal' ? trim((string) $document->title) : '';
+
+        return implode(' — ', array_filter([$type, $title !== $type ? $title : ''])) ?: 'وثيقة';
     }
 
     /**

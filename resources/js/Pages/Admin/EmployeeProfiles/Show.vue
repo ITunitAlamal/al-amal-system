@@ -33,6 +33,8 @@ const props = defineProps({
     activation: { type: Object, default: null },
     accountCandidate: { type: Object, default: null },
     directCreate: { type: Boolean, default: false },
+    // A change HR staff prepared on this file that the HR head has not decided yet.
+    fileChange: { type: Object, default: null },
 });
 
 const page = usePage();
@@ -40,7 +42,7 @@ const base = '/admin/employee-profiles';
 const flash = computed(() => page.props.flash?.success || '');
 const accountError = computed(() => page.props.errors?.account || page.props.errors?.confirm || page.props.errors?.code || page.props.errors?.phone || '');
 const view = computed(() => {
-    const { account, activation, accountCandidate, directCreate, ...rest } = props;
+    const { account, activation, accountCandidate, directCreate, fileChange, ...rest } = props;
     return rest;
 });
 const dateTime = value => formatDateTime(value);
@@ -61,8 +63,13 @@ function createActive() { directCreateForm.post(`${base}/${props.employee.id}/cr
 <template>
     <AppLayout :title="employee.display_name || 'ملف الموظف'">
         <div class="mx-auto max-w-6xl space-y-4">
-            <Link v-if="can.manage" :href="base" class="text-sm font-semibold text-blue-700 hover:underline">→ ملفات الموظفين</Link>
+            <Link v-if="can.edit" :href="base" class="text-sm font-semibold text-blue-700 hover:underline">→ ملفات الموظفين</Link>
             <p v-if="flash" class="alert-success">{{ flash }}</p>
+            <div v-if="fileChange" role="status" class="alert-warning flex flex-wrap items-center gap-2 leading-7">
+                <StatusBadge :label="fileChange.statusLabel" :tone="fileChange.tone" />
+                <span>{{ fileChange.own ? 'لهذا الملف تعديل أعددته؛ لا يظهر في الملف قبل اعتماد رئيس الموارد البشرية.' : `لهذا الملف تعديل أعده ${fileChange.preparedBy} ولم يُبت فيه بعد.` }}</span>
+                <Link v-if="fileChange.url" :href="fileChange.url" class="font-semibold underline">عرض التعديل</Link>
+            </div>
 
             <EmployeeFileView v-bind="view">
                 <template #actions>

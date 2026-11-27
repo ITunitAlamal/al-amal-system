@@ -1,12 +1,13 @@
 <script setup>
 import { formatDate } from '../../Support/dates.js';
 import { computed, reactive, ref } from 'vue';
-import { Link, router } from '@inertiajs/vue3';
+import { Deferred, Link, router } from '@inertiajs/vue3';
 import AppLayout from '../../Layouts/AppLayout.vue';
 import PageHeader from '../../Components/PageHeader.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
 import EmptyState from '../../Components/EmptyState.vue';
 import DelegationsPanel from '../../Components/Organization/DelegationsPanel.vue';
+import DepartmentBudgetSummary from '../../Components/Finance/DepartmentBudgetSummary.vue';
 
 const props = defineProps({
     departments: { type: Array, required: true },
@@ -21,6 +22,7 @@ const props = defineProps({
     units: { type: Array, default: () => [] },
     delegations: { type: Array, default: () => [] },
     delegationOptions: { type: Object, default: () => ({ permissions: [], scopes: [] }) },
+    departmentBudgets: { type: Object, default: undefined },
 });
 
 const tabs = computed(() => [
@@ -68,6 +70,12 @@ function changeDepartment() {
             <PageHeader title="قسمي" eyebrow="رئيس القسم" :description="`الأقسام المعروضة: ${scopeNames.join('، ')}. تظهر هنا سجلات أقسامك ووحداتها التابعة فقط، دون بيانات شخصية حساسة.`">
                 <Link v-if="kpiUrl" :href="kpiUrl" class="btn btn-secondary">مؤشرات القسم</Link>
             </PageHeader>
+
+            <Deferred data="departmentBudgets">
+                <template #fallback><div class="card h-28 motion-safe:animate-pulse bg-slate-50" role="status" aria-label="جارٍ تحميل ميزانية القسم"></div></template>
+                <template #rescue><p class="alert-error" role="alert">تعذر تحميل ميزانية القسم. <button type="button" class="underline" @click="router.reload({ only: ['departmentBudgets'] })">أعد المحاولة</button></p></template>
+                <DepartmentBudgetSummary :summary="departmentBudgets" />
+            </Deferred>
 
             <label v-if="departments.length > 1" class="field-label block max-w-sm">القسم
                 <select v-model="department" class="field mt-1 w-full" @change="changeDepartment">

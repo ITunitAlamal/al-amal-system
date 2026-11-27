@@ -15,6 +15,7 @@ use App\Services\Orphans\Persons;
 use App\Services\Orphans\Profiles;
 use App\Services\Orphans\Registry;
 use App\Services\Orphans\RegistryQueries;
+use App\Services\Orphans\SensitiveChanges;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -22,6 +23,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
@@ -40,6 +42,7 @@ final class RegistryController extends Controller
         private readonly Profiles $profiles,
         private readonly RegistryQueries $queries,
         private readonly AuditService $audit,
+        private readonly SensitiveChanges $sensitive,
     ) {}
 
     public function index(Request $request): Response
@@ -134,7 +137,7 @@ final class RegistryController extends Controller
         $guardian = $request->query('guardian') ? OrphanGuardian::query()->with('person')->where('public_id', $request->query('guardian'))->first() : null;
 
         return Inertia::render('Orphans/Registry/CreateOrphan', [
-            'options' => $this->queries->options(), 'canApprove' => $this->access->allows($request->user(), 'portal'), 'staff' => $this->access->staff(),
+            'options' => $this->queries->options(), 'canApprove' => $this->access->allowsDecision($request->user(), 'portal'), 'staff' => $this->access->staff(),
             'guardian' => $guardian ? ['public_id' => $guardian->public_id, 'reference_no' => $guardian->reference_no, 'full_name' => $guardian->person->full_name, 'id_masked' => $guardian->person->maskedId()] : null,
         ]);
     }
@@ -209,15 +212,25 @@ final class RegistryController extends Controller
         $person = $this->registryPerson($publicId);
         $data = $request->validate(Persons::rules(), [], Persons::attributes());
         $before = $person->only(['full_name', 'date_of_birth', 'sex', 'id_format']);
-        DB::transaction(function () use ($person, $data, $request): void {
+        $pending = DB::transaction(function () use ($person, $data, $request): ?object {
+            $pending = null;
+            // ORP-18: on an approved file, name, identity, birth date, sex and life status wait for the head.
+            if ($this->sensitive->mustRequest($request->user(), $this->sensitive->protectsPerson($person->id))) {
+                $pending = $this->sensitive->requestPerson($person, $data, $request->user());
+                $data = [...array_diff_key($data, array_flip(SensitiveChanges::PERSON_INPUT)), 'full_name' => $person->full_name];
+            }
             $this->persons->save($data, $person, $request->user()->id);
             if ($orphan = Orphan::query()->where('person_id', $person->id)->first()) {
                 $this->registry->refreshCompleteness($orphan);
             }
+
+            return $pending;
         });
         $this->audit->recordRow('orphans.person.updated', 'persons', $person->id, $before, $person->fresh()->only(array_keys($before)), $request->user()->id, $request->ip());
 
-        return back()->with('success', 'تم حفظ البيانات الأساسية.');
+        return back()->with('success', $pending
+            ? 'حُفظت البيانات الأخرى، وأُرسل تعديل الاسم أو الهوية أو الميلاد أو الجنس (الطلب '.$pending->reference_no.') إلى رئيس القسم لاعتماده؛ لا يتغير قبل قراره.'
+            : 'تم حفظ البيانات الأساسية.');
     }
 
     /** Full identity number on explicit request, for holders of «identity»; every reveal is logged. */
@@ -254,6 +267,10 @@ final class RegistryController extends Controller
         if (($data['assigned_to'] ?? null) != $orphan->assigned_to) {
             abort_unless($this->access->canAssign($request->user()), 403, 'الإسناد وإعادة الإسناد لرئيس القسم.');
         }
+        // Staff keep editing the file's data; changing its status (approval, suspension, ending, archiving) is a decision.
+        if ($data['status'] !== $orphan->status) {
+            $this->access->assertDecide($request->user(), 'تغيير حالة الملف (الاعتماد أو الإيقاف أو الإنهاء أو الأرشفة) لرئيس القسم أو القائم بأعماله.');
+        }
         if (in_array($data['status'], ['suspended', 'archived', 'ended'], true) && blank($data['status_reason'] ?? null)) {
             return back()->withErrors(['status_reason' => 'اذكر سبب تغيير الحالة.']);
         }
@@ -265,8 +282,15 @@ final class RegistryController extends Controller
         if ($this->access->allows($request->user(), 'health') && array_key_exists('restricted_notes', $data)) {
             $fill['restricted_notes'] = $data['restricted_notes'];
         }
+        $pending = null;
         if (($data['orphan_class_value_id'] ?? null) != $orphan->orphan_class_value_id) {
-            $fill['class_basis'] = $data['orphan_class_value_id'] ? 'manual' : 'provisional';
+            // ORP-18: the orphanhood class of an approved file (eligibility) changes on the head's approval.
+            if ($this->sensitive->mustRequest($request->user(), $this->sensitive->protectsFile($orphan))) {
+                $pending = $this->sensitive->requestClass($orphan, isset($data['orphan_class_value_id']) ? (int) $data['orphan_class_value_id'] : null, $request->user());
+                unset($fill['orphan_class_value_id']);
+            } else {
+                $fill['class_basis'] = $data['orphan_class_value_id'] ? 'manual' : 'provisional';
+            }
         }
         $orphan->forceFill([...$fill, 'updated_by' => $request->user()->id])->save();
         if (($fill['class_basis'] ?? null) === 'provisional') {
@@ -274,7 +298,7 @@ final class RegistryController extends Controller
         }
         $this->audit->recordRow('orphans.orphan.updated', 'orphans', $orphan->id, $before, $orphan->only(array_keys($before)), $request->user()->id, $request->ip());
 
-        return back()->with('success', 'تم تحديث بيانات الملف.');
+        return back()->with('success', $pending ? 'تم تحديث بيانات الملف، وأُرسل تغيير تصنيف اليتم (الطلب '.$pending->reference_no.') إلى رئيس القسم لاعتماده.' : 'تم تحديث بيانات الملف.');
     }
 
     public function updateGuardianRecord(Request $request, string $publicId): RedirectResponse
@@ -354,6 +378,12 @@ final class RegistryController extends Controller
         } elseif (blank($data['full_name'] ?? null) && blank($data['first_name'] ?? null)) {
             return back()->withErrors(['full_name' => 'اكتب الاسم أو اختر شخصًا مسجلًا.']);
         }
+        // ORP-18: the parents of an approved file drive its orphanhood class; staff propose, the head approves.
+        if ($this->sensitive->mustRequest($request->user(), $this->sensitive->protectsFile($orphan))) {
+            $row = $this->sensitive->requestParent($orphan, $relation, collect($data)->except('person_public_id')->all(), $request->user());
+
+            return back()->with('success', 'أُرسل ربط '.($relation === 'father' ? 'الأب' : 'الأم').' (الطلب '.$row->reference_no.') إلى رئيس القسم لاعتماده؛ لا يتغير الملف قبل قراره.');
+        }
         DB::transaction(function () use ($orphan, $relation, $data, $request): void {
             $this->registry->linkParent($orphan, $relation, $data, $request->user());
             $this->registry->refreshCompleteness($orphan);
@@ -373,6 +403,12 @@ final class RegistryController extends Controller
         }
         if ($data['verification'] === 'verified') {
             $this->access->assert($request->user(), 'portal');
+        }
+        // ORP-18: a life-status change of a person linked to an approved file waits for the head.
+        if ($this->sensitive->mustRequest($request->user(), $this->sensitive->protectsPerson($person->id))) {
+            $row = $this->sensitive->requestStatus($person, $data, $request->user());
+
+            return back()->with('success', 'أُرسل تسجيل الحالة (الطلب '.$row->reference_no.') إلى رئيس القسم لاعتماده؛ لا تتغير الحالة قبل قراره.');
         }
         DB::transaction(function () use ($person, $data, $request): void {
             $this->persons->recordStatus($person, $data, $request->user()->id);
@@ -493,26 +529,63 @@ final class RegistryController extends Controller
             $data['completed_on'] ??= today()->toDateString();
             $data['completed_by'] = $request->user()->id;
         }
-        DB::table('social_assessments')->insert([...$data, 'orphan_id' => $orphan->id, 'created_by' => $request->user()->id, 'created_at' => now(), 'updated_at' => now()]);
+        $id = DB::table('social_assessments')->insertGetId([...$data, 'orphan_id' => $orphan->id, 'created_by' => $request->user()->id, 'created_at' => now(), 'updated_at' => now()]);
+        $this->audit->recordRow('orphans.assessment.'.($data['status'] === 'completed' ? 'completed' : 'scheduled'), 'social_assessments', $id, null,
+            ['kind' => $data['kind'], 'assigned_to' => $data['assigned_to'] ?? null, 'needs_level_value_id' => $data['needs_level_value_id'] ?? null], $request->user()->id, $request->ip());
         $this->registry->refreshCompleteness($orphan);
 
         return back()->with('success', $data['status'] === 'completed' ? 'تم تسجيل التقييم.' : 'تمت جدولة الزيارة.');
     }
 
+    /**
+     * Completes or cancels a scheduled visit (ORP-19; req-04: no change to a visit's result without an audit trace):
+     * only its assignee (for an unassigned one, whoever scheduled it) or the head. A needs level it records drives
+     * campaign scoring only after the head's review (reviewAssessment).
+     */
     public function completeAssessment(Request $request, int $assessment): RedirectResponse
     {
-        $this->access->assertEdit($request->user());
+        $user = $request->user();
+        $this->access->assertEdit($user);
         $row = DB::table('social_assessments')->where('id', $assessment)->where('status', 'scheduled')->first();
         abort_unless($row, 404);
+        $owner = $row->assigned_to ?? $row->created_by;
+        abort_unless($this->access->canDecide($user) || ($owner !== null && (int) $owner === (int) $user->id), 403, 'يُنجز الزيارة الباحث المكلَّف بها أو رئيس القسم.');
         $data = $request->validate(['status' => ['required', Rule::in(['completed', 'cancelled'])], 'summary' => 'nullable|string|max:5000',
             'needs_level_value_id' => 'nullable|integer|exists:master_data_values,id', 'valid_until' => 'nullable|date']);
-        DB::table('social_assessments')->where('id', $assessment)->update([...$data, ...($data['status'] === 'completed' ? ['completed_on' => today()->toDateString(), 'completed_by' => $request->user()->id] : []),
+        DB::table('social_assessments')->where('id', $assessment)->where('status', 'scheduled')->update([...$data, ...($data['status'] === 'completed' ? ['completed_on' => today()->toDateString(), 'completed_by' => $user->id] : []),
             'updated_at' => now()]);
+        $this->audit->recordRow('orphans.assessment.'.$data['status'], 'social_assessments', $assessment, ['status' => 'scheduled'],
+            ['status' => $data['status'], 'needs_level_value_id' => $data['needs_level_value_id'] ?? null], $user->id, $request->ip());
         if ($row->orphan_id) {
             $this->registry->refreshCompleteness(Orphan::findOrFail($row->orphan_id));
         }
 
         return back()->with('success', 'تم تحديث الزيارة.');
+    }
+
+    /**
+     * The head's review of a completed visit or assessment (ORP-19; req-04 report review): approved, its needs level
+     * is read by the nomination engine; not approved (with a reason), it stays as history and is read by nothing.
+     * Nobody reviews a visit they completed.
+     */
+    public function reviewAssessment(Request $request, int $assessment): RedirectResponse
+    {
+        $user = $request->user();
+        $this->access->assertDecide($user, 'مراجعة الزيارات والتقييمات لرئيس القسم.');
+        abort_unless(Schema::hasColumn('social_assessments', 'review_outcome'), 422, 'المراجعة غير متاحة قبل تحديث قاعدة البيانات.');
+        $data = $request->validate(['outcome' => ['required', Rule::in(['approved', 'rejected'])], 'note' => 'nullable|string|max:2000|required_if:outcome,rejected'], [], ['note' => 'سبب عدم الاعتماد']);
+        DB::transaction(function () use ($assessment, $data, $user, $request): void {
+            $row = DB::table('social_assessments')->where('id', $assessment)->lockForUpdate()->first();
+            abort_unless($row && $row->status === 'completed', 404);
+            abort_unless($row->review_outcome === null, 422, 'سبقت مراجعة هذه الزيارة.');
+            abort_if((int) $row->completed_by === (int) $user->id, 422, 'لا يراجع أحد زيارة أنجزها؛ يراجعها رئيس القسم أو من يقوم مقامه.');
+            DB::table('social_assessments')->where('id', $row->id)->update(['review_outcome' => $data['outcome'], 'review_note' => isset($data['note']) ? trim($data['note']) : null,
+                'reviewed_by' => $user->id, 'reviewed_at' => now(), 'updated_at' => now()]);
+            $this->audit->recordRow('orphans.assessment.review_'.$data['outcome'], 'social_assessments', (int) $row->id, ['review_outcome' => null],
+                ['review_outcome' => $data['outcome'], 'needs_level_value_id' => $row->needs_level_value_id], $user->id, $request->ip());
+        });
+
+        return back()->with('success', $data['outcome'] === 'approved' ? 'اعتُمدت الزيارة؛ يُحتسب مستوى الاحتياج في الترشيح.' : 'لم تُعتمد الزيارة؛ بقيت في السجل ولا يُحتسب مستوى احتياجها.');
     }
 
     /** Household context: create one around this person, or join an existing one by reference. */

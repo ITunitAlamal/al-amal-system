@@ -12,6 +12,8 @@ const props = defineProps({
     steps: { type: Array, default: () => [] },
     transitions: { type: Array, default: () => [] },
     problems: { type: Array, default: () => [] },
+    // Points worth a look that do not stop publishing (e.g. every forward action depends on an optional field).
+    warnings: { type: Array, default: () => [] },
     stepTypes: { type: Object, default: () => ({}) },
     assignmentTypes: { type: Object, default: () => ({}) },
     departmentScopes: { type: Object, default: () => ({}) },
@@ -185,6 +187,10 @@ const input = 'field';
                 <ul class="mt-2 list-disc space-y-1 pr-5"><li v-for="problem in problems" :key="problem">{{ problem }}</li></ul>
             </section>
             <p v-else-if="editable" class="alert-success">المسودة مكتملة وجاهزة للنشر.</p>
+            <section v-if="editable && warnings.length" class="alert-info">
+                <h2 class="font-bold">تنبيهات لا تمنع النشر ({{ warnings.length }})</h2>
+                <ul class="mt-2 list-disc space-y-1 pr-5"><li v-for="warning in warnings" :key="warning">{{ warning }}</li></ul>
+            </section>
 
             <!-- المراحل -->
             <section class="card">

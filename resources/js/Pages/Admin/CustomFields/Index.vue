@@ -8,6 +8,8 @@ const props = defineProps({
     entities: { type: Object, default: () => ({}) },
     scopes: { type: Object, default: () => ({}) },
     steps: { type: Object, default: () => ({}) },
+    // step code => { action code: action name }: the actions a step field can be tied to
+    stepActions: { type: Object, default: () => ({}) },
     selectedEntity: { type: String, required: true },
     selectedScope: { type: String, default: '' },
     fields: { type: Array, default: () => [] },
@@ -25,8 +27,8 @@ const showForm = ref(false);
 const blank = {
     code: '', label_ar: '', label_en: '', help_text: '', field_type: 'text', master_data_type_id: null, step_code: '',
     is_required: false, is_sensitive: false, sort_order: 100, effective_from: '', effective_to: '', is_active: true,
-    validation: { min: null, max: null, max_length: null },
-    visible_when: { field: '', operator: 'equals', value: '' },
+    validation: { min: null, max: null, max_length: null, not_future: false },
+    visible_when: { field: '', operator: 'equals', value: '', action_codes: [] },
 };
 const form = useForm(JSON.parse(JSON.stringify(blank)));
 
@@ -54,8 +56,12 @@ function openEdit(field) {
         effective_from: field.effective_from ? String(field.effective_from).slice(0, 10) : '',
         effective_to: field.effective_to ? String(field.effective_to).slice(0, 10) : '',
         is_active: Boolean(field.is_active),
-        validation: { min: validation.min ?? null, max: validation.max ?? null, max_length: validation.max_length ?? null },
-        visible_when: { field: visibleWhen.field || '', operator: visibleWhen.operator || 'equals', value: visibleWhen.value ?? '' },
+        validation: { min: validation.min ?? null, max: validation.max ?? null, max_length: validation.max_length ?? null, not_future: Boolean(validation.not_future) },
+        visible_when: {
+            field: visibleWhen.field || '', operator: visibleWhen.operator || 'equals', value: visibleWhen.value ?? '',
+            // Only actions the step still has can be kept.
+            action_codes: (visibleWhen.action_codes || []).filter(code => props.stepActions[field.step_code || '']?.[code]),
+        },
     });
     form.clearErrors();
     showForm.value = true;
@@ -66,8 +72,10 @@ function save() {
             label_ar: data.label_ar, label_en: data.label_en || null, help_text: data.help_text || null,
             is_required: data.is_required, is_sensitive: data.is_sensitive, sort_order: data.sort_order,
             effective_from: data.effective_from || null, effective_to: data.effective_to || null,
-            validation: data.validation,
-            visible_when: data.visible_when.field ? data.visible_when : null,
+            validation: { ...data.validation, not_future: data.field_type === 'datetime' && data.validation.not_future },
+            visible_when: data.visible_when.field || actionCodes.value.length
+                ? { ...data.visible_when, action_codes: actionCodes.value }
+                : null,
         };
         if (editingId.value) {
             payload.is_active = data.is_active;
@@ -84,6 +92,10 @@ function save() {
     else form.post('/admin/custom-fields', options);
 }
 const otherFields = computed(() => props.fields.filter(field => field.code !== form.code));
+// A step field may belong to some of its step's actions only: shown, checked and saved with those actions.
+const actionsOfStep = computed(() => (form.step_code ? props.stepActions[form.step_code] : null) || {});
+const actionCodes = computed(() => form.visible_when.action_codes.filter(code => actionsOfStep.value[code]));
+const isActionBound = field => Boolean(decode(field.visible_when)?.action_codes?.length);
 </script>
 
 <template>
@@ -163,6 +175,9 @@ const otherFields = computed(() => props.fields.filter(field => field.code !== f
                         <label class="field-label">أقصى عدد أحرف</label>
                         <input v-model.number="form.validation.max_length" type="number" min="1" class="field" />
                     </div>
+                    <label v-if="form.field_type === 'datetime'" class="flex items-center gap-2 self-end text-sm">
+                        <input v-model="form.validation.not_future" type="checkbox" /> لا يقبل وقتًا في المستقبل (مثل وقت إنجاز فعلي)
+                    </label>
                     <div class="flex flex-wrap items-center gap-6 md:col-span-2">
                         <label class="flex items-center gap-2 text-sm"><input v-model="form.is_required" type="checkbox" /> إلزامي</label>
                         <label class="flex items-center gap-2 text-sm"><input v-model="form.is_sensitive" type="checkbox" /> حساس (لا يظهر إلا للمخولين بالكامل)</label>
@@ -181,6 +196,16 @@ const otherFields = computed(() => props.fields.filter(field => field.code !== f
                             <input v-if="form.visible_when.field && ['equals', 'not_equals'].includes(form.visible_when.operator)" v-model="form.visible_when.value" placeholder="القيمة (لقوائم الثوابت: رقم القيمة)" class="rounded-xl border border-slate-200 p-3" />
                         </div>
                         <p v-if="form.errors['visible_when.field']" class="field-error">{{ form.errors['visible_when.field'] }}</p>
+                        <div v-if="Object.keys(actionsOfStep).length" class="mt-4 border-t border-slate-100 pt-3">
+                            <p class="text-sm font-medium">يخص إجراءات محددة من المرحلة (اختياري)</p>
+                            <div class="mt-2 flex flex-wrap gap-x-6 gap-y-2">
+                                <label v-for="(name, code) in actionsOfStep" :key="code" class="flex items-center gap-2 text-sm">
+                                    <input v-model="form.visible_when.action_codes" type="checkbox" :value="code" /> {{ name }}
+                                </label>
+                            </div>
+                            <p class="mt-2 text-xs text-slate-500">دون اختيار يظهر الحقل مع كل إجراءات المرحلة. عند الاختيار يظهر ويُتحقق منه ويُحفظ مع الإجراءات المختارة فقط، وإلزاميته تسري معها فقط.</p>
+                            <p v-if="form.errors['visible_when.action_codes']" class="field-error">{{ form.errors['visible_when.action_codes'] }}</p>
+                        </div>
                     </fieldset>
                     <div><label class="field-label">ترتيب العرض</label><input v-model.number="form.sort_order" type="number" min="0" required class="field" /></div>
                     <div class="grid grid-cols-2 gap-3">
@@ -208,6 +233,7 @@ const otherFields = computed(() => props.fields.filter(field => field.code !== f
                                 <td class="space-x-1 space-x-reverse">
                                     <span v-if="field.is_required" class="rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700">إلزامي</span>
                                     <span v-if="field.is_sensitive" class="rounded-full bg-gold-50 px-2 py-0.5 text-xs text-gold-700">حساس</span>
+                                    <span v-if="isActionBound(field)" class="rounded-full bg-navy-50 px-2 py-0.5 text-xs text-navy-700">مع إجراءات محددة</span>
                                     <span v-if="!field.is_active" class="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">معطل</span>
                                 </td>
                                 <td><button type="button" class="text-blue-700 hover:underline" @click="openEdit(field)">تعديل</button></td>

@@ -21,7 +21,7 @@ const quotesRef = ref('');
 const message = ref('');
 const error = ref('');
 const busy = ref(false);
-const roles = [['finance_head', 'رئيس الحسابات'], ['general_accountant', 'محاسب عام'], ['procurement', 'محاسب مشتريات'], ['warehouse', 'محاسب/أمين مخزن'], ['cash_executor', 'منفذ القبض والصرف'], ['director_approver', 'اعتماد المدير التنفيذي'], ['payroll', 'مسؤول الرواتب'], ['auditor', 'مدقق مالي (اطلاع فقط)']];
+const roles = [['finance_head', 'رئيس الحسابات'], ['general_accountant', 'محاسب الفواتير'], ['procurement', 'مسؤول المشتريات'], ['warehouse', 'أمين المخازن'], ['cash_executor', 'منفذ الصرف'], ['receipt_executor', 'منفذ القبض'], ['director_approver', 'اعتماد المدير التنفيذي'], ['payroll', 'مسؤول الرواتب'], ['auditor', 'مدقق مالي (اطلاع فقط)']];
 const roleName = code => roles.find(role => role[0] === code)?.[1] || code;
 
 async function send(url, data) {
@@ -88,7 +88,8 @@ async function endAssignment(assignment) {
             <div v-if="message" class="alert-success" role="status">{{ message }}</div>
 
             <section class="card space-y-4">
-                <h2 class="card-title">تعيين اختصاص محاسب</h2>
+                <h2 class="card-title">إضافة اختصاص لموظف الحسابات</h2>
+                <p class="text-sm text-slate-600">يمكن إضافة أكثر من اختصاص للموظف نفسه؛ إضافة اختصاص تبقي اختصاصاته الأخرى وصلاحياتها نافذة.</p>
                 <div class="grid gap-4 sm:grid-cols-2">
                     <div>
                         <label for="fin-user" class="field-label">المستخدم</label>

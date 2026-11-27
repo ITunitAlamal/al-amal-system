@@ -56,6 +56,13 @@ Route::middleware(['web', 'auth'])->group(function () {
     Route::post('/admin/employee-profiles/{employee}/activate-direct', [Profiles::class, 'activateWithoutSms'])->whereNumber('employee')
         ->middleware('throttle:6,1')->name('admin.employee-profiles.activate-direct');
 
+    // What HR staff prepare on employee files, approved or returned by the HR head (EmployeeFileChanges).
+    Route::get('/admin/employee-file-changes', [Profiles::class, 'changes'])->name('admin.employee-file-changes.index');
+    Route::get('/admin/employee-file-changes/{change}/edit', [Profiles::class, 'editChange'])->whereNumber('change')->name('admin.employee-file-changes.edit');
+    Route::post('/admin/employee-file-changes/{change}/approve', [Profiles::class, 'approveChange'])->whereNumber('change')->name('admin.employee-file-changes.approve');
+    Route::post('/admin/employee-file-changes/{change}/return', [Profiles::class, 'returnChange'])->whereNumber('change')->name('admin.employee-file-changes.return');
+    Route::post('/admin/employee-file-changes/{change}/withdraw', [Profiles::class, 'withdrawChange'])->whereNumber('change')->name('admin.employee-file-changes.withdraw');
+
     Route::post('/admin/employee-profiles/{employee}/pay-changes', [PayChanges::class, 'store'])->whereNumber('employee')->name('admin.employee-pay-changes.store');
     Route::get('/admin/employee-pay-changes/{change}', [PayChanges::class, 'show'])->whereNumber('change')->name('admin.employee-pay-changes.show');
     Route::put('/admin/employee-pay-changes/{change}', [PayChanges::class, 'update'])->whereNumber('change')->name('admin.employee-pay-changes.update');

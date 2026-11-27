@@ -19,7 +19,7 @@ const household = ref('');
 const assistance = useForm({ unit: 'orphan', orphan_public_id: null, household_reference: '', type_value_id: null, description: '', quantity: null, amount: null, currency: null });
 const assistancePick = ref(null);
 const benefit = useForm({ unit: 'orphan', orphan_public_id: null, household_reference: '', source: 'other', assistance_public_id: null, type_value_id: null, description: '', quantity: null, unit_label: '',
-    amount: null, currency: null, recipient_name: '', delivered_on: new Date().toISOString().slice(0, 10), fulfillment_ref: '' });
+    amount: null, currency: null, recipient_name: '', delivered_on: new Date().toISOString().slice(0, 10), fulfillment_ref: '', fulfillment_kind: 'handover' });
 const benefitPick = ref(null);
 const statusTones = { draft: 'warning', active: 'success', partial: 'info', suspended: 'danger', expired: 'muted', ended: 'muted', requested: 'info', approved: 'success', rejected: 'danger', fulfilled: 'success', cancelled: 'muted' };
 function saveSponsorship() { sponsorship.orphans = picked.value.map(p => p.public_id); sponsorship.households = household.value ? household.value.split(/[\s,،]+/).filter(Boolean) : []; sponsorship.post('/orphans/aid/sponsorships'); }
@@ -100,7 +100,8 @@ function reverse(row) { const reason = window.prompt('سبب التصحيح (ي�
                     <label class="text-sm">المبلغ<input v-model="benefit.amount" type="number" min="0" step="0.01" class="field mt-1"></label>
                     <label class="text-sm">المستلم الفعلي<input v-model="benefit.recipient_name" class="field mt-1" required></label>
                     <label class="text-sm">تاريخ التسليم<input v-model="benefit.delivered_on" type="date" class="field mt-1" required></label>
-                    <label class="text-sm">مرجع التنفيذ (سند/حركة مخزن/محضر)<input v-model="benefit.fulfillment_ref" class="field mt-1" maxlength="140"></label>
+                    <label class="text-sm">نوع مرجع التنفيذ<select v-model="benefit.fulfillment_kind" class="field mt-1"><option v-for="(label, key) in labels.fulfillment" :key="key" :value="key">{{ label }}</option></select></label>
+                    <label class="text-sm">{{ benefit.fulfillment_kind === 'stock_movement' ? 'رقم حركة الصرف في المخازن' : benefit.fulfillment_kind === 'finance_document' ? 'رقم سند الحسابات' : 'رقم محضر التسليم' }}<input v-model="benefit.fulfillment_ref" class="field mt-1" maxlength="140" dir="ltr"></label>
                     <p v-for="(e, k) in benefit.errors" :key="k" class="field-error sm:col-span-3">{{ e }}</p>
                     <div class="sm:col-span-3"><button type="submit" class="btn btn-primary" :disabled="benefit.processing">تسجيل</button></div>
                 </form>
@@ -122,15 +123,16 @@ function reverse(row) { const reason = window.prompt('سبب التصحيح (ي�
                         <li v-for="a in rows.data" :key="a.public_id" class="flex flex-wrap items-center gap-2 py-2 text-sm"><span class="font-mono" dir="ltr">{{ a.reference_no }}</span><StatusBadge :label="labels.assistance[a.status]" :tone="statusTones[a.status]" />
                             <Link v-if="a.orphan_public_id" :href="`/orphans/registry/orphans/${a.orphan_public_id}`" class="text-blue-700 hover:underline">{{ a.orphan_name }}</Link><span v-else class="font-mono" dir="ltr">{{ a.household_reference }}</span>
                             <span class="min-w-0 flex-1 text-slate-700">{{ a.type ? `${a.type} · ` : '' }}{{ a.description }}</span>
-                            <template v-if="a.status === 'requested' && abilities.assign"><button type="button" class="btn btn-sm btn-primary" @click="decide(a, 'approved')">اعتماد</button><button type="button" class="btn btn-sm btn-danger" @click="decide(a, 'rejected')">رفض</button></template>
+                            <template v-if="a.status === 'requested' && abilities.decide"><button type="button" class="btn btn-sm btn-primary" @click="decide(a, 'approved')">اعتماد</button><button type="button" class="btn btn-sm btn-danger" @click="decide(a, 'rejected')">رفض</button></template>
                             <button v-if="a.status === 'approved' && (abilities.sponsorships || abilities.delivery)" type="button" class="btn btn-sm btn-secondary" @click="deliver(a)">تسجيل التسليم</button></li>
                     </ul>
                     <table v-else class="data-table min-w-[720px]">
                         <thead><tr><th scope="col">التاريخ</th><th scope="col">المستفيد</th><th scope="col">البيان</th><th scope="col">المستلم</th><th scope="col">المرجع</th><th scope="col"><span class="sr-only">إجراء</span></th></tr></thead>
                         <tbody><tr v-for="b in rows.data" :key="b.public_id" :class="b.kind === 'reversal' || b.reversed ? 'text-slate-400' : ''"><td>{{ b.delivered_on }}</td>
                             <td><Link v-if="b.orphan_public_id" :href="`/orphans/registry/orphans/${b.orphan_public_id}?tab=aid`" class="text-blue-700 hover:underline">{{ b.orphan_name }}</Link><span v-else class="font-mono" dir="ltr">{{ b.household_reference }} (أسرة)</span></td>
-                            <td>{{ b.kind === 'reversal' ? `تصحيح: ${b.reason}` : b.description }} <StatusBadge v-if="b.reversed" label="مُصحّح" tone="muted" /></td><td>{{ b.recipient_name }}</td><td class="font-mono text-xs" dir="ltr">{{ b.fulfillment_ref }}</td>
-                            <td><button v-if="b.kind === 'delivery' && !b.reversed && abilities.assign" type="button" class="btn btn-sm btn-secondary" @click="reverse(b)">تصحيح</button></td></tr></tbody>
+                            <td>{{ b.kind === 'reversal' ? `تصحيح: ${b.reason}` : b.description }} <StatusBadge v-if="b.reversed" label="مُصحّح" tone="muted" /></td><td>{{ b.recipient_name }}</td>
+                            <td class="text-xs"><span v-if="b.fulfillment_kind" class="text-slate-500">{{ labels.fulfillment[b.fulfillment_kind] }} </span><span class="font-mono" dir="ltr">{{ b.fulfillment_ref }}</span></td>
+                            <td><button v-if="b.kind === 'delivery' && !b.reversed && abilities.decide" type="button" class="btn btn-sm btn-secondary" @click="reverse(b)">تصحيح</button></td></tr></tbody>
                     </table>
                 </div>
                 <footer v-if="rows.last_page > 1" class="flex flex-wrap gap-1 border-t border-slate-200 p-4"><template v-for="(l, i) in rows.links" :key="i"><Link v-if="l.url" :href="l.url" :class="['rounded-lg border px-3 py-2 text-sm', l.active ? 'border-navy-700 bg-navy-700 text-white' : 'border-slate-200']" v-html="l.label" /></template></footer>

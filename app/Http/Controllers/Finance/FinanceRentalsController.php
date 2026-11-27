@@ -58,12 +58,13 @@ class FinanceRentalsController extends Controller
         $this->guard->assert($r->user(), 'finance.rentals.record');
         $d = $r->validate([
             'request_key' => 'required|uuid', 'reference' => 'required|string|max:150', 'posted_on' => 'required|date|before_or_equal:today',
-            'payment_method_value_id' => 'nullable|integer', 'note' => 'nullable|string|max:2000',
+            'voucher_amount' => 'required|numeric|min:0.01|max:999999999999', 'payment_method_value_id' => 'nullable|integer', 'note' => 'nullable|string|max:2000',
             'allocations' => 'required|array|min:1|max:50', 'allocations.*.due_id' => 'required|integer|exists:aims_rental_dues,id',
             'allocations.*.amount' => 'required|numeric|min:0.01|max:999999999999',
         ]);
         $constants->assert('payment_methods', isset($d['payment_method_value_id']) ? (int) $d['payment_method_value_id'] : null, 'payment_method_value_id');
         $d['allocations'] = array_map(fn (array $row): array => ['due_id' => (int) $row['due_id'], 'amount' => number_format((float) $row['amount'], 2, '.', '')], $d['allocations']);
+        $d['voucher_amount'] = number_format((float) $d['voucher_amount'], 2, '.', '');
         $count = $receipts->record($r->user(), $d);
 
         return back()->with('success', $count === 0 ? 'سبق تسجيل هذه العملية؛ لم يُكرَّر القبض.' : 'سُجل السند '.$d['reference'].' على '.$count.' استحقاق.');

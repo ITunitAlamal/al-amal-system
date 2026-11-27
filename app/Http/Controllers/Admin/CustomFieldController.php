@@ -41,6 +41,7 @@ class CustomFieldController extends Controller
             'entities' => $this->entities->all(),
             'scopes' => $scopes,
             'steps' => $this->entities->steps($entity, $scope),
+            'stepActions' => (object) $this->entities->stepActions($entity, $scope),
             'selectedEntity' => $entity,
             'selectedScope' => $scope,
             'fields' => DB::table('custom_field_definitions')
@@ -71,6 +72,7 @@ class CustomFieldController extends Controller
         $data['scope_key'] = $scope;
         $this->ensureUniqueCode($entity, $scope, $data['code']);
         $this->checkVisibilityRule($entity, $scope, $data['code'], $data['visible_when'] ?? null);
+        $this->checkActionCodes($entity, $scope, $data['step_code'] ?? null, $data['visible_when'] ?? null);
 
         DB::transaction(function () use ($request, $data): void {
             $row = $this->toRow($data);
@@ -102,6 +104,7 @@ class CustomFieldController extends Controller
 
         $data = $request->validate([...$this->editableRules(), 'is_active' => ['required', 'boolean']]);
         $this->checkVisibilityRule($before->entity_type, $before->scope_key, $before->code, $data['visible_when'] ?? null);
+        $this->checkActionCodes($before->entity_type, $before->scope_key, $before->step_code, $data['visible_when'] ?? null);
 
         DB::transaction(function () use ($request, $field, $before, $data): void {
             DB::table('custom_field_definitions')->where('id', $field)->lockForUpdate()->first();
@@ -142,10 +145,15 @@ class CustomFieldController extends Controller
                 }
             }],
             'validation.max_length' => ['nullable', 'integer', 'min:1', 'max:20000'],
+            // «تاريخ ووقت»: refuse a time that has not come yet.
+            'validation.not_future' => ['nullable', 'boolean'],
             'visible_when' => ['nullable', 'array'],
             'visible_when.field' => ['nullable', 'string', 'regex:/^[a-z][a-z0-9_]*$/'],
             'visible_when.operator' => ['nullable', Rule::in(CustomFieldService::VISIBILITY_OPERATORS)],
             'visible_when.value' => ['nullable', 'string', 'max:200'],
+            // A step field shown, checked and saved only with these actions of its step.
+            'visible_when.action_codes' => ['nullable', 'array', 'max:30'],
+            'visible_when.action_codes.*' => ['string', 'max:60', 'regex:/^[a-z][a-z0-9_]*$/'],
             'sort_order' => ['required', 'integer', 'min:0'],
             'effective_from' => ['nullable', 'date'],
             'effective_to' => ['nullable', 'date', 'after_or_equal:effective_from'],
@@ -158,12 +166,17 @@ class CustomFieldController extends Controller
      */
     private function toRow(array $data): array
     {
-        $validation = array_filter($data['validation'] ?? [], fn ($value): bool => $value !== null && $value !== '');
+        $validation = array_filter($data['validation'] ?? [], fn ($value): bool => $value !== null && $value !== '' && $value !== false);
         $visibleWhen = ! empty($data['visible_when']['field']) ? [
             'field' => $data['visible_when']['field'],
             'operator' => $data['visible_when']['operator'] ?? 'equals',
             'value' => $data['visible_when']['value'] ?? null,
-        ] : null;
+        ] : [];
+        $actionCodes = array_values(array_unique(array_filter($data['visible_when']['action_codes'] ?? [])));
+        if ($actionCodes !== []) {
+            $visibleWhen['action_codes'] = $actionCodes;
+        }
+        $visibleWhen = $visibleWhen === [] ? null : $visibleWhen;
 
         return [
             'label_ar' => $data['label_ar'],
@@ -214,6 +227,23 @@ class CustomFieldController extends Controller
 
         if ($field === $code || ! $exists) {
             throw ValidationException::withMessages(['visible_when.field' => 'شرط الظهور يجب أن يعتمد على حقل آخر موجود في النموذج نفسه.']);
+        }
+    }
+
+    /**
+     * A field can be tied only to actions of the step it is filled in.
+     *
+     * @param  array<string, mixed>|null  $rule
+     */
+    private function checkActionCodes(string $entity, string $scope, ?string $stepCode, ?array $rule): void
+    {
+        $codes = array_values(array_filter($rule['action_codes'] ?? []));
+        if ($codes === []) {
+            return;
+        }
+        $known = $stepCode ? array_keys($this->entities->stepActions($entity, $scope)[$stepCode] ?? []) : [];
+        if (array_diff($codes, $known) !== []) {
+            throw ValidationException::withMessages(['visible_when.action_codes' => 'اختر من إجراءات المرحلة التي يُعبأ فيها الحقل؛ حقول نموذج التقديم لا تُربط بإجراء.']);
         }
     }
 }

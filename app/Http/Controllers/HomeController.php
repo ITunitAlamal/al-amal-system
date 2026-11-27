@@ -7,8 +7,10 @@ use App\Services\Dashboard\DashboardLayoutResolver;
 use App\Services\Dashboard\PersonalTasks;
 use App\Services\Dashboard\PersonalWorkspace;
 use App\Services\Dashboard\RoleBoards;
+use App\Services\Finance\DepartmentBudgets;
 use App\Services\HomeDashboard;
-use App\Services\Hr\HrDashboardContent;
+use App\Services\Hr\DepartmentHome;
+use App\Services\Hr\HrHomeDashboard;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\Notifications\NotificationCenter;
 use App\Services\Rentals\RentalsDashboard;
@@ -23,12 +25,20 @@ class HomeController extends Controller
      * (DashboardLayoutResolver); a block appears only when the user's own access provides it: a template can
      * hide or arrange blocks, never reveal one, and locked blocks (the user's work) cannot be hidden.
      * The heavier personal and role blocks load after the page.
+     *
+     * The unified department (HR, general services and maintenance): its head has one dashboard, HrHomeDashboard
+     * («بانتظار إجرائي» first), with ?workspace=personal for their personal services; its other people open this page
+     * on «بانتظار إجرائي» and «طلباتي». Everyone else keeps the page as it is.
      */
     public function index(Request $request, HomeDashboard $dashboard, SystemReadiness $readiness, DashboardLayoutResolver $layouts,
-        NotificationCenter $notifications, PersonalWorkspace $workspace, PersonalTasks $todo): Response
+        NotificationCenter $notifications, PersonalWorkspace $workspace, PersonalTasks $todo, HrHomeDashboard $hr, DepartmentBudgets $budgets): Response
     {
         $user = $request->user();
-        $hrWorkspace = $user->isHrDepartmentHead();
+        $hrHead = $user->isHrDepartmentHead();
+        if ($hrHead && $request->query('workspace') !== 'personal') {
+            return Inertia::render('Hr/Home', $hr->props($request));
+        }
+        $member = ! $hrHead && HrServicesDashboard::isMember($user);
         $home = $dashboard->for($user);
         $fromHome = ['team' => $home['team'] !== null, 'executive' => $home['executive'] !== null, 'finance' => $home['finance'] !== null,
             'start_options' => $home['startOptions'] !== [] && $layouts->unavailableReason($user, 'start_options') === null, 'evaluation' => $home['evaluation'] !== null];
@@ -43,12 +53,22 @@ class HomeController extends Controller
             }
         }
         $limit = fn (string $key, int $default): int => (int) ($blocks[$key]['options']['limit'] ?? $default);
-        if ($hrWorkspace) {
+        if ($hrHead) {
             unset($blocks['hr_services']);
+        }
+        // «طلباتي» at the top of a member's page follows the template like the block it replaces (it is not locked).
+        $memberRequests = $member && isset($blocks['my_requests']);
+        if ($member) {
+            // Shown at the top of the page instead: the tasks as «بانتظار إجرائي», the requests as «طلباتي».
+            unset($blocks['tasks'], $blocks['my_requests']);
         }
 
         return Inertia::render('Home', [
-            'hrWorkspace' => $hrWorkspace,
+            'hrHomeUrl' => $hrHead ? route('ui.preview', [], false) : null,
+            'departmentHome' => $member ? 'member' : null,
+            'memberRequests' => $memberRequests,
+            'waiting' => fn () => $member ? app(DepartmentHome::class)->waiting($user, $dashboard->tasks($user)) : null,
+            'departmentBudgets' => Inertia::defer(fn (): array => $budgets->summary($user, now()->format('Y-m')), 'department-budgets'),
             'executiveWorkspace' => $layouts->resolve($user)['executive_workspace'],
             'home' => $home,
             'layout' => array_values(array_map(fn (array $block): array => ['key' => $block['key'], 'size' => $block['size'], 'section' => $block['section']], $blocks)),
@@ -63,8 +83,7 @@ class HomeController extends Controller
             'rentals' => isset($blocks['rentals']) ? Inertia::defer(fn (): array => app(RentalsDashboard::class)->summary($user), 'role') : null,
             'readiness' => fn () => isset($blocks['readiness']) ? $readiness->checks() : null,
             // Role dashboards (hero, trend, breakdown, action table) for each real role of the user; loaded after the page.
-            'boards' => Inertia::defer(fn (): array => app(RoleBoards::class)->for($user), 'boards'),
-            ...($hrWorkspace ? app(HrDashboardContent::class)->props($request) : []),
+            'boards' => Inertia::defer(fn (): array => app(RoleBoards::class)->for($user, $hrHead ? ['hr'] : []), 'boards'),
         ]);
     }
 }

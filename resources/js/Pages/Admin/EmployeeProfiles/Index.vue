@@ -18,6 +18,9 @@ const props = defineProps({
     departments: { type: Array, default: () => [] },
     smsEnabled: { type: Boolean, default: false },
     accountsWithoutProfile: { type: Array, default: () => [] },
+    // manage: HR management; prepare: HR staff, whose saves wait for the HR head; review: the HR head.
+    can: { type: Object, default: () => ({ manage: true, prepare: false, review: false }) },
+    fileChanges: { type: Object, default: null },
 });
 
 const page = usePage();
@@ -25,7 +28,7 @@ const search = ref(props.filters.search || '');
 const department = ref(props.filters.department || 0);
 const state = ref(props.filters.state || '');
 watch(() => props.filters, value => { search.value = value.search || ''; department.value = value.department || 0; state.value = value.state || ''; });
-const states = { '': 'كل الملفات', imported: 'مستوردة من ملف الموظفين', no_account: 'بلا حساب دخول', draft: 'مسودة (غير مكتملة)', name_review: 'تقسيم الاسم بانتظار المراجعة' };
+const states = { '': 'كل الملفات', review: 'وثائق أو صور أو أسماء تحتاج مراجعة', imported: 'مستوردة من ملف الموظفين', no_account: 'بلا حساب دخول', draft: 'مسودة (غير مكتملة)', name_review: 'تقسيم الاسم بانتظار المراجعة', documents_expiring: 'وثائق منتهية أو قريبة من الانتهاء', documents_missing: 'ينقصها وثائق إلزامية' };
 const query = () => Object.fromEntries(Object.entries({ search: search.value.trim(), department: department.value || '', state: state.value }).filter(([, v]) => v !== '' && v !== 0));
 const exportUrl = computed(() => `/admin/employee-profiles/export.csv?${new URLSearchParams(query()).toString()}`);
 const displayName = employee => employee.full_name_ar || [employee.first_name_ar, employee.family_name_ar].filter(Boolean).join(' ');
@@ -79,9 +82,16 @@ watch(() => props.employees, () => { preview.value = null; });
                     class="btn btn-primary">
                     + إضافة ملف موظف
                 </Link>
-                <Link href="/admin/employee-imports" class="btn btn-secondary">استيراد الموظفين</Link>
-                <a :href="exportUrl" class="btn btn-secondary">تصدير القائمة (CSV)</a>
+                <Link v-if="fileChanges" :href="fileChanges.url" class="btn btn-secondary">
+                    {{ can.manage ? 'تعديلات بانتظار الاعتماد' : 'تعديلاتي المرسلة للاعتماد' }}
+                    <span v-if="fileChanges.count" class="ms-1 rounded-full bg-gold-100 px-2 text-xs font-bold text-gold-900">{{ fileChanges.count }}</span>
+                </Link>
+                <template v-if="can.manage">
+                    <Link href="/admin/employee-imports" class="btn btn-secondary">استيراد الموظفين</Link>
+                    <a :href="exportUrl" class="btn btn-secondary">تصدير القائمة (CSV)</a>
+                </template>
             </PageHeader>
+            <p v-if="can.prepare" class="alert-info leading-7">ما تضيفه أو تعدّله من ملفات يُرسل إلى رئيس الموارد البشرية للاعتماد، ولا يظهر في الملف قبل اعتماده.</p>
 
             <section class="grid gap-3 md:grid-cols-2" aria-label="ملخص ملفات الموظفين">
                 <div class="card">
@@ -113,7 +123,7 @@ watch(() => props.employees, () => { preview.value = null; });
                     <button v-if="search || filters.search || filters.department || filters.state" type="button" @click="clearSearch" class="btn btn-secondary">مسح</button>
                 </form>
 <div class="space-y-3 p-4"><ActiveFilters :items="activeFilters" :count="total" @remove="removeFilter" @clear="clearFilters" /><ColumnPicker v-model="hiddenColumns" table="employee-profiles" :columns="columns" /><p class="mt-2 text-xs leading-6 text-slate-600 sm:hidden">على الهاتف تظهر البيانات الأساسية؛ استخدم «معاينة» لعرض بقية التفاصيل.</p></div>
-                <p class="border-b border-slate-100 px-4 py-2 text-xs text-slate-500">التصدير يشمل البيانات الوظيفية والحالة فقط؛ لا يُصدَّر رقم الهوية ولا الهواتف ولا العناوين ولا الرواتب ولا الحسابات البنكية، ويُسجل كل تصدير في سجل التدقيق.</p>
+                <p v-if="can.manage" class="border-b border-slate-100 px-4 py-2 text-xs text-slate-500">التصدير يشمل البيانات الوظيفية والحالة فقط؛ لا يُصدَّر رقم الهوية ولا الهواتف ولا العناوين ولا الرواتب ولا الحسابات البنكية، ويُسجل كل تصدير في سجل التدقيق.</p>
 
                 <div class="overflow-x-auto p-4">
                     <table role="table" v-if="rows.length" class="aims-responsive-table data-table min-w-[750px]">

@@ -14,6 +14,31 @@ final class AttendanceRawImporter
             ['id', 'host', 'port', 'protocol', 'assigned_agent', 'driver', 'timezone', 'communication_password']), JSON_THROW_ON_ERROR));
     }
 
+    /**
+     * The instants a device wall time can stand for in its time zone, earliest first: one normally, two around a
+     * daylight-saving change (the repeated hour read with either offset, or the skipped hour read with the offset
+     * before or after the change). ingest() stores the earliest one and holds the punch as "time_review".
+     *
+     * @return list<CarbonImmutable> in UTC
+     */
+    public static function timeReadings(string $local, string $timezone): array
+    {
+        $wall = preg_match('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/', $local) ? CarbonImmutable::createFromFormat('!Y-m-d H:i:s', substr($local, 0, 19), 'UTC') : null;
+        if (! $wall || ! in_array($timezone, timezone_identifiers_list(), true)) {
+            return [];
+        }
+        $zone = new \DateTimeZone($timezone);
+        $readings = [];
+        // The offsets in force a few hours either side of the wall time (no zone changes twice within six hours).
+        foreach ([-3, 3] as $hours) {
+            $instant = $wall->subSeconds($zone->getOffset($wall->addHours($hours)->toDateTime()));
+            $readings[$instant->getTimestamp()] = $instant;
+        }
+        ksort($readings);
+
+        return array_values($readings);
+    }
+
     /** @return array{received: int, inserted: int, duplicates: int, unmatched: int, failed: int} */
     public function ingest(object $device, array $events, int $runId, bool $dryRun): array
     {

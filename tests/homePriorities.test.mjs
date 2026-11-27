@@ -48,7 +48,7 @@ function home(props) {
     }
     const source = script.replace(/^import .*;\r?\n/gm, '');
     vm.createContext(context);
-    vm.runInContext(`${source}\nglobalThis.api = { dashboardLayout, sections, stats, leadingShortcuts, remainingShortcuts, visibleTasks, taskView, refreshSummary, refreshing, refreshError, date, dateTime, dayLabel, ago, isLate, quickDue, quickDueDate, quickDueHour, quickDueMinute, quickDuePeriod, quickDuePickerOpen, openQuickDuePicker };`, context);
+    vm.runInContext(`${source}\nglobalThis.api = { dashboardLayout, showPersonalWorkspace, stats, leadingShortcuts, remainingShortcuts, visibleTasks, taskView, refreshSummary, refreshing, refreshError, date, dateTime, dayLabel, ago, isLate, quickDue, quickDueDate, quickDueHour, quickDueMinute, quickDuePeriod, quickDuePickerOpen, openQuickDuePicker };`, context);
     return { ...context.api, request: () => request };
 }
 
@@ -83,7 +83,7 @@ test('system date formatting uses Arabic Gregorian month names with Latin digits
     assert.doesNotMatch(`${formattedDate} ${formattedDateTime} ${formattedNumber} ${kpiNumber(1234)}`, /[٠-٩]/);
 });
 
-test('role shortcuts do not duplicate header actions and configured sections retain their order', () => {
+test('executive overview excludes shortcut cards and retains authorized decision queues', () => {
     const props = {
         executiveWorkspace: true,
         layout: [{ key: 'tasks', section: 'base' }, { key: 'shortcuts', section: 'role' }, { key: 'finance', section: 'role' }],
@@ -95,10 +95,31 @@ test('role shortcuts do not duplicate header actions and configured sections ret
     assert.deepEqual(Array.from(app.leadingShortcuts.value, item => item.code), ['a', 'b', 'c']);
     assert.deepEqual(Array.from(app.remainingShortcuts.value, item => item.code), ['d']);
     assert.equal(app.stats.value.length, 2);
-    assert.deepEqual(Array.from(app.sections.value[1].blocks, item => item.key), ['shortcuts', 'finance']);
+    assert.deepEqual(Array.from(app.dashboardLayout.value, item => item.key), ['tasks', 'finance']);
     app.taskView.value = 'overdue';
     assert.equal(app.visibleTasks.value.length, 1);
     assert.equal(props.home.tasks.length, 2);
+});
+
+test('executive decision view prioritizes overdue work and exposes personal services only on request', () => {
+    const props = {
+        executiveWorkspace: true,
+        layout: ['profile', 'finance', 'executive', 'tasks', 'todo', 'stats', 'correspondence'].map(key => ({ key })),
+        shortcuts: [], actionCenter: [],
+        home: { stats: {}, executive: { decisions: [] }, tasks: [{ key: 'normal' }, { key: 'late', overdue: true }] },
+    };
+    const app = home(props);
+    assert.deepEqual(Array.from(app.dashboardLayout.value, item => item.key), ['tasks', 'correspondence', 'finance']);
+    assert.deepEqual(Array.from(app.visibleTasks.value, item => item.key), ['late', 'normal']);
+    assert.deepEqual(props.home.tasks.map(item => item.key), ['normal', 'late']);
+    app.refreshSummary();
+    assert.ok(app.request().only.includes('correspondence'));
+    app.showPersonalWorkspace.value = true;
+    assert.deepEqual(Array.from(app.dashboardLayout.value, item => item.key), ['tasks', 'todo', 'correspondence', 'profile']);
+    const withPolicy = home({ ...props, home: { ...props.home, executive: { decisions: [{ url: '/policy' }] } } });
+    assert.deepEqual(Array.from(withPolicy.dashboardLayout.value, item => item.key), ['tasks', 'executive', 'correspondence', 'finance']);
+    const restricted = home({ ...props, layout: [{ key: 'tasks' }] });
+    assert.deepEqual(Array.from(restricted.dashboardLayout.value, item => item.key), ['tasks']);
 });
 
 test('personal dashboard shows only the requested blocks in the requested order', () => {
@@ -117,10 +138,6 @@ test('personal dashboard shows only the requested blocks in the requested order'
     const app = home(props);
 
     assert.deepEqual(Array.from(app.dashboardLayout.value, block => block.key), requestedBlocks);
-    assert.deepEqual(
-        Array.from(app.sections.value, section => Array.from(section.blocks, block => block.key)),
-        [requestedBlocks.slice(0, -1), ['team']],
-    );
     assert.deepEqual(Array.from(app.leadingShortcuts.value), []);
 });
 
@@ -159,7 +176,7 @@ test('summary refresh is explicit, guarded, scoped and reports unsuccessful comp
     const app = home({ layout: [], shortcuts: [], home: { stats: {}, tasks: [] }, actionCenter: [] });
     app.refreshSummary();
     const first = app.request();
-    assert.deepEqual(Array.from(first.only), ['home', 'actionCenter']);
+    assert.deepEqual(Array.from(first.only), ['home', 'actionCenter', 'departmentBudgets']);
     app.refreshSummary();
     assert.equal(app.request(), first);
     first.onFinish();

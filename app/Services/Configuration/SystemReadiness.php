@@ -4,13 +4,18 @@ declare(strict_types=1);
 
 namespace App\Services\Configuration;
 
+use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\ScopedDelegations;
 use App\Services\Workflow\AssigneeResolver;
 use App\Services\WorkflowVisibilityService;
 use Illuminate\Support\Facades\DB;
 
 /**
  * Setup gaps that stop real work, read from live data: people, departments,
- * roles that published workflows depend on, and leave balances.
+ * roles that published workflows depend on, and leave balances; and operational
+ * gaps: ended or orphaned assignments, delegations that no longer grant anything,
+ * scheduled commands failing, the audit seal check, and security settings.
  */
 final class SystemReadiness
 {
@@ -38,6 +43,20 @@ final class SystemReadiness
                 'admin.employee-profiles.index', 'ملفات الموظفين'),
             $this->check('leave_balances', 'سُجّل الرصيد الافتتاحي للإجازات لهذا العام', $this->employeesWithoutOpeningBalance(),
                 'leaves.balances', 'أرصدة الإجازات'),
+            $this->check('stale_assignments', 'لا توجد تكليفات منتهية أو في أقسام موقوفة ما تزال مسجلة', $this->staleAssignments(),
+                'admin.employees.index', 'مراجعة التكليفات'),
+            $this->check('heads_without_role', 'كل رئيس قسم معيّن يحمل دور «رئيس قسم» ساريًا في قسمه', $this->headsWithoutRole(),
+                'admin.departments.vue', 'إدارة الأقسام'),
+            $this->check('finance_assignments', 'لا توجد اختصاصات حسابات انتهت مدتها وما تزال مفعلة', $this->expiredFinanceAssignments(),
+                'finance.staff', 'صلاحيات الحسابات'),
+            $this->check('delegations', 'كل تفويض ساري ما زال صاحبه يملك الصلاحية المفوضة', $this->lapsedDelegations(),
+                'department.workspace', 'التفويضات'),
+            $this->check('scheduled_commands', 'نجح آخر تشغيل لكل مهمة مجدولة', $this->failingScheduledCommands(),
+                'admin.audit-logs.index', 'سجل النظام'),
+            $this->check('audit_seal', 'آخر تحقق من سلسلة ختم «سجل النظام» سليم', $this->auditSealProblems(),
+                'admin.audit-logs.index', 'سجل النظام'),
+            $this->check('security_settings', 'إعدادات أمان الاتصال مكتملة (HTTPS وعناوين البوابة)', $this->securitySettingGaps(),
+                null, null),
         ];
     }
 
@@ -45,7 +64,7 @@ final class SystemReadiness
      * @param  list<string>  $gaps
      * @return array{code: string, title: string, ok: bool, items: list<string>, url: ?string, action: ?string}
      */
-    private function check(string $code, string $title, array $gaps, string $routeName, string $action): array
+    private function check(string $code, string $title, array $gaps, ?string $routeName, ?string $action): array
     {
         $shown = array_slice($gaps, 0, self::NAME_LIMIT);
         if (count($gaps) > self::NAME_LIMIT) {
@@ -57,7 +76,7 @@ final class SystemReadiness
             'title' => $title,
             'ok' => $gaps === [],
             'items' => $shown,
-            'url' => route($routeName, [], false),
+            'url' => $routeName === null ? null : route($routeName, [], false),
             'action' => $action,
         ];
     }
@@ -207,12 +226,166 @@ final class SystemReadiness
             ->all();
     }
 
+    /**
+     * Assignment rows of active people that no longer grant anything: past their end date, or in a stopped or
+     * archived department (EffectiveAssignments ignores both). They still block assigning the same role again.
+     *
+     * @return list<string>
+     */
+    private function staleAssignments(): array
+    {
+        $today = now()->toDateString();
+
+        return DB::table('department_user_roles as a')
+            ->join('users as u', 'u.id', '=', 'a.user_id')
+            ->join('roles as r', 'r.id', '=', 'a.role_id')
+            ->leftJoin('departments as d', 'd.id', '=', 'a.department_id')
+            ->where('u.is_active', true)
+            ->where(fn ($query) => $query->where('a.ends_on', '<', $today)
+                ->orWhere(fn ($inner) => $inner->whereNotNull('a.department_id')->where(fn ($state) => $state->where('d.is_active', false)->orWhereNotNull('d.deleted_at'))))
+            ->orderBy('u.name')
+            ->get(['u.name', 'r.name as role', 'd.name as department', 'a.ends_on'])
+            ->map(fn (object $row): string => $row->name.' — '.$row->role.($row->department ? ' في '.$row->department : '')
+                .($row->ends_on !== null && (string) $row->ends_on < $today ? ' (انتهى في '.$row->ends_on.')' : ' (القسم موقوف أو مؤرشف)'))
+            ->all();
+    }
+
+    /**
+     * Appointed heads (departments.head_user_id) who do not hold an effective «رئيس قسم» assignment in that
+     * department: their department's requests and decisions find no head.
+     *
+     * @return list<string>
+     */
+    private function headsWithoutRole(): array
+    {
+        return DB::table('departments as d')
+            ->join('users as u', 'u.id', '=', 'd.head_user_id')
+            ->where('d.is_active', true)->whereNull('d.deleted_at')->where('u.is_active', true)
+            ->whereNotExists(fn ($query) => $query->from('department_user_roles as a')
+                ->join('roles as r', 'r.id', '=', 'a.role_id')
+                ->whereColumn('a.user_id', 'd.head_user_id')->whereColumn('a.department_id', 'd.id')
+                ->where('r.code', 'department_head')->whereRaw(EffectiveAssignments::sql('a')))
+            ->orderBy('d.name')
+            ->get(['d.name', 'u.name as head'])
+            ->map(fn (object $row): string => $row->name.' — '.$row->head.' معيّن رئيسًا دون تكليف «رئيس قسم» ساري فيه')
+            ->all();
+    }
+
+    /**
+     * Finance assignments past their end date still marked active (finance:expire-access has not ended them).
+     *
+     * @return list<string>
+     */
+    private function expiredFinanceAssignments(): array
+    {
+        return DB::table('finance_staff_assignments as f')
+            ->join('users as u', 'u.id', '=', 'f.user_id')
+            ->where('f.is_active', true)->whereNotNull('f.valid_until')->where('f.valid_until', '<', now()->toDateString())
+            ->orderBy('u.name')
+            ->get(['u.name', 'f.specialization', 'f.valid_until'])
+            ->map(fn (object $row): string => $row->name.' — '.$row->specialization.' (انتهى في '.$row->valid_until.')')
+            ->all();
+    }
+
+    /**
+     * Running delegations that grant nothing any more: the delegator is inactive or no longer holds the permission
+     * in that scope, or the institution has disabled the permission for delegation. Revoke them to keep the list true.
+     *
+     * @return list<string>
+     */
+    private function lapsedDelegations(): array
+    {
+        $delegations = app(ScopedDelegations::class);
+        $enabled = $delegations->enabledPolicy();
+        $gaps = [];
+        $rows = DB::table('scoped_delegations as s')
+            ->join('users as a', 'a.id', '=', 's.delegator_user_id')->join('users as b', 'b.id', '=', 's.delegate_user_id')
+            ->join('departments as d', 'd.id', '=', 's.scope_department_id')
+            ->where('s.status', 'active')->where('s.ends_at', '>', now())
+            ->orderBy('s.id')->get(['s.permission_code', 's.scope_department_id', 's.delegator_user_id', 'a.name as delegator', 'b.name as delegate', 'd.name as scope']);
+        foreach ($rows as $row) {
+            $delegator = User::find($row->delegator_user_id);
+            $reason = match (true) {
+                ! isset($enabled[$row->permission_code]) => 'الصلاحية لم تعد مفعلة للتفويض',
+                $delegator === null || ! $delegator->is_active => 'حساب المفوِّض موقوف',
+                ! $delegations->holdsDirectly($delegator, $row->permission_code, (int) $row->scope_department_id) => 'المفوِّض لم يعد يملك الصلاحية',
+                default => null,
+            };
+            if ($reason !== null) {
+                $gaps[] = $row->delegator.' ← '.$row->delegate.' ('.$row->permission_code.'، '.$row->scope.'): '.$reason;
+            }
+        }
+
+        return $gaps;
+    }
+
+    /**
+     * Scheduled commands (routes/console.php) whose latest run failed, from SchedulerHeartbeat.
+     *
+     * @return list<string>
+     */
+    private function failingScheduledCommands(): array
+    {
+        try {
+            $failing = SchedulerHeartbeat::failing();
+        } catch (\Throwable) {
+            return [];
+        }
+
+        return array_map(fn (array $row): string => $row['command'].' — فشل آخر '.$row['consecutive_failures'].' تشغيل (آخرها '.substr($row['last_failure_at'], 0, 16).')'
+            .($row['last_success_at'] ? '، آخر نجاح '.substr((string) $row['last_success_at'], 0, 16) : '، لم يُسجل له نجاح'), $failing);
+    }
+
+    /**
+     * A broken hash chain reported by `audit:seal --verify` and not followed by a successful verification.
+     *
+     * @return list<string>
+     */
+    private function auditSealProblems(): array
+    {
+        $broken = DB::table('audit_logs')->where('action', 'audit.chain.broken')->max('created_at');
+        if ($broken === null) {
+            return [];
+        }
+        $verified = SchedulerHeartbeat::lastSuccess('audit:seal --verify');
+        if ($verified !== null && strtotime($verified) > strtotime((string) $broken)) {
+            return [];
+        }
+
+        return ['سُجل انقطاع في سلسلة الختم بتاريخ '.substr((string) $broken, 0, 16).' ولم يتبعه تحقق سليم؛ راجع «سجل النظام».'];
+    }
+
+    /**
+     * Connection security settings, shown to the system administrator only (the readiness block is theirs).
+     *
+     * @return list<string>
+     */
+    private function securitySettingGaps(): array
+    {
+        $gaps = [];
+        if (! str_starts_with(strtolower((string) config('app.url')), 'https://')) {
+            $gaps[] = 'عنوان النظام (APP_URL) لا يستخدم HTTPS.';
+        }
+        if (config('session.secure') !== true) {
+            $gaps[] = 'ملف تعريف الجلسة يُرسل دون اشتراط HTTPS (SESSION_SECURE_COOKIE).';
+        }
+        if (blank(config('portal.host')) || blank(config('portal.staff_host'))) {
+            $gaps[] = 'لم يُحدد عنوانا بوابة المستفيدين والنظام (PORTAL_HOST / STAFF_HOST)؛ تعمل البوابة والنظام على العنوان نفسه.';
+        }
+        if (config('app.debug') === true) {
+            $gaps[] = 'وضع التصحيح (APP_DEBUG) مفعل.';
+        }
+
+        return $gaps;
+    }
+
     private function activeHolders(string $roleCode): int
     {
         return DB::table('department_user_roles as a')
             ->join('roles as r', 'r.id', '=', 'a.role_id')
             ->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('r.code', $roleCode)->where('u.is_active', true)
+            ->whereRaw(EffectiveAssignments::sql('a'))
             ->distinct()->count('u.id');
     }
 }

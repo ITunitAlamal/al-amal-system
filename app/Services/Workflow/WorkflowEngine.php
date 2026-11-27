@@ -3,9 +3,11 @@
 namespace App\Services\Workflow;
 
 use App\Models\User;
+use App\Services\AuditService;
 use App\Services\Configuration\CustomFieldEntities;
 use App\Services\Configuration\CustomFieldService;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -24,6 +26,9 @@ use RuntimeException;
 final class WorkflowEngine
 {
     public const SUBJECT_TYPE = 'aims_request';
+
+    /** Actions that send a request back to a stage it already left, undoing what was recorded since (clearRewoundPass). */
+    private const REWINDING_ACTIONS = ['return', 'reject', 'field_cancel'];
 
     /**
      * Facts about the requester that every transition condition can test, besides the request's own fields.
@@ -44,6 +49,7 @@ final class WorkflowEngine
         private readonly NotificationCenter $notifications,
         private readonly WorkflowSubjects $subjects,
         private readonly ApprovalDelegations $delegations,
+        private readonly StepAssignments $assignments,
     ) {}
 
     /**
@@ -116,13 +122,15 @@ final class WorkflowEngine
      */
     public function availableActions(object $instance, User $user): array
     {
-        if ($instance->status !== 'in_progress' || ($instance->held_at ?? null) !== null || ! $this->isCurrentAssignee((int) $instance->id, $user)) {
+        if ($instance->status !== 'in_progress' || ($instance->held_at ?? null) !== null || ! $user->is_active || ! $this->holdsAssigneeRow((int) $instance->id, $user)) {
             return [];
         }
         $currentStep = DB::table('workflow_steps')->where('id', $instance->current_step_id)->first();
-        if ($currentStep && $this->delegations->actsOnLapsedDelegation($instance, $currentStep, (int) $user->id)) {
-            // The delegation ended but the scheduled check has not run yet: hand the request back now.
-            $this->delegations->closeLapsed();
+        if (! $currentStep || ! $this->assignees->stillQualifies($currentStep, $instance, $user)) {
+            if ($currentStep && $this->delegations->actsOnLapsedDelegation($instance, $currentStep, (int) $user->id)) {
+                // The delegation ended but the scheduled check has not run yet: hand the request back now.
+                $this->delegations->closeLapsed();
+            }
 
             return [];
         }
@@ -134,13 +142,14 @@ final class WorkflowEngine
             ->where('t.from_step_id', $instance->current_step_id)
             ->where('t.is_active', true)
             ->orderBy('t.id')
-            ->get(['t.id', 't.action_code', 't.name', 't.requires_comment', 't.conditions', 's.id as step_id', 's.name as to_step_name', 's.step_type', 's.assignment_type', 's.assigned_role_code', 's.assignment_config'])
+            ->get(['t.id', 't.action_code', 't.name', 't.requires_comment', 't.conditions', 's.id as step_id', 's.code as step_code', 's.name as to_step_name', 's.step_type', 's.assignment_type', 's.assigned_role_code', 's.assignment_config'])
             // Routes that depend only on who the requester is (e.g. "send to the executive director when there is no head") are shown only when they apply.
             ->reject(fn (object $transition): bool => $this->failsOnRequester($this->decode($transition->conditions), $requesterContext))
             ->values()
             ->map(function (object $transition) use ($instance): array {
                 $needsPick = $transition->assignment_type === 'pick';
                 $step = (object) [
+                    'code' => $transition->step_code,
                     'assignment_type' => $transition->assignment_type,
                     'assigned_role_code' => $transition->assigned_role_code,
                     'assignment_config' => $transition->assignment_config,
@@ -154,8 +163,12 @@ final class WorkflowEngine
                     'has_conditions' => ! empty($this->decode($transition->conditions)),
                     'to_step_name' => $transition->to_step_name,
                     'ends_request' => $transition->step_type === 'end',
+                    // The action hands the request to its requester, who then reads what was sent with it.
+                    'to_requester' => $transition->assignment_type === 'requester',
                     'needs_pick' => $needsPick,
                     'pick_options' => $needsPick ? $this->assignees->pickOptions($step, $instance) : [],
+                    // A step the request already passed goes back to whoever handled it, unless someone else is chosen.
+                    'pick_default_id' => $needsPick ? $this->assignees->previousHolder($step, $instance) : null,
                 ];
             })
             ->all();
@@ -181,10 +194,9 @@ final class WorkflowEngine
             if ($instance->held_at !== null) {
                 throw ValidationException::withMessages(['transition' => 'المعاملة معلقة حتى '.$instance->hold_until.'؛ استأنفها أولًا ثم نفّذ الإجراء.']);
             }
-            abort_unless($actor->is_active && $this->isCurrentAssignee($instanceId, $actor), 403, 'هذه المرحلة ليست مسندة إليك.');
+            abort_unless($actor->is_active && $this->holdsAssigneeRow($instanceId, $actor), 403, 'هذه المرحلة ليست مسندة إليك.');
             $currentStep = DB::table('workflow_steps')->where('id', $instance->current_step_id)->first();
-            abort_if($this->delegations->actsOnLapsedDelegation($instance, $currentStep, (int) $actor->id), 403,
-                'انتهى التفويض الذي أُسندت به هذه المرحلة إليك؛ تعود المعاملة إلى صاحب الصلاحية الأصلي.');
+            $this->assertStillQualifies($instance, $currentStep, $actor);
 
             $transition = DB::table('workflow_transitions')
                 ->where('id', $transitionId)
@@ -200,15 +212,31 @@ final class WorkflowEngine
                 throw ValidationException::withMessages(['comment' => 'هذا الإجراء يتطلب كتابة السبب أو الملاحظة.']);
             }
 
+            $recorded = [];
             if ($instance->subject_type === self::SUBJECT_TYPE) {
                 $definitionCode = $this->definitionCode((int) $instance->workflow_version_id);
                 $definitions = $this->fields->definitions(CustomFieldEntities::AIMS_REQUEST, $definitionCode, $currentStep->code);
                 $existing = $this->fields->context(CustomFieldEntities::AIMS_REQUEST, (int) $instance->subject_id);
-                $sendsBack = in_array($transition->action_code, ['return', 'reject'], true);
-                $values = $this->fields->validate($definitions, $fieldInput, $existing, ! $sendsBack);
+                // Cancelling a field job goes back like a send-back: the step's own fields are not demanded.
+                $sendsBack = in_array($transition->action_code, ['return', 'reject', 'field_cancel'], true);
+                // A step visited again keeps what it already holds: a field that was not submitted is not wiped.
+                // A field of one action ("action_codes") records that action, so it is never carried over from
+                // an earlier pass: it must be entered with the action each time.
+                $carried = $definitions->filter(fn (object $definition): bool => $this->fields->actionCodes($definition) === [])->pluck('code')->flip()->all();
+                $fieldInput += array_filter(array_intersect_key($existing, $carried), fn ($value): bool => $value !== null);
+                // Fields tied to other actions ("action_codes") are neither validated nor saved with this one.
+                $values = $this->fields->validate($definitions, $fieldInput, $existing, ! $sendsBack, (string) $transition->action_code);
                 // Sending back must not wipe what was already entered on this step.
                 $values = $sendsBack ? array_filter($values, fn ($value): bool => $value !== null && $value !== false) : $values;
+                if (! $sendsBack) {
+                    // Document numbers given with a hand-off must match the AIMS records they name, where those exist.
+                    app(AimsRequestReferences::class)->assert($instance, $definitionCode, $values);
+                }
+                // A cancelled or sent-back pass stops being the request's current state (before this action saves its own).
+                $this->clearRewoundPass($instance, $transition, $definitionCode, $actor->id);
                 $this->fields->save(CustomFieldEntities::AIMS_REQUEST, (int) $instance->subject_id, $definitions, $values, $actor->id);
+                // A copy kept with the event, so each pass keeps its own worker, time or document number.
+                $recorded = $this->fields->actionRecord($definitions, $values, (string) $transition->action_code);
                 $conditionContext = $this->fields->conditionContext(CustomFieldEntities::AIMS_REQUEST, (int) $instance->subject_id);
             } else {
                 $conditionContext = $this->subject($instance)->conditionContext($instance);
@@ -219,8 +247,46 @@ final class WorkflowEngine
                 throw ValidationException::withMessages(['transition' => 'شروط هذا الإجراء غير متحققة بالبيانات الحالية للطلب.']);
             }
 
-            $this->move($instance, $transition, $actor->id, $comment, $pickedUserId);
+            $this->move($instance, $transition, $actor->id, $comment, $pickedUserId, $recorded);
         });
+    }
+
+    /**
+     * Sending a request back, or cancelling a field job («إلغاء التكليف الميداني»), returns it to a stage it already
+     * left. What actions recorded in their own fields since it last left that stage (metadata.fields of those
+     * events: the worker of the field job, its completion time, a document number) is no longer current: the
+     * stored values are cleared, so the page, the dashboards, conditions and indicators stop reading them. The
+     * events keep every value, and an audit row names the cleared fields; nothing recorded is rewritten.
+     */
+    private function clearRewoundPass(object $instance, object $transition, string $definitionCode, int $actorId): void
+    {
+        if (! in_array($transition->action_code, self::REWINDING_ACTIONS, true)) {
+            return;
+        }
+        $lastLeft = DB::table('workflow_events')->where('workflow_instance_id', $instance->id)
+            ->where('from_step_id', $transition->to_step_id)->whereNotNull('workflow_transition_id')->max('id');
+        if ($lastLeft === null) {
+            return; // the target was never left before: nothing is being undone
+        }
+        $events = DB::table('workflow_events')->where('workflow_instance_id', $instance->id)->where('id', '>=', $lastLeft)
+            ->whereNotNull('workflow_transition_id')->whereNotNull('metadata')->orderBy('id')->get(['id', 'metadata']);
+        $codes = [];
+        $eventIds = [];
+        foreach ($events as $event) {
+            foreach (CustomFieldService::eventFields($event->metadata) as $field) {
+                $codes[$field['code']] = true;
+                $eventIds[(int) $event->id] = true;
+            }
+        }
+        $cleared = $this->fields->clearValues(CustomFieldEntities::AIMS_REQUEST, (int) $instance->subject_id, $definitionCode, array_keys($codes), $actorId);
+        if ($cleared !== []) {
+            // Codes only: the values stay readable in the events named here, under their own visibility.
+            app(AuditService::class)->event('workflow.fields.cleared', [
+                'subject_type' => 'aims_requests', 'subject_id' => (string) $instance->subject_id, 'subject_ref' => $instance->reference_no,
+                'actor_id' => $actorId,
+                'metadata' => ['fields' => $cleared, 'action' => $transition->action_code, 'recorded_in_events' => array_keys($eventIds), 'workflow_instance_id' => (int) $instance->id],
+            ]);
+        }
     }
 
     /**
@@ -330,6 +396,9 @@ final class WorkflowEngine
             if (! $target) {
                 throw ValidationException::withMessages(['step_id' => 'اختر مرحلة من مراحل مسار هذه المعاملة.']);
             }
+            if (! in_array((int) $target->id, array_map(fn (object $step): int => $step->id, $this->reopenTargets($instance)), true)) {
+                throw ValidationException::withMessages(['step_id' => "لا تُعاد المعاملة إلى «{$target->name}»: سبقها صرف أو سند سُجل في مرحلة لاحقة، فإعادتها تكرر الصرف. اختر مرحلة بعدها أو افتح طلبًا جديدًا."]);
+            }
             $candidates = $this->assignees->candidates($target, $instance);
             if ($candidates === []) {
                 throw ValidationException::withMessages(['step_id' => "لا يوجد مستخدم مؤهل لتنفيذ مرحلة «{$target->name}»."]);
@@ -361,6 +430,39 @@ final class WorkflowEngine
     }
 
     /**
+     * The stages a completed request may be reopened at. A stage marked "reopen_locked" in its step configuration
+     * records a stock issue, a payment or a receipt (e.g. «صرف المواد», «صرف الأجرة»): once the request has left it,
+     * a reopening may only return to a stage the request reached after it, so nothing is issued or paid twice. Without
+     * locked stages every non-final stage is offered.
+     *
+     * @return list<object{id: int, name: string}>
+     */
+    public function reopenTargets(object $instance): array
+    {
+        $steps = DB::table('workflow_steps')->where('workflow_version_id', $instance->workflow_version_id)
+            ->whereIn('step_type', ['start', 'task', 'decision'])->orderBy('sort_order')->get(['id', 'name', 'assignment_config']);
+        $locked = $steps->filter(fn (object $step): bool => ($this->assignees->config($step)['reopen_locked'] ?? false) === true)
+            ->pluck('id')->map(fn ($id): int => (int) $id)->all();
+        $reachedAfter = null;
+        if ($locked !== []) {
+            $events = DB::table('workflow_events')->where('workflow_instance_id', $instance->id)
+                ->where(fn ($query) => $query->whereNotNull('workflow_transition_id')->orWhere('action', 'reopen'))
+                ->orderBy('id')->get(['from_step_id', 'to_step_id', 'workflow_transition_id']);
+            foreach ($events as $event) {
+                if ($event->workflow_transition_id !== null && in_array((int) $event->from_step_id, $locked, true)) {
+                    $reachedAfter = [];
+                }
+                if ($reachedAfter !== null && $event->to_step_id !== null) {
+                    $reachedAfter[(int) $event->to_step_id] = true;
+                }
+            }
+        }
+
+        return $steps->filter(fn (object $step): bool => $reachedAfter === null || isset($reachedAfter[(int) $step->id]))
+            ->map(fn (object $step): object => (object) ['id' => (int) $step->id, 'name' => $step->name])->values()->all();
+    }
+
+    /**
      * A generic request in progress, locked, at the expected revision, with the actor as its current holder.
      */
     private function lockedOpenRequest(int $instanceId, User $actor, int $expectedRevision): object
@@ -374,11 +476,25 @@ final class WorkflowEngine
         if ((int) $instance->revision !== $expectedRevision) {
             throw ValidationException::withMessages(['hold' => 'تم تحديث المعاملة من مستخدم آخر. أعد تحميل الصفحة ثم حاول مجددًا.']);
         }
-        abort_unless($actor->is_active && $this->isCurrentAssignee($instanceId, $actor), 403, 'هذه المرحلة ليست مسندة إليك.');
+        abort_unless($actor->is_active && $this->holdsAssigneeRow($instanceId, $actor), 403, 'هذه المرحلة ليست مسندة إليك.');
         $step = DB::table('workflow_steps')->where('id', $instance->current_step_id)->first();
-        abort_if($step && $this->delegations->actsOnLapsedDelegation($instance, $step, (int) $actor->id), 403, 'انتهى التفويض الذي أُسندت به هذه المرحلة إليك.');
+        $this->assertStillQualifies($instance, $step, $actor);
 
         return $instance;
+    }
+
+    /**
+     * The authority behind the actor's place on the step is checked again now (TRANSFORM §3.4): a holder who lost
+     * the role, the headship or the delegation is refused, and the scheduled check reroutes the request.
+     */
+    private function assertStillQualifies(object $instance, ?object $step, User $actor): void
+    {
+        if ($step && $this->assignees->stillQualifies($step, $instance, $actor)) {
+            return;
+        }
+        abort(403, $step && $this->delegations->actsOnLapsedDelegation($instance, $step, (int) $actor->id)
+            ? 'انتهى التفويض الذي أُسندت به هذه المرحلة إليك؛ تعود المعاملة إلى صاحب الصلاحية الأصلي.'
+            : 'لم تعد صاحب الصلاحية في هذه المرحلة (تغيّر دورك أو تعيينك أو رئاسة القسم)؛ ستُحال المعاملة إلى صاحب الصلاحية الحالي.');
     }
 
     /**
@@ -410,7 +526,22 @@ final class WorkflowEngine
         ]);
     }
 
+    /**
+     * Whether the user holds the request's current step now: an active assignee row and, checked again today,
+     * the authority behind it (AssigneeResolver::stillQualifies).
+     */
     public function isCurrentAssignee(int $instanceId, User $user): bool
+    {
+        if (! $user->is_active || ! $this->holdsAssigneeRow($instanceId, $user)) {
+            return false;
+        }
+        $instance = DB::table('workflow_instances')->where('id', $instanceId)->first();
+        $step = $instance ? DB::table('workflow_steps')->where('id', $instance->current_step_id)->first() : null;
+
+        return $step !== null && $this->assignees->stillQualifies($step, $instance, $user);
+    }
+
+    private function holdsAssigneeRow(int $instanceId, User $user): bool
     {
         return DB::table('workflow_participants')
             ->where('workflow_instance_id', $instanceId)
@@ -489,7 +620,7 @@ final class WorkflowEngine
         return [
             'requester_has_department_head' => $this->assignees->hasSuperiorHead((int) $instance->department_id, $requesterId),
             'requester_is_executive' => DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->where('a.user_id', $requesterId)->where('r.code', 'executive_director')->exists(),
+                ->where('a.user_id', $requesterId)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists(),
         ];
     }
 
@@ -514,7 +645,10 @@ final class WorkflowEngine
             ?? throw new RuntimeException('No workflow handler for subject type '.$instance->subject_type);
     }
 
-    private function move(object $instance, object $transition, int $actorId, ?string $comment, ?int $pickedUserId): void
+    /**
+     * @param  array<string, array{label: string, value: string, type: string}>  $recorded  what the action recorded in its own fields
+     */
+    private function move(object $instance, object $transition, int $actorId, ?string $comment, ?int $pickedUserId, array $recorded = []): void
     {
         $now = now();
         $target = DB::table('workflow_steps')->where('id', $transition->to_step_id)->first();
@@ -547,7 +681,8 @@ final class WorkflowEngine
             'assigned_to_id' => null,
             'action' => $transition->action_code,
             'comment' => $comment,
-            'metadata' => json_encode(['transition' => $transition->name, 'picked_user_id' => $pickedUserId], JSON_UNESCAPED_UNICODE),
+            'metadata' => json_encode(['transition' => $transition->name, 'picked_user_id' => $pickedUserId]
+                + ($recorded !== [] ? ['fields' => $recorded] : []), JSON_UNESCAPED_UNICODE),
             'occurred_at' => $now,
             'created_at' => $now,
         ]);
@@ -562,7 +697,7 @@ final class WorkflowEngine
                 throw ValidationException::withMessages([
                     'transition' => $target->assignment_type === 'pick'
                         ? "اختر المسؤول عن مرحلة «{$target->name}» من القائمة."
-                        : "لا يوجد مستخدم مؤهل لتنفيذ مرحلة «{$target->name}». راجع إعدادات المسار أو تعيينات الأدوار.",
+                        : "لا يوجد مستخدم مؤهل لتنفيذ مرحلة «{$target->name}»؛ يلزم: ".$this->assignees->holderNeeded($target).'. لم يُنفَّذ الإجراء.',
                 ]);
             }
             foreach ($candidates as $candidateId) {
@@ -592,6 +727,8 @@ final class WorkflowEngine
 
         $this->notifyMove($instance, $target, $actorId, $candidates ?? [], (int) $update['revision'], $update['status'] ?? null);
         $this->informRoles($instance, $target, $actorId, (int) $update['revision']);
+        // The head who supervises the step being left hears that the person holding it for them acted on it.
+        $this->assignments->stepCompleted($instance, $from, $target, $transition, $actorId, $candidates ?? [], (int) $update['revision']);
     }
 
     /**
@@ -606,7 +743,7 @@ final class WorkflowEngine
             return;
         }
         $userIds = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')
-            ->whereIn('r.code', $roles)->where('u.is_active', true)->distinct()->pluck('a.user_id')->map(fn ($id): int => (int) $id)->all();
+            ->whereIn('r.code', $roles)->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->distinct()->pluck('a.user_id')->map(fn ($id): int => (int) $id)->all();
         $workflowName = (string) DB::table('workflow_versions as v')->join('workflow_definitions as d', 'd.id', '=', 'v.workflow_definition_id')
             ->where('v.id', $instance->workflow_version_id)->value('d.name');
         $this->notifications->notifyMany(array_diff($userIds, [$actorId]), 'workflow_step_informed', [

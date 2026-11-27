@@ -7,8 +7,9 @@ import PageHeader from '../../Components/PageHeader.vue';
 import CorrespondenceFiles from '../../Components/CorrespondenceFiles.vue';
 import { useUnsavedChanges } from '../../Support/useUnsavedChanges.js';
 
-const props = defineProps({ catalog: Object, departments: Array, settings: Object, letter: Object, linkedRequests: Array, parentLetters: Array });
+const props = defineProps({ catalog: Object, departments: Array, settings: Object, letter: Object, linkedRequests: Array, parentLetters: Array, decision: Object });
 const l = props.letter;
+const d = props.decision || {};
 const idOf = (list, code) => list.find(item => item.code === code)?.id;
 const defaults = {
     type: idOf(props.catalog.types, 'memo') || props.catalog.types[0]?.id || '',
@@ -26,6 +27,8 @@ const form = useForm({
     subject: l?.subject || '', body: l?.body || '', letter_date: l?.letter_date || new Date().toLocaleDateString('en-CA'),
     due_at: l?.due_at || '', acknowledgment_required: l?.acknowledgment_required ?? false,
     workflow_instance_id: l?.workflow_instance_id || '', parent_id: l?.parent_id || '', board_reference: l?.board_reference || '',
+    // A Board decision's register data (number, date, meeting); the decision number also becomes its Board reference.
+    decision_number: d.decision_number || l?.board_reference || '', decision_date: d.decision_date || '', meeting_number: d.meeting_number || '', meeting_date: d.meeting_date || '',
     attachments: [], send: false,
 });
 useUnsavedChanges(() => form.isDirty);
@@ -35,7 +38,8 @@ const urgent = computed({
     set: value => { form.priority_value_id = value ? urgentId : defaults.priority; },
 });
 const isBoard = computed(() => props.catalog.types.find(type => String(type.id) === String(form.type_value_id))?.code === 'board_transmission');
-const advancedFields = ['type_value_id', 'classification_value_id', 'priority_value_id', 'retention_value_id', 'letter_date', 'due_at', 'acknowledgment_required', 'workflow_instance_id', 'parent_id', 'board_reference'];
+const advancedFields = ['type_value_id', 'classification_value_id', 'priority_value_id', 'retention_value_id', 'letter_date', 'due_at', 'acknowledgment_required', 'workflow_instance_id', 'parent_id', 'board_reference', 'decision_number', 'decision_date', 'meeting_number', 'meeting_date'];
+const today = new Date().toLocaleDateString('en-CA');
 const showAdvanced = ref(Boolean(l && (String(l.type_value_id) !== String(defaults.type) || String(l.classification_value_id) !== String(defaults.classification)
     || l.due_at || l.workflow_instance_id || l.parent_id || l.acknowledgment_required)));
 watch(() => form.errors, errors => { if (advancedFields.some(field => errors[field])) { showAdvanced.value = true; } });
@@ -150,9 +154,21 @@ function submit(send) {
                     <label class="text-sm">مدة الاحتفاظ
                         <select v-model="form.retention_value_id" class="field mt-1 w-full"><option v-for="item in catalog.retention" :key="item.id" :value="item.id">{{ item.name_ar }}</option></select>
                     </label>
-                    <label v-if="isBoard" class="text-sm sm:col-span-2">مرجع قرار مجلس الإدارة <span class="text-red-700" aria-hidden="true">*</span>
-                        <input v-model="form.board_reference" class="field mt-1 w-full" />
-                    </label>
+                    <template v-if="isBoard">
+                        <p class="rounded-lg border border-navy-100 bg-navy-50/60 p-3 text-sm text-slate-700 sm:col-span-2">بيانات القرار في سجل قرارات مجلس الإدارة، وتثبت عند إرساله.</p>
+                        <label class="text-sm">رقم القرار <span class="text-red-700" aria-hidden="true">*</span>
+                            <input v-model="form.decision_number" class="field mt-1 w-full" maxlength="100" />
+                        </label>
+                        <label class="text-sm">تاريخ القرار <span class="text-red-700" aria-hidden="true">*</span>
+                            <input v-model="form.decision_date" type="date" class="field mt-1 w-full" :max="today" />
+                        </label>
+                        <label class="text-sm">رقم الجلسة <span class="text-red-700" aria-hidden="true">*</span>
+                            <input v-model="form.meeting_number" class="field mt-1 w-full" maxlength="100" />
+                        </label>
+                        <label class="text-sm">تاريخ الجلسة
+                            <input v-model="form.meeting_date" type="date" class="field mt-1 w-full" :max="today" />
+                        </label>
+                    </template>
                     <label class="text-sm">تاريخ الكتاب
                         <input v-model="form.letter_date" type="date" class="field mt-1 w-full" />
                     </label>

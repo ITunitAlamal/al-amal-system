@@ -1,17 +1,22 @@
 <script setup>
 import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue';
 import axios from 'axios';
-import { useForm } from '@inertiajs/vue3';
+import { Link, useForm } from '@inertiajs/vue3';
 import { arabicLatinDigitsLocale, formatDateTime, parseDate } from '../../Support/dates.js';
+import AppIcon from '../../Components/AppIcon.vue';
 import AppLayout from '../../Layouts/AppLayout.vue';
+import AttachmentList from '../../Components/Workflow/AttachmentList.vue';
 import DynamicFields from '../../Components/DynamicFields.vue';
 import EmptyState from '../../Components/EmptyState.vue';
 import PageHeader from '../../Components/PageHeader.vue';
+import RequestAttachmentsInput from '../../Components/Workflow/RequestAttachmentsInput.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
 import StatusStepper from '../../Components/StatusStepper.vue';
+import StepAssignmentPanel from '../../Components/Workflow/StepAssignmentPanel.vue';
 
 const props = defineProps({
     publicId: { type: String, required: true },
+    assignment: { type: Object, default: null },
     referenceNo: { type: String, default: null },
     workflowName: { type: String, default: null },
     revision: { type: Number, default: 1 },
@@ -19,13 +24,25 @@ const props = defineProps({
     slaBreached: { type: Boolean, default: false },
     progress: { type: Object, default: () => ({ steps: [], summary: null }) },
     purchase: { type: Object, default: null },
+    // «طلب صيانة»: { parent, children, openUrl, followUpOptions } (MaintenanceAddenda::panel); null otherwise.
+    addenda: { type: Object, default: null },
     actions: { type: Array, default: () => [] },
     stepFields: { type: Array, default: () => [] },
+    // Stored values of the step's fields, keyed by code: a step visited again starts from what it holds.
+    stepValues: { type: Object, default: () => ({}) },
+    // { title, description } while the requester may edit a request returned to its start step.
+    requestEdit: { type: Object, default: null },
+    // The requester's own turn: 'edit' (returned for editing) or 'verify' (confirm what was done).
+    requesterStep: { type: String, default: null },
+    attachmentPolicy: { type: Object, default: null },
     fieldValues: { type: Array, default: () => [] },
     hold: { type: Object, default: null },
     canHold: { type: Boolean, default: false },
     canResume: { type: Boolean, default: false },
     reopenSteps: { type: Array, default: () => [] },
+    // { step, resolvable, needed, rolesUrl } for the executive director or the system administrator while the
+    // request waits with no qualified holder; null otherwise.
+    recovery: { type: Object, default: null },
 });
 
 const currentTimestamp = ref(Date.now());
@@ -72,32 +89,87 @@ function submitReopen() {
     if (!confirm('إعادة فتح المعاملة وإسنادها إلى المرحلة المختارة؟')) return;
     reopenForm.post(`/workflows/${props.publicId}/reopen`, { preserveScroll: true, onSuccess: () => { reopenForm.reset(); loadDetails(); } });
 }
+// «قرار فصل»: the holder of the closing stage lets the request close while a required addendum stays open.
+const separating = ref(null);
+const separationForm = useForm({ reason: '', follow_up_user_id: null });
+function openSeparation(child) {
+    separating.value = separating.value === child.publicId ? null : child.publicId;
+    separationForm.reset();
+    separationForm.clearErrors();
+}
+function submitSeparation(child) {
+    separationForm.post(`/workflows/${props.publicId}/addenda/${child.publicId}/separate`, {
+        preserveScroll: true,
+        onSuccess: () => { separating.value = null; separationForm.reset(); },
+    });
+}
+// «إعادة تحديد المسؤول»: the step's own rules choose its holder again; nobody is picked by hand.
+const rerouteForm = useForm({});
+function submitReroute() {
+    rerouteForm.post(`/workflows/${props.publicId}/reroute`, { preserveScroll: true, onFinish: () => loadDetails() });
+}
 
 const selectedAction = ref(null);
-const actionForm = useForm({ transition_id: null, revision: props.revision, comment: '', fields: {}, picked_user_id: null });
+const actionForm = useForm({
+    transition_id: null, revision: props.revision, comment: '', fields: { ...props.stepValues }, picked_user_id: null,
+    title: props.requestEdit?.title ?? '', description: props.requestEdit?.description ?? '', attachments: [],
+});
+// «إلغاء التكليف الميداني» returns the request to the stage before the field job, like a send-back.
+const isBackward = action => ['reject', 'return', 'field_cancel'].includes(action.action_code);
 const chosen = computed(() => props.actions.find(action => action.id === selectedAction.value) || null);
-const requiredStepFields = computed(() => props.stepFields.filter(field => field.required));
+// A step field may belong to some actions only (visible_when.action_codes): shown, checked and saved with them.
+const boundActions = field => field.visible_when?.action_codes || [];
+const requiredStepFields = computed(() => (chosen.value ? props.stepFields.filter(field => field.required
+    && (!boundActions(field).length || boundActions(field).includes(chosen.value.action_code))
+    // Sending back does not require the step's fields, except a field tied to that very action.
+    && (!isBackward(chosen.value) || boundActions(field).length)) : []));
 const pickedAssignee = computed(() => chosen.value?.pick_options?.find(option => option.id === actionForm.picked_user_id) || null);
 const fieldContext = computed(() => Object.fromEntries(props.fieldValues.map(item => [item.code, item.value])));
-watch(() => props.revision, value => { actionForm.revision = value; });
+// The form always starts from what the request holds now: stored step values, and the request's own data when
+// its requester may edit it.
+function syncActionForm() {
+    actionForm.fields = { ...props.stepValues };
+    actionForm.title = props.requestEdit?.title ?? '';
+    actionForm.description = props.requestEdit?.description ?? '';
+}
+watch(() => props.revision, value => { actionForm.revision = value; syncActionForm(); });
 function choose(action) {
     selectedAction.value = action.id;
     actionForm.clearErrors();
-    actionForm.picked_user_id = null;
+    // A step the request already passed goes back to whoever handled it, unless someone else is chosen.
+    actionForm.picked_user_id = action.pick_default_id ?? null;
 }
+// A returned request with one way to resend it: the editable form is open from the start.
+if (props.requestEdit && props.actions.length === 1) choose(props.actions[0]);
 function submitAction() {
     if (!chosen.value) return;
     actionForm.transition_id = chosen.value.id;
-    actionForm.post(`/workflows/${props.publicId}/act`, {
+    actionForm.transform(data => {
+        const payload = { ...data };
+        // The request's own data travels only when its requester edits a returned request.
+        if (!props.requestEdit) { delete payload.title; delete payload.description; }
+        return payload;
+    }).post(`/workflows/${props.publicId}/act`, {
         preserveScroll: true,
         onSuccess: () => {
             selectedAction.value = null;
-            actionForm.reset('comment', 'fields', 'picked_user_id');
+            actionForm.comment = '';
+            actionForm.picked_user_id = null;
+            actionForm.attachments = [];
+            syncActionForm();
             loadDetails();
         },
     });
 }
-const isBackward = action => ['reject', 'return'].includes(action.action_code);
+// Icons beside the action text (never alone): send back, refuse, close, assign to a person, approve, forward.
+const approvals = ['approve', 'accept', 'confirm', 'recommend', 'done', 'document_done', 'finish', 'received', 'paid', 'disbursed', 'provide', 'issue', 'available', 'receipt', 'completed_work'];
+function actionIcon(action) {
+    if (action.action_code === 'return' || action.action_code === 'field_cancel') return 'undo';
+    if (action.action_code === 'reject') return 'close';
+    if (action.ends_request || action.action_code === 'close') return 'circle-check';
+    if (action.needs_pick || action.action_code === 'assign' || action.action_code === 'field_assign') return 'user-plus';
+    return approvals.includes(action.action_code) ? 'check' : 'send';
+}
 
 const loading = ref(true);
 const error = ref('');
@@ -108,6 +180,13 @@ const request = computed(() => details.value?.request ?? {});
 const instance = computed(() => details.value?.instance ?? {});
 const timelineFilter = ref('all');
 const latestEvent = computed(() => timeline.value.length ? timeline.value[timeline.value.length - 1] : null);
+// The move that brought the request to its requester: its note and files are what they need to act.
+const sentToMe = computed(() => {
+    const lastMove = [...timeline.value].reverse().find(event => event.is_move);
+    return lastMove?.addressed ? lastMove : null;
+});
+// «تاريخ ووقت» is stored as «YYYY-MM-DD HH:MM»; shown like every other date-time of the page.
+const shownValue = item => (item.value === null || item.value === undefined || item.value === '' ? '—' : item.type === 'datetime' ? formatDateTime(item.value) : item.value);
 const filteredTimeline = computed(() => timeline.value.filter(event => {
     if (timelineFilter.value === 'comments') return Boolean(event.comment?.trim());
     if (timelineFilter.value === 'attachments') return Boolean(event.attachments?.length);
@@ -126,6 +205,8 @@ const actionLabels = {
     escalate: 'تصعيد', available: 'المواد متوفرة', unavailable: 'المواد غير متوفرة', request_approval: 'طلب اعتماد التكلفة',
     delegation_returned: 'إعادة بعد انتهاء التفويض', version_migrated: 'نقل إلى إصدار المسار الجديد', cancel: 'إلغاء الطلب',
     hold: 'تعليق المعاملة', resume: 'استئناف المعاملة', reopen: 'إعادة فتح المعاملة',
+    assigned: 'إسناد إلى موظف', assignment_withdrawn: 'سحب الإسناد',
+    rerouted: 'إعادة توجيه إلى صاحب الصلاحية', holder_missing: 'لا يوجد صاحب صلاحية مؤهل',
     internal: 'تنفيذ داخلي', done: 'تم التنفيذ', contract_sent: 'إرسال التكلفة والعقد', receipt: 'محضر الاستلام',
     recommend: 'موافقة مبدئية ورفع', disbursed: 'صرف السلفة', respond: 'الرد على الشكوى', report: 'رفع نتيجة المعالجة', object: 'اعتراض على الرد',
 };
@@ -190,10 +271,71 @@ onBeforeUnmount(() => {
                 <h2 id="purchase-progress-title" class="card-title mb-3">مسار الشراء في الحسابات — {{ purchase.number }}</h2>
                 <StatusStepper :steps="purchase.progress.steps" :summary="purchase.progress.summary" />
             </section>
+            <section v-if="addenda" class="card" aria-labelledby="addenda-title">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                    <h2 id="addenda-title" class="card-title">الطلبات الملحقة</h2>
+                    <Link v-if="addenda.openUrl" :href="addenda.openUrl" class="btn btn-secondary btn-sm">طلب ملحق لعمل إضافي</Link>
+                </div>
+                <p v-if="addenda.parent" class="alert-info mt-3 text-sm">
+                    هذا طلب ملحق بالطلب
+                    <Link :href="`/workflows/${addenda.parent.publicId}`" class="font-semibold underline">{{ addenda.parent.referenceNo }}</Link>
+                    — {{ addenda.parent.title }}{{ addenda.parent.required ? ' (لازم لإغلاقه)' : '' }}
+                </p>
+                <p v-if="!addenda.children.length && addenda.openUrl" class="mt-2 text-sm text-slate-500">إذا ظهر عمل إضافي أثناء التنفيذ فافتح له طلبًا ملحقًا بمراجعته وموافقاته؛ لا يتغير هذا الطلب ولا موافقاته.</p>
+                <ul v-if="addenda.children.length" class="mt-3 divide-y divide-slate-100">
+                    <li v-for="child in addenda.children" :key="child.publicId" class="space-y-2 py-3 text-sm">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <Link :href="`/workflows/${child.publicId}`" class="font-semibold text-blue-700 hover:underline">{{ child.referenceNo }}</Link>
+                            <span class="text-slate-700">{{ child.title }}</span>
+                            <StatusBadge :status="child.status" />
+                            <span v-if="child.stage" class="text-xs text-slate-500">{{ child.stage }}</span>
+                            <span v-if="child.required" class="text-xs font-semibold text-amber-700">لازم للإغلاق</span>
+                            <button v-if="child.canSeparate" type="button" class="btn btn-secondary btn-sm" @click="openSeparation(child)">قرار فصل</button>
+                        </div>
+                        <p v-if="child.separation" class="text-xs text-slate-600">
+                            فُصل عن الإغلاق {{ formatDateTime(child.separation.at) }}<template v-if="child.separation.reason">: {{ child.separation.reason }}</template>
+                            <template v-if="child.separation.followUp"> — مسؤول المتابعة: {{ child.separation.followUp }}</template>
+                            <template v-if="child.separation.by"> — بقرار {{ child.separation.by }}</template>
+                        </p>
+                        <form v-if="separating === child.publicId" class="space-y-3 rounded-xl border border-amber-200 bg-amber-50/60 p-4" @submit.prevent="submitSeparation(child)">
+                            <div>
+                                <label :for="`sep-reason-${child.publicId}`" class="field-label">سبب إغلاق الطلب الأصلي دون هذا الملحق <span class="text-red-600">*</span></label>
+                                <textarea :id="`sep-reason-${child.publicId}`" v-model="separationForm.reason" required minlength="10" maxlength="2000" rows="2" class="field" />
+                                <p v-if="separationForm.errors.reason" class="field-error">{{ separationForm.errors.reason }}</p>
+                            </div>
+                            <div>
+                                <label :for="`sep-owner-${child.publicId}`" class="field-label">مسؤول متابعة الملحق <span class="text-red-600">*</span></label>
+                                <select :id="`sep-owner-${child.publicId}`" v-model="separationForm.follow_up_user_id" required class="field">
+                                    <option :value="null" disabled>اختر</option>
+                                    <option v-for="person in addenda.followUpOptions" :key="person.id" :value="person.id">{{ person.name }}</option>
+                                </select>
+                                <p v-if="separationForm.errors.follow_up_user_id || separationForm.errors.separation" class="field-error">{{ separationForm.errors.follow_up_user_id || separationForm.errors.separation }}</p>
+                            </div>
+                            <button type="submit" class="btn btn-primary btn-sm" :disabled="separationForm.processing">تسجيل قرار الفصل</button>
+                        </form>
+                    </li>
+                </ul>
+            </section>
             <section v-if="progress.steps?.length" class="card">
                 <h2 class="card-title mb-4">مراحل الطلب</h2>
                 <StatusStepper :steps="progress.steps" :summary="progress.summary" />
                 <p v-if="progress.steps.some(step => step.state === 'upcoming')" class="mt-3 text-xs text-slate-500">المراحل الرمادية هي المسار المتوقع؛ قد يتغير حسب قرارات المعتمدين وشروط المسار. اضغط على أي مرحلة لعرض تفاصيلها.</p>
+            </section>
+            <StepAssignmentPanel v-if="assignment" :assignment="assignment" :public-id="publicId" :revision="revision" @changed="loadDetails" />
+            <section v-if="recovery" class="card border-2 border-red-200" role="status" aria-labelledby="recovery-title">
+                <h2 id="recovery-title" class="card-title">لا يوجد صاحب صلاحية مؤهل لهذه المعاملة</h2>
+                <p class="mt-2 text-sm text-slate-600">متوقفة عند «{{ recovery.step }}».</p>
+                <p v-if="recovery.resolvable" class="mt-1 text-sm text-slate-700">يوجد الآن من يحمل المرحلة وفق قواعدها؛ أعد تحديد المسؤول لإحالتها إليه.</p>
+                <p v-else class="mt-1 text-sm text-slate-700">يلزم: {{ recovery.needed }}.</p>
+                <p class="mt-1 text-xs text-slate-500">إعادة التحديد تطبّق قواعد المرحلة نفسها فقط: لا يُختار أحد يدويًا ولا يُعتمد شيء، وتُسجَّل في سجل المعاملة والتدقيق.</p>
+                <p v-if="rerouteForm.errors.reroute" class="field-error mt-2" role="alert">{{ rerouteForm.errors.reroute }}</p>
+                <div class="mt-4 flex flex-wrap gap-2">
+                    <button type="button" class="btn btn-primary" :disabled="rerouteForm.processing" @click="submitReroute">
+                        <AppIcon name="user-plus" :size="16" />
+                        {{ rerouteForm.processing ? 'جارٍ إعادة التحديد...' : 'إعادة تحديد المسؤول' }}
+                    </button>
+                    <Link v-if="recovery.rolesUrl" :href="recovery.rolesUrl" class="btn btn-secondary">إسناد الأدوار</Link>
+                </div>
             </section>
 
             <div v-if="loading" class="card animate-pulse space-y-3" role="status" aria-label="جارٍ تحميل الطلب">
@@ -219,7 +361,19 @@ onBeforeUnmount(() => {
 
                 <section v-if="actions.length" class="card border-2 border-gold-300">
                     <h2 class="card-title">الإجراء المطلوب منك</h2>
-                    <p class="mt-1 text-sm text-slate-500">اختر الإجراء ثم أكّده. لا يمكن اعتماد طلب قدّمته بنفسك.</p>
+                    <p v-if="requesterStep === 'edit'" class="mt-1 text-sm text-slate-500">أُعيد الطلب إليك: عدّل بياناته إن لزم ثم أعد إرساله. يُحفظ التعديل مع إعادة الإرسال.</p>
+                    <p v-else-if="requesterStep === 'verify'" class="mt-1 text-sm text-slate-500">تحقّق من الإنجاز، ثم أكّد أو أعد الطلب للاستكمال مع ذكر السبب.</p>
+                    <p v-else class="mt-1 text-sm text-slate-500">اختر الإجراء ثم أكّده. لا يمكن اعتماد طلب قدّمته بنفسك.</p>
+                    <!-- What was sent to the requester with the move that brought the request to them. -->
+                    <div v-if="requesterStep && sentToMe" class="mt-4 rounded-xl border border-gold-200 bg-gold-50/60 p-4">
+                        <h3 class="text-sm font-bold text-navy-800">{{ requesterStep === 'edit' ? 'سبب إعادة الطلب إليك' : 'ما أُنجز ويُطلب منك التحقق منه' }}</h3>
+                        <dl v-if="sentToMe.fields?.length" class="mt-2 grid gap-3 sm:grid-cols-2">
+                            <div v-for="field in sentToMe.fields" :key="field.code"><dt class="text-xs text-slate-500">{{ field.label }}</dt><dd class="mt-1 text-sm font-semibold">{{ shownValue(field) }}</dd></div>
+                        </dl>
+                        <p v-if="sentToMe.comment" class="mt-2 whitespace-pre-wrap text-sm leading-7 text-slate-700">{{ sentToMe.comment }}</p>
+                        <p v-else class="mt-2 text-sm text-slate-500">لم تُكتب ملاحظة مع الإحالة.</p>
+                        <AttachmentList class="mt-3" :files="sentToMe.attachments" />
+                    </div>
                     <div class="mt-4 flex flex-wrap gap-2">
                         <button
                             v-for="action in actions"
@@ -229,6 +383,7 @@ onBeforeUnmount(() => {
                             :aria-pressed="selectedAction === action.id"
                             @click="choose(action)"
                         >
+                            <AppIcon :name="actionIcon(action)" :size="16" />
                             {{ action.name }}
                         </button>
                     </div>
@@ -242,14 +397,15 @@ onBeforeUnmount(() => {
                                 </div>
                                 <div v-if="chosen.needs_pick">
                                     <dt class="text-xs text-slate-600">المسؤول عن المرحلة التالية</dt>
-                                    <dd class="mt-1 font-semibold text-navy-800">{{ pickedAssignee?.name || 'يلزم اختيار مسؤول أدناه' }}</dd>
+                                    <dd class="mt-1 font-semibold text-navy-800">{{ pickedAssignee?.name || (chosen.pick_default_id ? 'من نفّذ المرحلة سابقًا' : 'يلزم اختيار مسؤول أدناه') }}</dd>
                                 </div>
                             </dl>
                             <div class="mt-3 border-t border-blue-200 pt-3">
                                 <p class="text-xs font-semibold text-slate-700">المتطلبات قبل التأكيد</p>
                                 <ul class="mt-2 list-inside list-disc space-y-1 text-sm text-slate-700">
                                     <li v-if="chosen.requires_comment">إدخال الملاحظة أو السبب المطلوب.</li>
-                                    <li v-if="chosen.needs_pick">اختيار المسؤول عن المرحلة التالية.</li>
+                                    <li v-if="chosen.needs_pick && !chosen.pick_default_id">اختيار المسؤول عن المرحلة التالية.</li>
+                                    <li v-else-if="chosen.needs_pick">تعود المرحلة إلى من نفّذها سابقًا، ويمكنك اختيار غيره.</li>
                                     <li v-if="requiredStepFields.length">
                                         استكمال الحقول الإلزامية:
                                         <span class="font-semibold">{{ requiredStepFields.map(field => field.label).join('، ') }}</span>
@@ -259,11 +415,25 @@ onBeforeUnmount(() => {
                                 </ul>
                             </div>
                         </section>
-                        <DynamicFields v-if="stepFields.length" v-model="actionForm.fields" :fields="stepFields" :errors="actionForm.errors" :context="fieldContext" />
+                        <!-- A returned request: its requester edits it here, in the same step as the resend. -->
+                        <template v-if="requestEdit">
+                            <div>
+                                <label for="act-title" class="field-label">عنوان الطلب <span class="text-red-600">*</span></label>
+                                <input id="act-title" v-model="actionForm.title" required maxlength="200" class="field" />
+                                <p v-if="actionForm.errors.title" class="field-error">{{ actionForm.errors.title }}</p>
+                            </div>
+                            <div>
+                                <label for="act-description" class="field-label">الوصف والتفاصيل</label>
+                                <textarea id="act-description" v-model="actionForm.description" rows="4" maxlength="10000" class="field" />
+                                <p v-if="actionForm.errors.description" class="field-error">{{ actionForm.errors.description }}</p>
+                            </div>
+                        </template>
+                        <DynamicFields v-if="stepFields.length" v-model="actionForm.fields" :fields="stepFields" :errors="actionForm.errors" :context="fieldContext"
+                            :action-code="chosen.action_code" :sends-back="isBackward(chosen)" />
                         <div v-if="chosen.needs_pick">
-                            <label for="act-pick" class="field-label">المسؤول عن المرحلة التالية <span class="text-red-600">*</span></label>
-                            <select id="act-pick" v-model="actionForm.picked_user_id" required class="field">
-                                <option :value="null" disabled>اختر</option>
+                            <label for="act-pick" class="field-label">المسؤول عن المرحلة التالية <span v-if="!chosen.pick_default_id" class="text-red-600">*</span></label>
+                            <select id="act-pick" v-model="actionForm.picked_user_id" :required="!chosen.pick_default_id" class="field">
+                                <option :value="null" :disabled="!chosen.pick_default_id">{{ chosen.pick_default_id ? 'من نفّذ المرحلة سابقًا' : 'اختر' }}</option>
                                 <option v-for="option in chosen.pick_options" :key="option.id" :value="option.id">{{ option.name }}</option>
                             </select>
                             <p v-if="actionForm.errors.picked_user_id" class="field-error">{{ actionForm.errors.picked_user_id }}</p>
@@ -273,8 +443,11 @@ onBeforeUnmount(() => {
                             <textarea id="act-comment" v-model="actionForm.comment" rows="3" maxlength="5000" :required="chosen.requires_comment" class="field" />
                             <p v-if="actionForm.errors.comment" class="field-error">{{ actionForm.errors.comment }}</p>
                         </div>
+                        <RequestAttachmentsInput v-if="attachmentPolicy" v-model="actionForm.attachments" :policy="attachmentPolicy" :errors="actionForm.errors"
+                            :progress="actionForm.progress" :disabled="actionForm.processing" :shared-with-requester="chosen.to_requester && requesterStep === null" input-id="act-attachments" />
                         <div class="flex flex-wrap gap-2">
                             <button type="submit" :disabled="actionForm.processing" :class="['btn px-6 py-2.5', isBackward(chosen) ? 'bg-red-600 text-white hover:bg-red-700' : 'btn-primary']">
+                                <AppIcon :name="actionIcon(chosen)" :size="16" />
                                 {{ actionForm.processing ? 'جارٍ التنفيذ...' : `تأكيد: ${chosen.name}` }}
                             </button>
                             <button type="button" class="btn btn-secondary" @click="selectedAction = null">إلغاء</button>
@@ -333,13 +506,14 @@ onBeforeUnmount(() => {
                         <div><dt class="text-xs text-slate-500">تاريخ الإغلاق</dt><dd class="mt-1 text-sm">{{ formattedDate(instance.completed_at) }}</dd></div>
                     </dl>
                     <dl v-if="fieldValues.length" class="mt-5 grid gap-4 rounded-xl bg-navy-50/60 p-4 sm:grid-cols-2">
-                        <div v-for="item in fieldValues" :key="item.code"><dt class="text-xs text-slate-500">{{ item.label }}</dt><dd class="mt-1 text-sm font-semibold">{{ item.value ?? '—' }}</dd></div>
+                        <div v-for="item in fieldValues" :key="item.code"><dt class="text-xs text-slate-500">{{ item.label }}</dt><dd class="mt-1 text-sm font-semibold">{{ shownValue(item) }}</dd></div>
                     </dl>
-                    <div v-if="!isPublic && request.description" class="mt-5 rounded-xl bg-slate-50 p-4">
+                    <div v-if="request.description" class="mt-5 rounded-xl bg-slate-50 p-4">
                         <h3 class="mb-2 text-sm font-bold text-navy-800">وصف الطلب</h3>
                         <p class="whitespace-pre-wrap text-sm leading-7 text-slate-700">{{ request.description }}</p>
                     </div>
-                    <p v-if="isPublic" class="alert-info mt-5 text-xs">تظهر لك الحالة العامة وسجل الإحالات المسموح بعرضه. الملاحظات الداخلية والمرفقات المالية غير متاحة لمقدم الطلب.</p>
+                    <p v-if="isPublic && details.viewer_is_requester" class="alert-info mt-5 text-xs">تظهر لك حالة طلبك وسجل إحالاته، وما أُرسل إليك مباشرة من ملاحظات ومرفقات، والمرفقات التي أرفقتها أنت. الملاحظات الداخلية بين المعالجين وأسماؤهم غير معروضة.</p>
+                    <p v-else-if="isPublic" class="alert-info mt-5 text-xs">تظهر لك الحالة العامة وسجل الإحالات المسموح بعرضه. الملاحظات الداخلية والمرفقات غير متاحة في هذا العرض.</p>
                 </section>
 
                 <section class="card">
@@ -375,18 +549,15 @@ onBeforeUnmount(() => {
                                 <span class="mx-2 text-gold-500" aria-hidden="true">←</span>
                                 <span class="font-semibold text-navy-700">{{ event.to_step || '—' }}</span>
                             </p>
-                            <template v-if="!isPublic">
-                                <p v-if="event.actor_name" class="mt-2 text-xs text-slate-500">بواسطة: {{ event.actor_name }}</p>
-                                <p v-if="event.comment" class="mt-3 whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-sm">{{ event.comment }}</p>
-                                <div v-if="event.attachments?.length" class="mt-3">
-                                    <p class="mb-2 text-xs font-semibold text-slate-600">المرفقات</p>
-                                    <ul class="space-y-2">
-                                        <li v-for="file in event.attachments" :key="file.public_id" class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
-                                            {{ file.filename }} <span class="mr-2 text-xs text-slate-400">(عرض وصفي فقط)</span>
-                                        </li>
-                                    </ul>
-                                </div>
-                            </template>
+                            <!-- The server sends only what this viewer may read: names and internal notes for people who
+                                 handle the request; for its requester, the notes and files addressed to them. -->
+                            <p v-if="!isPublic && event.actor_name" class="mt-2 text-xs text-slate-500">بواسطة: {{ event.actor_name }}<span v-if="event.assigned_to_name"> · إلى: {{ event.assigned_to_name }}</span></p>
+                            <!-- What the action recorded in its own fields (worker, actual completion time, document number). -->
+                            <dl v-if="event.fields?.length" class="mt-3 grid gap-3 rounded-lg bg-navy-50/60 p-3 sm:grid-cols-2">
+                                <div v-for="field in event.fields" :key="field.code"><dt class="text-xs text-slate-500">{{ field.label }}</dt><dd class="mt-1 text-sm font-semibold">{{ shownValue(field) }}</dd></div>
+                            </dl>
+                            <p v-if="event.comment" class="mt-3 whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-sm">{{ event.comment }}</p>
+                            <AttachmentList class="mt-3" :files="event.attachments || []" />
                         </li>
                         </ol>
                     </template>

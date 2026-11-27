@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue';
-import { router } from '@inertiajs/vue3';
+import { Link, router } from '@inertiajs/vue3';
 import AppLayout from '../../Layouts/AppLayout.vue';
 import PageHeader from '../../Components/PageHeader.vue';
 import EmptyState from '../../Components/EmptyState.vue';
@@ -66,7 +66,12 @@ const tone = s => ({ complete: 'text-emerald-700', absent: 'text-red-700', incom
                         </tbody>
                     </table>
                 </div>
-                <p class="text-xs text-slate-600">لتصحيح بصمة أو تسجيل إذن: «طلب إذن» من «طلباتي»، أو تواصل مع الموارد البشرية. التأخير المحسوب بعد مهلة السماح والأذونات المعتمدة.</p>
+                <!-- The permission form lives in the employee's own file (attendance tab, «طلبات الإذن»), not in «طلباتي». -->
+                <p class="text-xs leading-6 text-slate-600">
+                    <template v-if="current.employee_id === ownId">لتقديم طلب إذن (تأخير، انصراف مبكر، خروج مؤقت): <Link href="/my/profile?tab=attendance" class="font-semibold text-blue-700 underline">افتح «ملفي الوظيفي» ← «الحضور والانصراف» ← بطاقة «طلبات الإذن»</Link>.</template>
+                    <template v-else>طلب الإذن يقدّمه الموظف نفسه من «ملفي الوظيفي» ← «الحضور والانصراف» ← بطاقة «طلبات الإذن».</template>
+                    لتصحيح بصمة تواصل مع الموارد البشرية. التأخير محسوب بعد مهلة السماح والأذونات المعتمدة.
+                </p>
             </template>
         </div>
     </AppLayout>

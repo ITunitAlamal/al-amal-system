@@ -3,6 +3,7 @@
 namespace App\Services\Audit;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Workflow\ApprovalDelegations;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
@@ -60,7 +61,11 @@ final class AuditScope
         if ($user->isSystemAdmin() || app(ApprovalDelegations::class)->isExecutive($user)) {
             return ['level' => 'all', 'departments' => []];
         }
-        $heads = DB::table('departments')->where('head_user_id', $user->id)->where('is_active', true)->whereNull('deleted_at')->pluck('id')->map(fn ($id): int => (int) $id)->all();
+        // Appointed head with an effective «رئيس قسم» assignment there; an ended appointment no longer opens the log.
+        $heads = DB::table('departments as d')->join('department_user_roles as r', fn ($join) => $join->on('r.department_id', '=', 'd.id')->where('r.user_id', $user->id))
+            ->join('roles as role', 'role.id', '=', 'r.role_id')->where('role.code', 'department_head')->whereRaw(EffectiveAssignments::sql('r'))
+            ->where('d.head_user_id', $user->id)->where('d.is_active', true)->whereNull('d.deleted_at')
+            ->distinct()->pluck('d.id')->map(fn ($id): int => (int) $id)->all();
         if ($heads === []) {
             return ['level' => 'none', 'departments' => []];
         }

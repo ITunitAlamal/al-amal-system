@@ -9,6 +9,7 @@ use App\Services\Finance\FinanceApprovalQueue;
 use App\Services\Finance\FinanceGuard;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\LeaveApproverResolver;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Rentals\RentalsDashboard;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
@@ -39,9 +40,9 @@ final class DashboardLayoutResolver
     public function templatesFor(User $user): array
     {
         $roles = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->where('a.user_id', $user->id)
-            ->distinct()->pluck('r.code')->all();
+            ->whereRaw(EffectiveAssignments::sql('a'))->distinct()->pluck('r.code')->all();
         $own = collect([$user->department_id])
-            ->merge(DB::table('department_user_roles')->where('user_id', $user->id)->whereNotNull('department_id')->pluck('department_id'))
+            ->merge(EffectiveAssignments::apply(DB::table('department_user_roles')->where('user_id', $user->id)->whereNotNull('department_id'))->pluck('department_id'))
             ->merge(DB::table('departments')->where('head_user_id', $user->id)->whereNull('deleted_at')->pluck('id'))
             ->filter()->map(fn ($id): int => (int) $id)->unique()->values()->all();
         $parents = DB::table('departments')->whereNull('deleted_at')->pluck('parent_id', 'id')->all();

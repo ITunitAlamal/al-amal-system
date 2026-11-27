@@ -3,15 +3,22 @@
 namespace App\Http\Controllers\Orphans;
 
 use App\Http\Controllers\Controller;
+use App\Services\AuditService;
+use App\Services\Configuration\GazaGeography;
+use App\Services\Finance\FinanceGuard;
+use App\Services\Orphans\Aid;
 use App\Services\Orphans\Campaigns\Campaigns;
 use App\Services\Orphans\Campaigns\NominationEngine;
+use App\Services\Orphans\Field\FieldBatches;
+use App\Services\Orphans\Field\FieldSync;
 use App\Services\Orphans\OrphanAccess;
 use App\Services\Orphans\RegistryQueries;
+use App\Services\Portal\PortalNotifier;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -36,7 +43,7 @@ final class CampaignController extends Controller
             ->paginate(25)->withQueryString();
 
         return Inertia::render('Orphans/Campaigns/Index', ['rows' => $rows, 'statuses' => Campaigns::STATUS, 'filters' => ['status' => $request->query('status')],
-            'abilities' => $this->access->abilities($user), 'importUrl' => \Illuminate\Support\Facades\Route::has('orphans.import.index') ? route('orphans.import.index', ['purpose' => 'campaign_candidates'], false) : null]);
+            'abilities' => $this->access->abilities($user), 'importUrl' => Route::has('orphans.import.index') ? route('orphans.import.index', ['purpose' => 'campaign_candidates'], false) : null]);
     }
 
     public function wizard(Request $request, ?string $publicId = null): Response
@@ -52,11 +59,13 @@ final class CampaignController extends Controller
             'quotas' => $campaign ? DB::table('campaign_quotas')->where('campaign_id', $campaign->id)->get() : [],
             'rules' => $campaign ? $this->rulesPayload(DB::table('campaign_rule_versions')->where('campaign_id', $campaign->id)->orderByDesc('version')->first()) : null,
             'run' => $run ? ['public_id' => $run->public_id, 'created_at' => $run->created_at, 'report' => $this->campaigns->report($campaign, $run)] : null,
-            'options' => ['aid_types' => $this->queries->values('relief_campaign_types'), 'governorates' => app(\App\Services\Configuration\GazaGeography::class)->children(null),
+            'options' => ['aid_types' => $this->queries->values('relief_campaign_types'), 'governorates' => app(GazaGeography::class)->children(null),
                 'classes' => $this->queries->values('orphan_classifications'), 'income_bands' => $this->queries->values('income_bands'), 'needs' => $this->queries->values('needs_levels'),
                 'warehouses' => DB::table('finance_warehouses')->where('is_active', true)->orderBy('name')->get(['id', 'name']), 'stock_items' => DB::table('finance_stock_items')->where('is_active', true)->orderBy('name')->get(['id', 'name', 'unit', 'sku']),
                 'funds' => DB::table('finance_restricted_funds')->where('is_active', true)->orderBy('name')->get(['id', 'name']), 'sponsors' => DB::table('sponsors')->where('status', 'active')->orderBy('name')->get(['id', 'name']),
-                'staff' => $this->access->staff(), 'criteria' => collect(NominationEngine::CRITERIA)->map(fn ($c, $k) => ['key' => $k, 'label' => $c[0], 'type' => $c[1]])->values()],
+                'enrollment' => $this->queries->values('enrollment_statuses'), 'tenures' => $this->queries->values('housing_tenures'), 'shelters' => $this->queries->values('shelter_types'),
+                'building_conditions' => $this->queries->values('building_conditions'), 'dimensions' => NominationEngine::DIMENSIONS,
+                'staff' => $this->access->staff(), 'criteria' => collect(NominationEngine::CRITERIA)->map(fn ($c, $k) => ['key' => $k, 'label' => $c[0], 'type' => $c[1], 'dimension' => $c[2]])->values()],
         ]);
     }
 
@@ -156,6 +165,10 @@ final class CampaignController extends Controller
                     ->selectRaw("coalesce(g.name_ar, 'غير محدد') as label, count(*) as n")->groupBy('g.name_ar')->get(),
                 'quotas' => DB::table('campaign_quotas as q')->join('master_data_values as g', 'g.id', '=', 'q.governorate_value_id')->where('q.campaign_id', $campaign->id)->get(['g.name_ar as label', 'q.quantity']),
                 'duplicates' => DB::table('campaign_duplicate_alerts')->where('campaign_id', $campaign->id)->where('status', 'open')->count(),
+                // Cleared alerts stay visible to the executive director with who cleared them and why (ORP-10).
+                'duplicate_decisions' => DB::table('campaign_duplicate_alerts as a')->leftJoin('users as u', 'u.id', '=', 'a.decided_by')
+                    ->where('a.campaign_id', $campaign->id)->where('a.status', '<>', 'open')->orderByDesc('a.id')->limit(200)
+                    ->get(['a.id', 'a.unit_key', 'a.detail', 'a.status', 'a.decision_note', 'a.decided_at', 'u.name as decided_name']),
                 'rules' => $this->rulesPayload($pending->run_id ? DB::table('campaign_rule_versions')->where('id', DB::table('campaign_runs')->where('id', $pending->run_id)->value('rule_version_id'))->first() : null)];
         }
 
@@ -163,7 +176,7 @@ final class CampaignController extends Controller
             'campaign' => [...(array) $campaign, 'targeting' => json_decode((string) $campaign->targeting, true) ?: [], 'status_label' => Campaigns::STATUS[$campaign->status],
                 'aid_type' => $campaign->aid_type_value_id ? DB::table('master_data_values')->where('id', $campaign->aid_type_value_id)->value('name_ar') : null],
             'lists' => $lists->map(fn ($l) => [...(array) $l, 'status_label' => Campaigns::LIST_STATUS[$l->status]]), 'current' => $current ? (array) $current : null, 'view' => $view, 'entries' => $entries,
-            'approval' => $approval, 'tab' => $request->query('tab', $pending && $this->access->isExecutive($user) ? 'approval' : 'list'),
+            'approval' => $approval, 'tab' => $request->query('tab', $pending && $this->access->isDesignatedExecutive($user) ? 'approval' : 'list'),
             'changes' => DB::table('campaign_change_requests as r')->join('campaign_lists as l', 'l.id', '=', 'r.proposed_list_id')->leftJoin('users as u', 'u.id', '=', 'r.requested_by')
                 ->where('r.campaign_id', $campaign->id)->orderByDesc('r.id')->get(['r.*', 'l.version', 'l.status as list_status', 'u.name as requested_name'])
                 ->map(fn ($r) => [...(array) $r, 'diff' => json_decode((string) $r->diff, true)]),
@@ -176,7 +189,7 @@ final class CampaignController extends Controller
             'duplicates' => DB::table('campaign_duplicate_alerts')->where('campaign_id', $campaign->id)->orderByDesc('id')->limit(100)->get(),
             'failureReasons' => $this->queries->values('relief_failure_reasons'), 'users' => $fullAccess ? DB::table('users')->where('is_active', true)->orderBy('name')->get(['id', 'name']) : [],
             'abilities' => [...$this->access->abilities($user), 'prepare' => $this->campaigns->canPrepare($user, $campaign), 'deliver' => $this->campaigns->canDeliver($user, $campaign),
-                'stock' => app(\App\Services\Finance\FinanceGuard::class)->allows($user, 'finance.stock.issue'), 'files' => $fullAccess],
+                'stock' => app(FinanceGuard::class)->allows($user, 'finance.stock.issue'), 'files' => $fullAccess],
         ]);
     }
 
@@ -187,12 +200,13 @@ final class CampaignController extends Controller
         abort_unless($this->campaigns->canView($request->user(), $campaign), 403);
         $c = DB::table('campaign_candidates as c')->join('campaign_runs as r', 'r.id', '=', 'c.run_id')->where('r.campaign_id', $campaign->id)->where('c.id', $candidate)->firstOrFail(['c.*', 'r.input_hash', 'r.rule_version_id']);
         $unit = array_filter(['orphan_id' => $c->orphan_id, 'household_id' => $c->household_id]);
+        $contributions = json_decode((string) $c->contributions, true) ?: [];
 
         return response()->json(['beneficiary' => $this->campaigns->entryLabel($c), 'outcome' => NominationEngine::OUTCOMES[$c->outcome], 'score' => $c->score, 'rank' => $c->rank,
-            'contributions' => json_decode((string) $c->contributions, true), 'reasons' => json_decode((string) $c->reasons, true), 'missing' => json_decode((string) $c->missing, true),
+            'contributions' => $contributions, 'dimensions' => NominationEngine::dimensionTotals($contributions), 'reasons' => json_decode((string) $c->reasons, true), 'missing' => json_decode((string) $c->missing, true),
             'snapshot' => json_decode($c->snapshot, true), 'duplicates' => json_decode((string) $c->duplicate_flags, true) ?: [],
             'rule_version' => DB::table('campaign_rule_versions')->where('id', $c->rule_version_id)->value('version'), 'input_hash' => $c->input_hash,
-            'benefits' => $unit ? \App\Services\Orphans\Aid::benefits($unit, 10) : []]);
+            'benefits' => $unit ? Aid::benefits($unit, 10) : []]);
     }
 
     public function editList(Request $request, string $publicId, string $list): RedirectResponse
@@ -211,13 +225,15 @@ final class CampaignController extends Controller
     {
         $campaign = $this->find($publicId);
         $row = DB::table('campaign_lists')->where('campaign_id', $campaign->id)->where('public_id', $list)->firstOrFail();
-        $data = $request->validate(['action' => ['required', Rule::in(['submit', 'withdraw', 'approve', 'reject'])], 'note' => 'nullable|string|max:2000', 'content_hash' => 'nullable|string|size:64']);
+        $data = $request->validate(['action' => ['required', Rule::in(['request_review', 'submit', 'withdraw', 'approve', 'reject'])], 'note' => 'nullable|string|max:2000', 'content_hash' => 'nullable|string|size:64']);
         match ($data['action']) {
+            'request_review' => $this->campaigns->requestReview($row, $data['note'] ?? null, $request->user()),
             'submit' => $this->campaigns->submit($row, $data['note'] ?? null, $request->user()),
             'withdraw' => $this->campaigns->withdraw($row, $request->user()),
             default => $this->campaigns->decide($row, $data['action'], $data['note'] ?? null, (string) ($data['content_hash'] ?? ''), $request->user()),
         };
-        $messages = ['submit' => 'رُفع الكشف للمدير التنفيذي ولم يعد قابلًا للتعديل.', 'withdraw' => 'أُعيد الكشف إلى مسودة.', 'approve' => 'اعتُمد الإصدار وأصبح مقفلًا.', 'reject' => 'رُفض الإصدار مع حفظ السبب.'];
+        $messages = ['request_review' => 'رُفع الكشف لرئيس القسم وظهر في قائمة أعماله؛ يبقى مسودة حتى يرفعه للمدير التنفيذي.',
+            'submit' => 'رُفع الكشف بتوصيتك للمدير التنفيذي ولم يعد قابلًا للتعديل.', 'withdraw' => 'أُعيد الكشف إلى مسودة.', 'approve' => 'اعتُمد الإصدار وأصبح مقفلًا.', 'reject' => 'رُفض الإصدار مع حفظ السبب.'];
 
         return back()->with('success', $messages[$data['action']]);
     }
@@ -312,7 +328,7 @@ final class CampaignController extends Controller
             DB::table('campaigns')->where('id', $campaign->id)->update($data['action'] === 'publish'
                 ? ['portal_published_at' => now(), 'portal_published_by' => $request->user()->id, 'portal_instructions' => $data['instructions'], 'updated_at' => now()]
                 : ['portal_published_at' => null, 'updated_at' => now()]);
-            app(\App\Services\AuditService::class)->recordRow('orphans.campaign.portal_'.$data['action'], 'campaigns', $campaign->id, null, ['reference' => $campaign->reference_no], $request->user()->id, $request->ip());
+            app(AuditService::class)->recordRow('orphans.campaign.portal_'.$data['action'], 'campaigns', $campaign->id, null, ['reference' => $campaign->reference_no], $request->user()->id, $request->ip());
             if ($data['action'] === 'publish') {
                 $this->notifyPublished($campaign);
             }
@@ -325,7 +341,7 @@ final class CampaignController extends Controller
     private function notifyPublished(object $campaign): void
     {
         $list = DB::table('campaign_lists')->where('campaign_id', $campaign->id)->where('status', 'approved')->orderByDesc('version')->value('id');
-        $notifier = app(\App\Services\Portal\PortalNotifier::class);
+        $notifier = app(PortalNotifier::class);
         $accounts = [];
         foreach (DB::table('campaign_list_entries')->where('list_id', $list)->where('kind', 'primary')->get(['orphan_id', 'household_id', 'guardian_id', 'recipient_guardian_id']) as $entry) {
             if ($entry->orphan_id) {
@@ -347,13 +363,34 @@ final class CampaignController extends Controller
         }
     }
 
+    /**
+     * A duplicate-aid alert (ORP-10; TRANSFORM §13, §3.4). An exception is a decision of the head (or acting head)
+     * of the department, never of the list's preparers. A preparer marks an alert «معالج» only once the beneficiary
+     * is no longer in the primary part of the open (draft or pending) list. Every decision is audited, and the
+     * executive director sees cleared alerts with their notes on the approval tab.
+     */
     public function duplicate(Request $request, string $publicId, int $alert): RedirectResponse
     {
         $campaign = $this->find($publicId);
-        abort_unless($this->campaigns->canPrepare($request->user(), $campaign), 403);
-        $data = $request->validate(['status' => ['required', Rule::in(['exception_granted', 'resolved'])], 'note' => 'required|string|max:1000'], [], ['note' => 'المبرر']);
-        DB::table('campaign_duplicate_alerts')->where('id', $alert)->where('campaign_id', $campaign->id)->where('status', 'open')->update(['status' => $data['status'], 'decision_note' => $data['note'],
-            'decided_by' => $request->user()->id, 'decided_at' => now()]);
+        $user = $request->user();
+        abort_unless($this->campaigns->canPrepare($user, $campaign) || $this->access->canDecide($user), 403);
+        $data = $request->validate(['status' => ['required', Rule::in(['exception_granted', 'resolved'])], 'note' => 'required|string|min:5|max:1000'], [], ['note' => 'المبرر']);
+        abort_if($data['status'] === 'exception_granted' && ! $this->access->canDecide($user), 403, 'الاستثناء من تنبيه التكرار قرار رئيس القسم؛ عالج التنبيه بتعديل المسودة أو ارفعه لرئيس القسم.');
+        DB::transaction(function () use ($campaign, $alert, $data, $user, $request): void {
+            $row = DB::table('campaign_duplicate_alerts')->where('id', $alert)->where('campaign_id', $campaign->id)->lockForUpdate()->first();
+            abort_unless($row, 404);
+            abort_unless($row->status === 'open', 422, 'سبق البت في هذا التنبيه.');
+            if ($data['status'] === 'resolved') {
+                $stillListed = DB::table('campaign_list_entries as e')->join('campaign_lists as l', 'l.id', '=', 'e.list_id')
+                    ->where('l.campaign_id', $campaign->id)->whereIn('l.status', ['draft', 'pending_executive'])
+                    ->where('e.kind', 'primary')->where('e.unit_key', $row->unit_key)->exists();
+                abort_if($stillListed, 422, 'المستفيد ما زال في الكشف الأساسي؛ احذفه من المسودة أو انقله للاحتياط أولًا، أو اطلب استثناءً من رئيس القسم.');
+            }
+            DB::table('campaign_duplicate_alerts')->where('id', $row->id)->update(['status' => $data['status'], 'decision_note' => trim($data['note']),
+                'decided_by' => $user->id, 'decided_at' => now()]);
+            app(AuditService::class)->recordRow('orphans.campaign.duplicate_'.$data['status'], 'campaign_duplicate_alerts', (int) $row->id,
+                ['status' => 'open'], ['status' => $data['status'], 'unit_key' => $row->unit_key, 'note' => trim($data['note']), 'campaign' => $campaign->reference_no], $user->id, $request->ip());
+        });
 
         return back()->with('success', 'سُجّل القرار على تنبيه التكرار.');
     }
@@ -362,7 +399,7 @@ final class CampaignController extends Controller
     {
         $campaign = $this->find($publicId);
         $data = $request->validate(['distributor_user_id' => 'required|integer|exists:users,id', 'device_id' => 'required|integer|exists:field_devices,id', 'governorate_value_id' => 'nullable|integer|exists:master_data_values,id']);
-        $batch = app(\App\Services\Orphans\Field\FieldBatches::class)->create($campaign, (int) $data['distributor_user_id'], (int) $data['device_id'], [], $data['governorate_value_id'] ?? null, $request->user());
+        $batch = app(FieldBatches::class)->create($campaign, (int) $data['distributor_user_id'], (int) $data['device_id'], [], $data['governorate_value_id'] ?? null, $request->user());
 
         return back()->with('success', 'أُنشئت الدفعة '.$batch->reference_no.'؛ يُنزّلها الموزع على جهازه المعتمد.');
     }
@@ -370,7 +407,7 @@ final class CampaignController extends Controller
     public function revokeBatch(Request $request, string $publicId, string $batch): RedirectResponse
     {
         $row = DB::table('campaign_batches')->where('campaign_id', $this->find($publicId)->id)->where('public_id', $batch)->firstOrFail();
-        app(\App\Services\Orphans\Field\FieldBatches::class)->revoke($row, $request->user());
+        app(FieldBatches::class)->revoke($row, $request->user());
 
         return back()->with('success', 'أُلغيت الدفعة؛ الأحداث المستلمة منها محفوظة للمراجعة.');
     }
@@ -380,7 +417,7 @@ final class CampaignController extends Controller
         $campaign = $this->find($publicId);
         abort_unless(DB::table('field_events as f')->join('campaign_batches as b', 'b.id', '=', 'f.batch_id')->where('f.id', $event)->where('b.campaign_id', $campaign->id)->exists(), 404);
         $data = $request->validate(['decision' => ['required', Rule::in(['confirm', 'reject'])], 'note' => 'required|string|min:5|max:1000']);
-        app(\App\Services\Orphans\Field\FieldSync::class)->resolve($request->user(), $event, $data['decision'] === 'confirm', $data['note'], $this->access);
+        app(FieldSync::class)->resolve($request->user(), $event, $data['decision'] === 'confirm', $data['note'], $this->access);
 
         return back()->with('success', 'سُجّل القرار على حدث الميدان.');
     }

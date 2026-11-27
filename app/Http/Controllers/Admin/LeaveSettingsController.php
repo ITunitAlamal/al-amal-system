@@ -212,37 +212,55 @@ final class LeaveSettingsController extends Controller
         return back()->with('success', 'تم حفظ إعدادات الإجازات.');
     }
 
+    /**
+     * The official calendar stays editable (TRANSFORM §8): a holiday changes a leave's counted days only when leave is
+     * counted in working days (LeaveDayCounter ignores holidays in calendar counting), so only an open or approved
+     * request that covers this very date blocks the change. A holiday that an approved or credited compensatory work
+     * day rests on is never removed silently either.
+     */
+    private function guardHolidayChange(string $date, string $field, bool $removing): void
+    {
+        $counting = DB::table('leave_module_settings')->where('id', 1)->value('counting_mode');
+        if ($counting === 'working' && DB::table('employee_leave_requests')->whereIn('status', [...LeaveSubmissionRules::OPEN_STATUSES, 'approved'])
+            ->where('start_date', '<=', $date)->where('end_date', '>=', $date)->exists()) {
+            throw ValidationException::withMessages([$field => 'توجد إجازة قيد المعالجة أو معتمدة تشمل هذا التاريخ وتُحتسب بأيام العمل؛ تغيير العطلة يغيّر أيامها، فيلزم تصحيح إداري منفصل.']);
+        }
+        if ($removing && DB::table('attendance_compensatory_work')->where('work_date', $date)->whereIn('status', ['approved', 'credited'])->exists()) {
+            throw ValidationException::withMessages([$field => 'اعتُمد عمل في هذا اليوم على أنه عطلة رسمية؛ لا تُحذف العطلة قبل معالجة العمل التعويضي المرتبط بها.']);
+        }
+    }
+
     public function addHoliday(Request $request): RedirectResponse
     {
         $this->guard($request);
-        if (DB::table('employee_leave_requests')->whereIn('status', [...LeaveSubmissionRules::OPEN_STATUSES, 'approved'])->exists()) {
-            throw ValidationException::withMessages(['holiday_date' => 'توجد طلبات قيد المعالجة أو معتمدة؛ لا يمكن تغيير التقويم دون إجراء ترحيل مستقل.']);
-        }
         $data = $request->validate(['holiday_date' => ['required', 'date_format:Y-m-d', 'unique:leave_holidays,holiday_date'], 'name_ar' => ['required', 'string', 'max:255']]);
         DB::transaction(function () use ($request, $data) {
+            DB::table('leave_module_settings')->where('id', 1)->lockForUpdate()->first();
+            $this->guardHolidayChange($data['holiday_date'], 'holiday_date', false);
             $id = DB::table('leave_holidays')->insertGetId([...$data, 'created_by' => $request->user()->id, 'created_at' => now(), 'updated_at' => now()]);
-            $this->audit($request, 'leave_holiday.added', ['id' => $id, 'date' => $data['holiday_date']]);
+            $this->audit($request, 'leave_holiday.added', ['id' => $id, 'date' => $data['holiday_date'], 'name' => $data['name_ar']]);
+            // Attendance days already calculated for that date become «عطلة رسمية».
+            app(AttendanceDailyService::class)->refreshExisting(null, $data['holiday_date'], $data['holiday_date']);
         });
 
-        return back()->with('success', 'أُضيفت العطلة.');
+        return back()->with('success', 'أُضيفت العطلة وأُعيد احتساب الحضور في ذلك اليوم.');
     }
 
     public function removeHoliday(Request $request, int $holiday): RedirectResponse
     {
         $this->guard($request);
-        // Historical counting must never be silently reinterpreted.
-        if (DB::table('employee_leave_requests')->whereIn('status', [...LeaveSubmissionRules::OPEN_STATUSES, 'approved'])->exists()) {
-            throw ValidationException::withMessages(['holiday' => 'توجد طلبات قيد المعالجة أو معتمدة؛ يلزم إجراء تصحيح إداري منفصل لتغيير التقويم.']);
-        }
         DB::transaction(function () use ($request, $holiday) {
-            $row = DB::table('leave_holidays')->where('id', $holiday)->first();
+            DB::table('leave_module_settings')->where('id', 1)->lockForUpdate()->first();
+            $row = DB::table('leave_holidays')->where('id', $holiday)->lockForUpdate()->first();
             abort_unless($row, 404);
+            // Counting already made must never be silently reinterpreted.
+            $this->guardHolidayChange((string) $row->holiday_date, 'holiday', true);
             DB::table('leave_holidays')->where('id', $holiday)->delete();
-            $this->audit($request, 'leave_holiday.removed', ['id' => $holiday, 'date' => $row->holiday_date]);
+            $this->audit($request, 'leave_holiday.removed', ['id' => $holiday, 'date' => $row->holiday_date, 'name' => $row->name_ar]);
             app(AttendanceDailyService::class)->refreshExisting(null, (string) $row->holiday_date, (string) $row->holiday_date);
         });
 
-        return back()->with('success', 'حُذفت العطلة قبل وجود طلبات نافذة.');
+        return back()->with('success', 'حُذفت العطلة وأُعيد احتساب الحضور في ذلك اليوم.');
     }
 
     private function audit(Request $r, string $action, array $metadata): void

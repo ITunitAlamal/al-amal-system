@@ -3,6 +3,7 @@
 namespace App\Services\Orphans;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -13,7 +14,8 @@ use Illuminate\Support\Facades\DB;
  *   capabilities the head grants (orphan_staff_capabilities).
  * - The head (appointed, or acting within valid dates) holds every capability.
  * - The executive director reads everything a decision needs and is the ONLY approver of campaign lists.
- * - The system admin has full technical access, audited, but never takes an executive decision.
+ * - The system admin has full technical access, audited, but never takes an executive or department decision
+ *   (canDecide / allowsDecision / isDesignatedExecutive).
  */
 final class OrphanAccess
 {
@@ -55,11 +57,41 @@ final class OrphanAccess
         });
     }
 
+    /** Holds an effective executive_director assignment (read access to decision material). */
     public function isExecutive(?User $user): bool
     {
         return $this->remember($user, 'executive', fn (User $u): bool => DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $u->id)->where('r.code', 'executive_director')
-            ->where(fn ($q) => $q->whereNull('a.ends_on')->orWhere('a.ends_on', '>=', today()->toDateString()))->exists());
+            ->where('a.user_id', $u->id)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists());
+    }
+
+    /**
+     * The original, officially designated executive director: the appointed head of EXEC who also holds an effective
+     * executive_director assignment in EXEC. No delegation, acting role or technical role passes this check.
+     */
+    public function isDesignatedExecutive(?User $user): bool
+    {
+        return $this->remember($user, 'designated_executive', fn (User $u): bool => DB::table('departments as d')
+            ->join('department_user_roles as a', fn ($j) => $j->on('a.user_id', '=', 'd.head_user_id')->on('a.department_id', '=', 'd.id'))
+            ->join('roles as r', 'r.id', '=', 'a.role_id')
+            ->where('d.code', 'EXEC')->whereNull('d.deleted_at')->where('d.head_user_id', $u->id)->where('r.code', 'executive_director')
+            ->whereRaw(EffectiveAssignments::sql('a'))->exists());
+    }
+
+    /**
+     * Institutional decisions of the department (activation, suspension, ending, assistance, reversal, guardianship
+     * approval, campaign close/correction, import commit): the effective head or acting head only. The system admin
+     * role alone never passes. The final approval of an orphan file (its activation) belongs to the head of the
+     * Orphans & Sponsorships department by the owner's decision of 2026-11-27 (decision 2): it is the approved
+     * rule, not an interim one, and it does not go to the executive director.
+     */
+    public function canDecide(?User $user): bool
+    {
+        return $user !== null && $user->is_active && $this->isHead($user);
+    }
+
+    public function assertDecide(?User $user, string $message): void
+    {
+        abort_unless($this->canDecide($user), 403, $message);
     }
 
     public function isHead(?User $user): bool
@@ -71,7 +103,7 @@ final class OrphanAccess
             }
             $today = today()->toDateString();
             $roles = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->where('a.user_id', $u->id)->where('a.department_id', $department)->get(['r.code', 'a.starts_on', 'a.ends_on']);
+                ->where('a.user_id', $u->id)->where('a.department_id', $department)->whereRaw(EffectiveAssignments::sql('a'))->get(['r.code', 'a.starts_on', 'a.ends_on']);
             $appointed = (int) DB::table('departments')->where('id', $department)->value('head_user_id') === (int) $u->id
                 && $roles->contains(fn ($row): bool => $row->code === 'department_head');
             $acting = $roles->contains(fn ($row): bool => $row->code === 'acting_department_head' && $row->starts_on && $row->ends_on
@@ -122,6 +154,30 @@ final class OrphanAccess
             return false;
         }
 
+        return $this->hasGrant($user, $capability);
+    }
+
+    /**
+     * A decision the head may grant to named staff (guardianship approval «portal», import commit «import»): the head
+     * or acting head, or department staff holding that explicit, dated grant. The system admin or executive role alone
+     * never passes (AIMS2 plan matrix §2).
+     */
+    public function allowsDecision(?User $user, string $capability): bool
+    {
+        if (! $user || ! $user->is_active || ! array_key_exists($capability, self::CAPABILITIES)) {
+            return false;
+        }
+
+        return $this->canDecide($user) || ($this->isStaff($user) && $this->hasGrant($user, $capability));
+    }
+
+    public function assertDecision(?User $user, string $capability): void
+    {
+        abort_unless($this->allowsDecision($user, $capability), 403, 'هذا القرار لرئيس القسم أو لموظف القسم الممنوح قدرة «'.(self::CAPABILITIES[$capability] ?? $capability).'»؛ لا يمر بدور مدير النظام وحده.');
+    }
+
+    private function hasGrant(User $user, string $capability): bool
+    {
         return $this->remember($user, 'cap:'.$capability, fn (User $u): bool => DB::table('orphan_staff_capabilities')->where('user_id', $u->id)
             ->where('capability', $capability)->whereNull('revoked_at')
             ->where(fn ($q) => $q->whereNull('starts_on')->orWhere('starts_on', '<=', today()->toDateString()))
@@ -196,11 +252,14 @@ final class OrphanAccess
         return User::query()->whereIn('id', $candidates)->get()->filter(fn (User $u): bool => $this->isHead($u))->map(fn (User $u): int => (int) $u->id)->values()->all();
     }
 
-    /** @return list<int> */
+    /** The designated executive director (campaign list decisions), within effective dates. @return list<int> */
     public function executiveUserIds(): array
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->pluck('a.user_id')->map(fn ($id) => (int) $id)->unique()->values()->all();
+        return DB::table('departments as d')->join('users as u', 'u.id', '=', 'd.head_user_id')
+            ->join('department_user_roles as a', fn ($j) => $j->on('a.user_id', '=', 'd.head_user_id')->on('a.department_id', '=', 'd.id'))
+            ->join('roles as r', 'r.id', '=', 'a.role_id')
+            ->where('d.code', 'EXEC')->whereNull('d.deleted_at')->where('r.code', 'executive_director')->where('u.is_active', true)
+            ->whereRaw(EffectiveAssignments::sql('a'))->pluck('u.id')->map(fn ($id) => (int) $id)->unique()->values()->all();
     }
 
     /** Logs a read of a protected record (who, what, when), never its content. */
@@ -216,6 +275,9 @@ final class OrphanAccess
         return [
             'view' => $this->canView($user), 'edit' => $this->canEdit($user), 'assign' => $this->canAssign($user),
             'settings' => $this->canManageSettings($user), 'head' => $this->isHead($user), 'executive' => $this->isExecutive($user),
+            'decide' => $this->canDecide($user), 'designated_executive' => $this->isDesignatedExecutive($user),
+            // Decisions the head may grant to named staff (guardianship approval, import commit); no admin-only path.
+            'decide_portal' => $this->allowsDecision($user, 'portal'), 'decide_import' => $this->allowsDecision($user, 'import'),
             ...array_combine(array_keys(self::CAPABILITIES), array_map(fn (string $c): bool => $this->allows($user, $c), array_keys(self::CAPABILITIES))),
         ];
     }

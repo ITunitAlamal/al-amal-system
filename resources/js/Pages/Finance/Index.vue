@@ -9,13 +9,15 @@ import StatusBadge from '../../Components/StatusBadge.vue';
 import StatusStepper from '../../Components/StatusStepper.vue';
 import AppIcon from '../../Components/AppIcon.vue';
 
-const props=defineProps({summary:Object,allowed:Array});
+const props=defineProps({summary:Object,allowed:Array,transactionKinds:{type:Array,default:()=>[]},transactionKind:String,canManageDepartmentBudgets:{type:Boolean,default:false}});
 const allowed=ref(props.allowed||[]),metadata=ref({summary:props.summary||{},lookups:{},alerts:[]});
 // One side menu. An entry appears only to holders of one of its permissions (the server enforces the same rules).
 // In the documentary cycle the server refuses the bookkeeping permissions, so the «المحاسبة» entries disappear.
 const procurement=['finance.procurement.manage','finance.procurement.review'];
-const cyclePermissions=[...procurement,'finance.procurement.director_approve','finance.procurement.board_approve','finance.purchase.receive','finance.purchase.invoice','finance.warehouse.manage','finance.stock.receive','finance.stock.issue','finance.stock.count','finance.stock.count.approve'];
-// «قسم الحسابات» in three functional areas (المشتريات، المخازن، المحاسب العام) plus the overview and the reports.
+const paymentPermissions=['finance.payment.draft','finance.payment.review','finance.payment.approve','finance.payment.execute'];
+const receiptPermissions=['finance.receipt.draft','finance.receipt.review','finance.receipt.approve','finance.receipt.execute'];
+const cyclePermissions=[...procurement,'finance.procurement.director_approve','finance.procurement.board_approve','finance.purchase.receive','finance.purchase.invoice','finance.payment.record','finance.warehouse.manage','finance.stock.receive','finance.stock.issue','finance.stock.count','finance.stock.count.approve','finance.sponsorships.record'];
+// Functional units of Accounts. Multiple assigned permissions add their sections without sharing execution rights.
 // No area inherits another's permissions: each entry lists only its own.
 const groups=[
  {title:'نظرة عامة',icon:'chart',items:[{id:'pending',name:'بانتظار إجرائي',icon:'inbox',any:cyclePermissions},{id:'overview',name:'الدورة المستندية',icon:'git-branch',any:cyclePermissions}]},
@@ -37,30 +39,39 @@ const groups=[
  {title:'المحاسب العام',icon:'wallet',items:[
   {id:'orders',name:'أوامر بانتظار الفاتورة',icon:'file-text',any:['finance.purchase.invoice'],unless:[...procurement,'finance.purchase.receive'],monitor:false},
   {id:'invoices',name:'فواتير الموردين',icon:'receipt',any:['finance.purchase.invoice','finance.procurement.review']},
-  {id:'rentals',name:'قبض الإيجارات وتسوياتها',icon:'building',any:['finance.rentals.record'],href:'/finance/rentals'},
-  {id:'transactions',name:'سندات القبض والصرف',icon:'hand-coins',any:['finance.transaction.draft']},
   {id:'treasuries',name:'الصناديق والبنوك',icon:'banknote',any:['finance.treasury.manage']},
   {id:'receivables',name:'المستحقات',icon:'list',any:['finance.receivable.manage']},
   {id:'transfers',name:'التحويلات',icon:'coins',any:['finance.transfer.execute']},
   {id:'advances',name:'العهد والسلف',icon:'wallet',any:['finance.advance.manage']},
   {id:'cheques',name:'الشيكات',icon:'file-text',any:['finance.cheque.manage']},
   {id:'reconciliations',name:'المطابقة',icon:'book-open',any:['finance.reconcile']},
-  {id:'payroll',name:'الرواتب',icon:'users',any:['finance.payroll.manage']},
-  {id:'payroll_items',name:'بنود الرواتب',icon:'list',any:['finance.payroll.manage']},
   {id:'budgets',name:'الموازنات',icon:'chart',any:['finance.budget.manage']},
   {id:'budget_exceptions',name:'استثناءات الموازنة',icon:'list',any:['finance.budget.transfer']},
   {id:'budget_transfers',name:'مناقلات الموازنة',icon:'list',any:['finance.budget.transfer']},
   {id:'funds',name:'التمويل المخصص',icon:'coins',any:['finance.fund.manage']},
   {id:'fund_movements',name:'حركات الأموال المقيدة',icon:'list',any:['finance.fund.manage']},
  ]},
- {title:'الرواتب',icon:'users',items:[{id:'payroll_runs',name:'مسير الرواتب والقسائم',icon:'users',any:['finance.payroll.record','finance.payroll.publish','finance.monitor'],href:'/finance/payroll-runs'}]},
+ {title:'الصرف',icon:'banknote',items:[
+  {id:'payments',name:'سندات الصرف',icon:'banknote',any:paymentPermissions},
+  {id:'payment_vouchers',name:'سندات الصرف على فواتير الموردين',icon:'receipt',any:['finance.payment.record']},
+ ]},
+ {title:'القبض',icon:'hand-coins',items:[
+  {id:'receipts',name:'سندات القبض',icon:'hand-coins',any:receiptPermissions},
+  {id:'rentals',name:'قبض الإيجارات وتسوياتها',icon:'building',any:['finance.rentals.record'],href:'/finance/rentals'},
+  {id:'sponsorship_receipts',name:'قبض الكفالات',icon:'hand-coins',any:['finance.sponsorships.record'],href:'/finance/sponsorships'},
+ ]},
+ {title:'الرواتب',icon:'users',items:[
+  {id:'payroll_runs',name:'مسير الرواتب والقسائم',icon:'users',any:['finance.payroll.record','finance.payroll.publish','finance.monitor'],href:'/finance/payroll-runs'},
+  {id:'payroll',name:'إعداد الرواتب',icon:'users',any:['finance.payroll.manage','finance.payroll.approve']},
+  {id:'payroll_items',name:'بنود الرواتب',icon:'list',any:['finance.payroll.manage','finance.payroll.approve']},
+ ]},
  {title:'التقارير',icon:'file-spreadsheet',items:[{id:'reports',name:'التقارير والتصدير',icon:'file-spreadsheet',any:['finance.reports.view']},{id:'archive',name:'السجل',icon:'save',any:[...procurement,'finance.purchase.invoice']}]},
- {title:'إدارة القسم',icon:'users',items:[{id:'staff',name:'موظفو القسم وصلاحياتهم',icon:'users',any:['finance.staff.assign'],href:'/finance/staff'}]},
+ {title:'إدارة القسم',icon:'users',items:[{id:'staff',name:'موظفو القسم وصلاحياتهم',icon:'users',any:['finance.staff.assign'],href:'/finance/staff'},{id:'department_budgets',name:'ميزانيات الأقسام',icon:'chart',any:[],headOnly:true,href:'/finance/department-budgets'}]},
 ];
 // The head's consolidated monitoring (finance.monitor) opens every unit's lists read-only; the server refuses any
 // change, and individual salary lines stay with payroll staff.
 const MONITOR_ITEMS=['overview','purchases','quotes','orders','suppliers','purchase_receipts','stock','items','warehouses','counts','invoices','archive'];
-const areaMeta={procurement:['المشتريات','shopping-cart'],stores:['المخازن','boxes'],accountant:['المحاسب العام','wallet'],payroll:['مسير الرواتب','users']};
+const areaMeta={procurement:['المشتريات','shopping-cart'],stores:['المخازن','boxes'],accountant:['المحاسب العام','wallet'],payments:['الصرف','banknote'],receipts:['القبض','hand-coins'],payroll:['مسير الرواتب','users']};
 const modules=groups.flatMap(g=>g.items);
 // The same field descriptors power accessible RTL forms and API validation-compatible payloads.
 const f=(key,label,type='text',opts={})=>({key,label,type,...opts});
@@ -72,9 +83,10 @@ const schemas={
  items:{url:'/finance/catalog/items',permission:'finance.warehouse.manage',fields:[f('sku','رمز الصنف'),f('name','اسم الصنف'),f('unit','وحدة القياس'),f('minimum_qty','الحد الأدنى','quantity')]},
  funds:{url:'/finance/catalog/funds',permission:'finance.fund.manage',fields:[f('name','اسم التمويل'),f('purpose','الغرض المخصص'),f('currency','العملة','lookup',{source:'currencies'})]},
  receivables:{url:'/finance/receivables',permission:'finance.receivable.manage',fields:[f('reference','رقم الاستحقاق'),f('party','الجهة المستحقة عليها'),f('currency','العملة','lookup',{source:'currencies'}),f('amount','المبلغ','money'),f('due_on','تاريخ الاستحقاق','date'),f('kind','التصنيف','enum',{choices:[['rent','إيجار'],['service','خدمة'],['donation','تبرع'],['sponsorship','كفالة'],['grant','منحة'],['other','أخرى']]}),f('description','البيان','textarea',{optional:true})]},
- transactions:{url:'/finance/transactions',permission:'finance.transaction.draft',fields:[f('kind','نوع السند','enum',{choices:[['receipt','قبض'],['payment','صرف']]}),f('treasury_id','الصندوق أو البنك','lookup',{source:'treasuries'}),f('budget_line_id','بند الموازنة','lookup',{source:'budgets',optional:true}),f('amount','المبلغ','money'),f('effective_on','تاريخ الحركة','date'),f('counterparty','المستفيد أو الدافع','text',{optional:true}),f('description','البيان','textarea',{optional:true})]},
+ payments:{url:'/finance/transactions',permission:'finance.payment.draft',kind:'payment',fields:[f('treasury_id','الصندوق أو البنك','lookup',{source:'treasuries'}),f('budget_line_id','بند الموازنة','lookup',{source:'budgets'}),f('amount','المبلغ','money'),f('effective_on','تاريخ الصرف','date'),f('counterparty','المستفيد','text',{optional:true}),f('description','البيان','textarea',{optional:true})]},
+ receipts:{url:'/finance/transactions',permission:'finance.receipt.draft',kind:'receipt',fields:[f('treasury_id','الصندوق أو البنك','lookup',{source:'treasuries'}),f('amount','المبلغ','money'),f('effective_on','تاريخ القبض','date'),f('counterparty','الدافع','text',{optional:true}),f('description','البيان','textarea',{optional:true})]},
  purchases:{url:'/finance/purchases',permission:'finance.procurement.manage',fields:[f('department_id','القسم الطالب','lookup',{source:'departments'}),f('budget_line_id','بند الموازنة','lookup',{source:'budgets'}),f('currency','العملة','lookup',{source:'currencies'}),f('purpose','سبب الطلب','textarea'),f('source_module','القسم المصدر','text',{optional:true}),f('source_id','مرجع القسم المصدر','text',{optional:true})],array:'items',arrayFields:[f('item_name','الصنف'),f('quantity','الكمية','quantity'),f('unit','الوحدة'),f('unit_price','سعر الوحدة','price')]},
- stock:{url:'/finance/stock-movements',permission:'finance.stock.receive',fields:[f('warehouse_id','المخزن','lookup',{source:'warehouses'}),f('stock_item_id','الصنف','lookup',{source:'stock_items'}),f('kind','نوع الحركة','enum',{choices:[['receipt','استلام'],['issue','صرف'],['return_in','مرتجع داخل'],['return_out','مرتجع خارج']]}),f('quantity','الكمية','quantity'),f('unit_cost','تكلفة الوحدة','price'),f('reference_type','نوع المرجع','text',{optional:true}),f('reference_id','رقم المرجع','text',{optional:true}),f('note','ملاحظات','text',{optional:true})]},
+ stock:{url:'/finance/stock-movements',permission:'finance.stock.receive',fields:[f('warehouse_id','المخزن','lookup',{source:'warehouses'}),f('stock_item_id','الصنف','lookup',{source:'stock_items'}),f('kind','نوع الحركة','enum',{choices:[['receipt','استلام'],['issue','صرف'],['return_in','مرتجع داخل'],['return_out','مرتجع خارج']]}),f('quantity','الكمية','quantity'),f('unit_cost','تكلفة الوحدة','price'),f('reference_type','مرجع الحركة','enum',{choices:[['aims_request','صرف: طلب صيانة أو شراء بانتظار المخزن (رقم الطلب)'],['assistance_request','صرف: مساعدة معتمدة لمستفيد (رقمها)'],['sponsorship','صرف: تسليم عيني من كفالة سارية (رقم الكفالة)'],['stock_movement','مرتجع داخل: حركة الصرف الأصلية (رقمها)'],['purchase_receipt','مرتجع للمورد: محضر استلام المشتريات (GRN)'],['receipt_record','استلام: محضر استلام موثق (تبرع عيني أو رصيد افتتاحي)']]}),f('reference_id','رقم المرجع'),f('note','ملاحظات','text',{optional:true})]},
  counts:{url:'/finance/stock-counts',permission:'finance.stock.count',fields:[f('warehouse_id','المخزن','lookup',{source:'warehouses'}),f('stock_item_id','الصنف','lookup',{source:'stock_items'}),f('physical_qty','الكمية الفعلية','quantity'),f('reason','سبب الجرد أو الفرق','textarea')]},
  transfers:{url:'/finance/transfers',permission:'finance.transfer.execute',fields:[f('from_id','من صندوق/بنك','lookup',{source:'treasuries'}),f('to_id','إلى صندوق/بنك','lookup',{source:'treasuries'}),f('amount','المبلغ','money'),f('reference','مرجع التحويل')]},
  budget_transfers:{url:'/finance/budgets/transfers',permission:'finance.budget.transfer',fields:[f('from_line_id','من بند','lookup',{source:'budgets'}),f('to_line_id','إلى بند','lookup',{source:'budgets'}),f('amount','المبلغ','money'),f('reason','مبرر المناقلة','textarea')]},
@@ -89,12 +101,11 @@ const schema=computed(()=>{
  const definition=schemas[active.value];
  // In the documentary cycle the budget is controlled in the external accounting software.
  if(active.value==='purchases'&&definition&&documentary.value)return {...definition,fields:definition.fields.filter(field=>field.key!=='budget_line_id')};
- if(active.value!=='transactions'||!definition)return definition;
- return {...definition,fields:definition.fields.map(field=>field.key==='budget_line_id'?{...field,optional:form.value.kind!=='payment'}:field)};
+ return definition;
 });
 const recordPage=ref({current_page:1,last_page:1,total:0});
 const can=(p)=>allowed.value.includes(p);
-const menu=computed(()=>groups.map(g=>({...g,items:g.items.filter(item=>item.monitor===false
+const menu=computed(()=>groups.map(g=>({...g,items:g.items.filter(item=>item.headOnly?props.canManageDepartmentBudgets:item.monitor===false
   ?item.any.some(can)&&!(item.unless||[]).some(can)&&!can('finance.monitor')
   :item.any.some(can)||(can('finance.monitor')&&MONITOR_ITEMS.includes(item.id)))})).filter(g=>g.items.length));
 const documentary=computed(()=>!!metadata.value.mode?.documentary);
@@ -107,19 +118,21 @@ function prefill(id,values){chosenOperation.value=id;startOperation();Object.ass
 function rowForms(r){const a=[];
  if(active.value==='orders'&&can('finance.purchase.receive')&&['issued','partial_received'].includes(r.state))a.push(['goods','استلام الأصناف',{order_id:r.id}]);
  if(active.value==='orders'&&can('finance.purchase.invoice')&&['partial_received','received'].includes(r.state))a.push(['invoice','تسجيل فاتورة المورد',{order_id:r.id}]);
- if(active.value==='invoices'&&documentary.value&&can('finance.purchase.invoice')&&r.state!=='paid')a.push(['externalVoucher','تسجيل رقم سند الصرف',{invoice_id:r.id}]);
+ if(['invoices','payment_vouchers'].includes(active.value)&&documentary.value&&can('finance.payment.record')&&r.state!=='paid')a.push(['externalVoucher','تسجيل رقم سند الصرف',{invoice_id:r.id}]);
  return a;}
 async function openPending(item){
+ if(item.module==='sponsorship_receipts'){router.visit(`/finance/sponsorships?due=${item.id}`);return;}
  const forms={receive:['goods',{order_id:item.id}],invoice:['invoice',{order_id:item.id}],voucher:['externalVoucher',{invoice_id:item.id}]};
- await openModule(item.module);
- syncUrl(item.module);
+ const module=item.kind==='voucher'?'payment_vouchers':item.module;
+ await openModule(module);
+ syncUrl(module);
  if(forms[item.kind]){prefill(...forms[item.kind]);return;}
  if(item.module==='purchases')await openPurchase(item.id);}
 const canCreate=computed(()=>schema.value&&can(schema.value.permission));
 const human={id:'الرقم',document_no:'السند',number:'رقم الطلب',name:'الاسم',title:'البند',amount:'المبلغ',total_amount:'الإجمالي',approved_amount:'المعتمد',currency:'العملة',state:'الحالة',created_at:'تاريخ الإنشاء',code:'الرمز',purpose:'الغرض',effective_on:'التاريخ',reference:'المرجع',due_on:'تاريخ الاستحقاق',period:'الفترة',kind:'النوع',quantity:'الكمية',counterparty:'الجهة',party:'الجهة',invoice_no:'الفاتورة',purchase_request_id:'طلب الشراء',order_id:'أمر الشراء'};
 const money=(v)=>v===null||v===undefined?'—':String(v);
 const fieldsFor=(r)=>Object.keys(r||{}).filter(k=>!['updated_at','source_id','metadata','password','notes','description','created_by','approved_by','reviewed_by','executed_by','director_approved_by','board_approved_by','created_at','payment_id','external_recorded_by','external_recorded_at','closure_released_amount','valuation_rate_id','budget_line_id'].includes(k)).slice(0,9);
-Object.assign(human,{external_voucher_no:'سند الصرف (البرنامج المحاسبي)',external_voucher_on:'تاريخ السند',invoice_on:'تاريخ الفاتورة',supplier_id:'المورد',department_id:'القسم',selected:'مختار',received_by:'المستلم',warehouse_id:'المخزن',stock_item_id:'الصنف',unit_cost:'تكلفة الوحدة',sku:'رمز الصنف',unit:'الوحدة',minimum_qty:'الحد الأدنى',physical_qty:'الكمية الفعلية',recorded_qty:'الكمية المسجلة',reason:'السبب',is_active:'فعال',registration_no:'رقم التسجيل',phone:'الهاتف',email:'البريد',evaluated_ils:'التقييم بالشيكل',source_module:'القسم المصدر'});
+Object.assign(human,{external_voucher_no:'سند الصرف (البرنامج المحاسبي)',external_voucher_on:'تاريخ السند',external_voucher_amount:'قيمة السند',invoice_on:'تاريخ الفاتورة',supplier_id:'المورد',department_id:'القسم',selected:'مختار',received_by:'المستلم',warehouse_id:'المخزن',stock_item_id:'الصنف',unit_cost:'تكلفة الوحدة',sku:'رمز الصنف',unit:'الوحدة',minimum_qty:'الحد الأدنى',physical_qty:'الكمية الفعلية',recorded_qty:'الكمية المسجلة',reason:'السبب',is_active:'فعال',registration_no:'رقم التسجيل',phone:'الهاتف',email:'البريد',evaluated_ils:'التقييم بالشيكل',source_module:'القسم المصدر'});
 const currentFields=computed(()=>records.value.length?fieldsFor(records.value[0]):[]);
 function blank(s){const v={};for(const x of s?.fields||[])v[x.key]=x.type==='date'?new Date().toISOString().slice(0,10):'';if(s?.array)v[s.array]=[Object.fromEntries(s.arrayFields.map(x=>[x.key,'']))];return v;}
 function startCreate(){form.value=blank(schema.value);creating.value=true;error.value='';success.value='';}
@@ -128,13 +141,13 @@ function lookupOptions(field){return (metadata.value.lookups||{})[field.source]|
 function optionValue(field,item){return field.source==='currencies'?item.code:item.id;}
 function optionText(field,item){return field.source==='currencies'?`${item.code} — ${item.name_ar}`:field.source==='employees'?`${item.employee_number} — ${item.first_name_ar} ${item.family_name_ar}`:field.source==='stock_items'?`${item.sku} — ${item.name}`:field.source==='budgets'?`${item.title} (${item.currency})`:field.source==='funds'?`${item.name} (${item.currency})`:item.name;}
 const isCatalog=(m)=>['treasuries','budgets','suppliers','warehouses','items','funds'].includes(m);
-function routeFor(m){return isCatalog(m)?`/finance/catalog/${m}`:`/finance/records/${m}`;}
+function routeFor(m){if(['payments','receipts'].includes(m))return `/finance/records/transactions?kind=${m==='payments'?'payment':'receipt'}`;if(m==='payment_vouchers')return '/finance/records/invoices';return isCatalog(m)?`/finance/catalog/${m}`:`/finance/records/${m}`;}
 async function refreshMeta(){try{const {data}=await axios.get('/finance/bootstrap');metadata.value=data;allowed.value=data.allowed||[];}catch(e){error.value=errorText(e);}}
 function errorText(e){const errors=e.response?.data?.errors;return errors?Object.values(errors).flat().join(' — '):e.response?.data?.message||'تعذر إتمام العملية';}
 async function openModule(m,pageNumber=1){active.value=m;creating.value=false;selectedPurchase.value=null;records.value=[];recordPage.value={current_page:1,last_page:1,total:0};error.value='';if(m==='overview'||m==='pending'){await loadCycle();return;}if(m==='archive'){await loadArchive(pageNumber);return;}if(m==='reports'){await loadReports();return;}busy.value=true;try{const {data}=await axios.get(routeFor(m),{params:{page:pageNumber}});if(active.value===m){records.value=data.data||[];recordPage.value={current_page:data.current_page||1,last_page:data.last_page||1,total:data.total||0};}}catch(e){error.value=errorText(e);}finally{busy.value=false;}}
-async function createRecord(){if(!schema.value)return;busy.value=true;error.value='';success.value='';try{const payload={...form.value};for(const x of schema.value.fields||[]){if(x.optional&&(payload[x.key]===''||payload[x.key]===undefined))payload[x.key]=null;}const {data}=await axios.post(schema.value.url,payload);success.value=`تم تسجيل العملية رقم ${data.id||'—'} بنجاح.`;creating.value=false;await refreshMeta();await openModule(active.value);}catch(e){error.value=errorText(e);}finally{busy.value=false;}}
+async function createRecord(){if(!schema.value)return;busy.value=true;error.value='';success.value='';try{const payload={...form.value,...(schema.value.kind?{kind:schema.value.kind}:{})};for(const x of schema.value.fields||[]){if(x.optional&&(payload[x.key]===''||payload[x.key]===undefined))payload[x.key]=null;}const {data}=await axios.post(schema.value.url,payload);success.value=`تم تسجيل العملية رقم ${data.id||'—'} بنجاح.`;creating.value=false;await refreshMeta();await openModule(active.value);}catch(e){error.value=errorText(e);}finally{busy.value=false;}}
 function actionsFor(r){let a=[];const add=(label,per,url,when)=>{if(when&&can(per))a.push({label,url});};
- if(active.value==='transactions'){add('إرسال للمراجعة','finance.transaction.draft',`/finance/transactions/${r.id}/submit`,r.state==='draft');add('مراجعة','finance.transaction.review',`/finance/transactions/${r.id}/review`,r.state==='pending_review');add('اعتماد المدير','finance.transaction.approve',`/finance/transactions/${r.id}/approve`,r.state==='pending_director');add('تنفيذ','finance.transaction.execute',`/finance/transactions/${r.id}/execute`,r.state==='approved');add('طلب عكس','finance.reversal.request',`/finance/transactions/${r.id}/reverse`,r.state==='executed');}
+ if(['payments','receipts'].includes(active.value)){const kind=active.value==='payments'?'payment':'receipt';add('إرسال للمراجعة',`finance.${kind}.draft`,`/finance/transactions/${r.id}/submit`,r.state==='draft');add('مراجعة',`finance.${kind}.review`,`/finance/transactions/${r.id}/review`,r.state==='pending_review');add('اعتماد المدير',`finance.${kind}.approve`,`/finance/transactions/${r.id}/approve`,r.state==='pending_director');add('تنفيذ',`finance.${kind}.execute`,`/finance/transactions/${r.id}/execute`,r.state==='approved');add('طلب عكس','finance.reversal.request',`/finance/transactions/${r.id}/reverse`,r.state==='executed');}
  if(active.value==='purchases'){add('إرسال','finance.procurement.manage',`/finance/purchases/${r.id}/submit`,r.state==='draft');add('رئيس الحسابات','finance.procurement.review',`/finance/purchases/${r.id}/review`,r.state==='pending_finance_head');add('المدير التنفيذي','finance.procurement.director_approve',`/finance/purchases/${r.id}/director`,r.state==='pending_director');add('أمين الصندوق/المجلس','finance.procurement.board_approve',`/finance/purchases/${r.id}/board`,r.state==='pending_board_treasurer');}
  if(active.value==='orders')add('إغلاق أمر الشراء','finance.procurement.manage',`/finance/orders/${r.id}/close`,r.state==='received');
  if(active.value==='transfers'){add('اعتماد','finance.transfer.approve',`/finance/transfers/${r.id}/approve`,r.state==='pending_approval');add('تنفيذ','finance.transfer.execute',`/finance/transfers/${r.id}/execute`,r.state==='approved');}
@@ -151,6 +164,9 @@ const linesForm=ref([]),decisionNote=ref('');
 const PURCHASE_STAGES={pending_finance_head:'finance.procurement.review',pending_director:'finance.procurement.director_approve',pending_board_treasurer:'finance.procurement.board_approve'};
 const stagePermission=computed(()=>PURCHASE_STAGES[selectedPurchase.value?.purchase?.state]||null);
 async function saveLines(){busy.value=true;error.value='';try{const id=selectedPurchase.value.purchase.id;await axios.post(`/finance/purchases/${id}/items`,{items:linesForm.value});await openPurchase(id);success.value='حُفظت البنود.';}catch(e){error.value=errorText(e);}finally{busy.value=false;}}
+const cancelReason=ref('');
+const cancellableOrder=computed(()=>{const o=selectedPurchase.value?.orders?.[0];return !o||['issued','partial_received'].includes(o.state);});
+async function cancelPurchase(){if(!confirm('تأكيد الإلغاء؟ يُحفظ السبب في سجل الطلب.'))return;await purchaseAction(`/finance/purchases/${selectedPurchase.value.purchase.id}/cancel`,{reason:cancelReason.value});cancelReason.value='';}
 async function purchaseDecision(decision){await purchaseAction(`/finance/purchases/${selectedPurchase.value.purchase.id}/decision/${decision}`,{note:decisionNote.value});}
 async function addQuote(){if(!selectedPurchase.value)return;busy.value=true;try{await axios.post(`/finance/purchases/${selectedPurchase.value.purchase.id}/quotes`,quoteForm.value);await openPurchase(selectedPurchase.value.purchase.id);success.value='تمت إضافة عرض السعر.';}catch(e){error.value=errorText(e);}finally{busy.value=false;}}
 async function purchaseAction(url,payload={}){busy.value=true;try{await axios.post(url,payload);const id=selectedPurchase.value.purchase.id;await openPurchase(id);await openModule('purchases');await openPurchase(id);success.value='تم حفظ الإجراء.';}catch(e){error.value=errorText(e);}finally{busy.value=false;}}
@@ -161,12 +177,12 @@ const operations=[
  op('stockTransfer','نقل صنف بين مخزنين','/finance/stock-transfers','finance.stock.issue',[f('from_id','المخزن المصدر','lookup',{source:'warehouses'}),f('to_id','المخزن الوجهة','lookup',{source:'warehouses'}),f('stock_item_id','الصنف','lookup',{source:'stock_items'}),f('quantity','الكمية','quantity'),f('reference','مرجع النقل')]),
  op('quote','عرض سعر لمورد','/finance/purchases/{purchase_id}/quotes','finance.procurement.manage',[f('purchase_id','رقم طلب الشراء','number'),f('supplier_id','المورد','lookup',{source:'suppliers'}),f('amount','قيمة العرض','money'),f('currency','العملة','lookup',{source:'currencies'})]),
  op('order','إصدار أمر شراء','/finance/purchases/{purchase_id}/orders','finance.procurement.manage',[f('purchase_id','رقم طلب الشراء','number')]),
- op('goods','استلام أصناف أمر شراء','/finance/orders/{order_id}/receipts','finance.purchase.receive',[f('order_id','رقم أمر الشراء','number'),f('notes','ملاحظات الاستلام','textarea',{optional:true})],'items',[f('purchase_item_id','رقم بند الشراء','number'),f('stock_item_id','الصنف','lookup',{source:'stock_items'}),f('warehouse_id','المخزن','lookup',{source:'warehouses'}),f('quantity','الكمية المستلمة','quantity'),f('unit_cost','تكلفة الوحدة','price')]),
+ op('goods','استلام أصناف أمر شراء','/finance/orders/{order_id}/receipts','finance.purchase.receive',[f('order_id','رقم أمر الشراء','number'),f('notes','ملاحظات الاستلام','textarea',{optional:true})],'items',[f('purchase_item_id','رقم بند الشراء','number'),f('stock_item_id','الصنف','lookup',{source:'stock_items'}),f('warehouse_id','المخزن','lookup',{source:'warehouses'}),f('quantity','الكمية المقبولة','quantity'),f('unit_cost','تكلفة الوحدة','price'),f('rejected_qty','الكمية المرفوضة','quantity',{optional:true}),f('rejection_reason','سبب الرفض','text',{optional:true})]),
  op('closeOrder','إغلاق أمر شراء بعد الاستلام والسداد','/finance/orders/{order_id}/close','finance.procurement.manage',[f('order_id','رقم أمر الشراء','number')]),
  op('invoice','تسجيل فاتورة شراء','/finance/orders/{order_id}/invoices','finance.purchase.invoice',[f('order_id','رقم أمر الشراء','number'),f('invoice_no','رقم الفاتورة'),f('invoice_on','تاريخ الفاتورة','date'),f('amount','قيمة الفاتورة','money')]),
- op('invoiceDraft','إنشاء سند صرف من فاتورة','/finance/invoices/{invoice_id}/payments/draft','finance.transaction.draft',[f('invoice_id','رقم الفاتورة الداخلية','number'),f('treasury_id','الصندوق/البنك','lookup',{source:'treasuries'}),f('amount','الدفعة','money'),f('effective_on','تاريخ الصرف','date')]),
+ op('invoiceDraft','إنشاء سند صرف من فاتورة','/finance/invoices/{invoice_id}/payments/draft','finance.payment.draft',[f('invoice_id','رقم الفاتورة الداخلية','number'),f('treasury_id','الصندوق/البنك','lookup',{source:'treasuries'}),f('amount','الدفعة','money'),f('effective_on','تاريخ الصرف','date')]),
  op('invoicePay','ربط فاتورة بسند صرف','/finance/invoices/{invoice_id}/payments','finance.purchase.invoice',[f('invoice_id','رقم الفاتورة الداخلية','number'),f('transaction_id','رقم سند الصرف المنفذ','number')]),
- op('allocation','تخصيص سند قبض لمستحقات','/finance/receipts/{receipt_id}/allocations','finance.transaction.execute',[f('receipt_id','رقم سند القبض المنفذ','number')],'allocations',[f('module','المصدر','enum',{choices:[['finance','مستحق مالي داخلي']]}),f('reference','رقم المستحق','number'),f('amount','قيمة التخصيص','money')]),
+ op('allocation','تخصيص سند قبض لمستحقات','/finance/receipts/{receipt_id}/allocations','finance.receipt.execute',[f('receipt_id','رقم سند القبض المنفذ','number')],'allocations',[f('module','المصدر','enum',{choices:[['finance','مستحق مالي داخلي']]}),f('reference','رقم المستحق','number'),f('amount','قيمة التخصيص','money')]),
  op('advanceDisburse','ربط صرف السلفة بسند','/finance/advances/{advance_id}/disburse','finance.advance.manage',[f('advance_id','رقم السلفة','number'),f('transaction_id','سند الصرف المنفذ','number')]),
  op('advanceSettlement','تسوية سلفة','/finance/advances/{advance_id}/settlements','finance.advance.manage',[f('advance_id','رقم السلفة','number'),f('kind','نوع التسوية','enum',{choices:[['expense','نفقة موثقة'],['refund','استرداد']]}),f('amount','المبلغ','money'),f('reference','المرجع الداعم'),f('transaction_id','سند القبض للاسترداد','number',{optional:true})]),
  op('fundMovement','حركة تمويل مخصص','/finance/funds/{fund_id}/movements','finance.fund.manage',[f('fund_id','رقم التمويل','lookup',{source:'funds'}),f('kind','نوع الحركة','enum',{choices:[['receive','استلام تمويل'],['commit','التزام'],['release','تحرير التزام'],['spend','صرف من التخصيص']]}),f('amount','المبلغ','money'),f('reference','رقم المرجع'),f('reason','السبب','textarea',{optional:true})]),
@@ -175,7 +191,7 @@ const operations=[
  op('resolve','تسوية فرق المطابقة','/finance/reconciliations/{reconciliation_id}/resolve','finance.reconcile',[f('reconciliation_id','رقم المطابقة','number'),f('reference','المرجع'),f('reason','سبب التسوية','textarea')]),
  op('quotePolicy','سياسة عروض الأسعار','/finance/purchase-rules','finance.procurement.policy',[f('min_quotes','الحد الأدنى لعروض الأسعار','number'),f('decision_reference','مرجع قرار الإدارة')]),
  op('valuation','تقييم شراء بعملة أجنبية بالشيكل','/finance/purchases/{purchase_id}/valuation','finance.procurement.manage',[f('purchase_id','رقم طلب الشراء','number'),f('rate_id','رقم سعر الصرف المعتمد','number')]),
- op('externalVoucher','تسجيل رقم سند الصرف من البرنامج المحاسبي على فاتورة مورد','/finance/invoices/{invoice_id}/external-voucher','finance.purchase.invoice',[f('invoice_id','رقم الفاتورة الداخلية','number'),f('voucher_no','رقم سند الصرف'),f('voucher_on','تاريخ السند','date')]),
+ op('externalVoucher','تسجيل رقم سند الصرف من البرنامج المحاسبي على فاتورة مورد','/finance/invoices/{invoice_id}/external-voucher','finance.payment.record',[f('invoice_id','رقم الفاتورة الداخلية','number'),f('voucher_no','رقم سند الصرف'),f('voucher_on','تاريخ السند','date'),f('amount','قيمة السند بعملة الفاتورة','money')]),
 ];
 // Bookkeeping operations disappear in the documentary cycle; the external voucher exists only there.
 const bookkeepingOperations=['invoiceDraft','invoicePay','allocation','advanceDisburse','advanceSettlement','fundMovement','payrollPay','chequeStatus','resolve','budgetException'];
@@ -197,18 +213,18 @@ async function runReport(page=1){if(!reportKey.value)return;busy.value=true;repo
 // An export can be refused after the page loaded (revoked permission, too many rows): check before leaving the page.
 async function exportReport(format){reportError.value='';try{const url=exportUrl(format);if(format==='pdf'||format==='print'){window.open(url,'_blank','noopener');return;}const response=await fetch(url,{credentials:'same-origin'});if(!response.ok){reportError.value=response.status===403?'لا تملك صلاحية تصدير هذا التقرير.':response.status===422?(await response.json().catch(()=>({}))).message||'تعذر التصدير':'تعذر التصدير';return;}const blob=await response.blob();const name=(response.headers.get('content-disposition')||'').match(/filename="?([^";]+)"?/)?.[1]||`AIMS_${reportKey.value}.${format}`;const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=name;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),2000);}catch(e){reportError.value='تعذر التصدير، تحقق من الاتصال.';}}
 // Department overview: the document-cycle stages grouped by functional area.
-const stageAreas=computed(()=>['procurement','stores','accountant'].map(code=>({code,name:areaMeta[code][0],icon:areaMeta[code][1],stages:(cycle.value.stages||[]).filter(s=>s.area===code)})).filter(a=>a.stages.length).map(a=>({...a,open:a.stages.reduce((n,s)=>n+Number(s.count||0),0)})));
+const stageAreas=computed(()=>['procurement','stores','accountant','payments','receipts'].map(code=>({code,name:areaMeta[code][0],icon:areaMeta[code][1],stages:(cycle.value.stages||[]).filter(s=>s.area===code)})).filter(a=>a.stages.length).map(a=>({...a,open:a.stages.reduce((n,s)=>n+Number(s.count||0),0)})));
 const closedStage=computed(()=>(cycle.value.stages||[]).find(s=>s.area==='archive'));
 // Each section has its own address (/finance?view=orders): the one global sidebar links to it, and bookmarks and
 // the browser history work. Switching sections updates the address without reloading the page.
 const inertiaPage=usePage();
-const viewFromUrl=()=>new URLSearchParams(String(inertiaPage.url).split('?')[1]||'').get('view');
+const viewFromUrl=()=>{const query=new URLSearchParams(String(inertiaPage.url).split('?')[1]||'');const view=query.get('view');if(view==='transactions')return (query.get('kind')||props.transactionKind||props.transactionKinds[0])==='receipt'?'receipts':'payments';if(view==='payments'&&can('finance.payment.record')&&!paymentPermissions.some(can))return 'payment_vouchers';return view;};
 const pageSections=computed(()=>menu.value.flatMap(g=>g.items).filter(m=>!m.href).map(m=>m.id));
 const activeGroup=computed(()=>menu.value.find(g=>g.items.some(m=>m.id===active.value))||null);
 function syncUrl(id){if(viewFromUrl()!==id)router.replace({url:`/finance?view=${encodeURIComponent(id)}`,preserveScroll:true,preserveState:true});}
 async function go(m){if(!m)return;if(m.href){router.visit(m.href);return;}if(m.id!==active.value)await openModule(m.id);syncUrl(m.id);}
 watch(()=>inertiaPage.url,()=>{const view=viewFromUrl();if(view&&view!==active.value&&pageSections.value.includes(view))openModule(view);});
-onMounted(async()=>{await refreshMeta();const requested=viewFromUrl();const first=pageSections.value.includes(requested)?requested:(pageSections.value[0]||'reports');await openModule(first);if(pageSections.value.includes(first))syncUrl(first);});
+onMounted(async()=>{await refreshMeta();const requested=viewFromUrl();const first=pageSections.value.includes(requested)?requested:pageSections.value[0];if(!first){const destination=menu.value.flatMap(g=>g.items).find(m=>m.href);if(destination)router.visit(destination.href);return;}await openModule(first);syncUrl(first);});
 
 // Arabic labels and tones for the state codes the finance services write.
 const stateLabels={draft:['مسودة','warning'],pending:['بانتظار الاعتماد','info'],pending_review:['بانتظار المراجعة','info'],pending_approval:['بانتظار الاعتماد','info'],pending_director:['بانتظار المدير التنفيذي','info'],pending_finance_head:['بانتظار رئيس الحسابات','info'],pending_board_treasurer:['بانتظار أمين الصندوق','info'],approved:['معتمد','success'],executed:['منفّذ','success'],closed:['مغلق','muted'],disbursed:['مصروف','success'],issued:['صادر','success'],matched:['مطابق','success'],paid:['مدفوع','success'],received:['مستلم','success'],settled:['مسوّى','success'],reversed:['معكوس','muted'],rejected:['مرفوض','danger'],cancelled:['ملغى','muted'],cleared:['محصّل','success'],returned:['مرتجع','danger'],ordered:['صدر أمر الشراء','success']};
@@ -223,7 +239,7 @@ const supplierName=(id)=>(metadata.value.lookups?.suppliers||[]).find(s=>Number(
  <div class="space-y-5">
   <PageHeader eyebrow="قسم الحسابات" :title="documentary?'الدورة المستندية للحسابات':'الحسابات والعمليات المالية'"
    :description="documentary?`من طلب الشراء حتى فاتورة المورد ورقم سند الصرف. القيود والصناديق والموازنات تُدار في ${externalSystem}. تظهر لك الأقسام والإجراءات حسب صلاحيتك فقط.`:'المعاملات والالتزامات والمشتريات والمخزون، وتظهر لك الإجراءات حسب اختصاصك فقط.'" />
-  <!-- Contextual sections of this page only; the application keeps one sidebar, where the same sections are listed under «الحسابات». -->
+  <!-- Each employee sees their assigned Accounts units; several assignments may be held together. -->
   <nav v-if="menu.length" aria-label="أقسام الحسابات" class="card space-y-3 p-3">
    <div class="flex flex-wrap gap-2">
     <button v-for="group in menu" :key="group.title" type="button" @click="go(group.items[0])" :aria-current="activeGroup?.title===group.title?'true':undefined"
@@ -448,6 +464,14 @@ const supplierName=(id)=>(metadata.value.lookups?.suppliers||[]).find(s=>Number(
       <div class="flex flex-wrap gap-2"><button type="button" class="btn btn-secondary btn-sm" :disabled="busy||decisionNote.trim().length<5" @click="purchaseDecision('return')">إعادة للمشتريات</button>
        <button type="button" class="btn btn-danger btn-sm" :disabled="busy||decisionNote.trim().length<5" @click="purchaseDecision('reject')">رفض الطلب</button></div>
      </div>
+     <p v-if="selectedPurchase.purchase.cancellation_reason" class="alert-warning text-sm">سبب الإلغاء: {{selectedPurchase.purchase.cancellation_reason}}</p>
+     <p v-else-if="selectedPurchase.orders?.[0]?.cancellation_reason" class="alert-warning text-sm">أُلغي المتبقي غير المورَّد من أمر الشراء: {{selectedPurchase.orders[0].cancellation_reason}}</p>
+     <div v-if="can('finance.procurement.director_approve')&&selectedPurchase.purchase.state==='approved'&&cancellableOrder" class="space-y-2 rounded-xl border border-red-200 p-4">
+      <h3 class="text-sm font-bold text-navy-800">{{selectedPurchase.orders?.[0]?.state==='partial_received'?'إلغاء المتبقي غير المورَّد من أمر الشراء':'إلغاء طلب الشراء المعتمد'}}</h3>
+      <p class="text-xs text-slate-600">{{selectedPurchase.orders?.[0]?.state==='partial_received'?'يُحتسب الأمر مستلمًا بما ورد فعلًا، ثم يُفوتر ويُغلق عليه.':'يُلغى الطلب وأمر الشراء الصادر له (إن وجد) ما دام لم يُستلم منه شيء.'}}</p>
+      <label class="block"><span class="field-label">سبب الإلغاء (إلزامي)</span><input v-model="cancelReason" class="field" maxlength="2000" /></label>
+      <button type="button" class="btn btn-danger btn-sm" :disabled="busy||cancelReason.trim().length<10" @click="cancelPurchase">تأكيد الإلغاء</button>
+     </div>
      <div><h3 class="mb-2 text-sm font-bold text-navy-800">عروض الموردين</h3>
       <p v-if="!selectedPurchase.quotes?.length" class="text-sm text-slate-500">لم تُسجل عروض بعد.</p>
       <div v-for="q in selectedPurchase.quotes" :key="q.id" class="flex items-center justify-between gap-2 border-b border-slate-100 py-2 text-sm">
@@ -482,9 +506,9 @@ const supplierName=(id)=>(metadata.value.lookups?.suppliers||[]).find(s=>Number(
        <div class="flex justify-between"><h3 class="text-sm font-bold text-navy-800">البنود</h3><button type="button" @click="operationForm[operation.array].push(Object.fromEntries(operation.arrayFields.map(x=>[x.key,''])))" class="btn btn-secondary btn-sm">+ بند</button></div>
        <div v-for="(line,index) in operationForm[operation.array]" :key="index" class="grid gap-2 rounded-lg bg-slate-50 p-3 sm:grid-cols-3">
         <label v-for="field in operation.arrayFields" :key="field.key" class="text-xs"><span class="mb-1 block font-semibold text-slate-600">{{field.label}}</span>
-         <select v-if="field.type==='lookup'" v-model="line[field.key]" required class="field"><option value="">اختر</option><option v-for="item in lookupOptions(field)" :key="optionValue(field,item)" :value="optionValue(field,item)">{{optionText(field,item)}}</option></select>
+         <select v-if="field.type==='lookup'" v-model="line[field.key]" :required="!field.optional" class="field"><option value="">اختر</option><option v-for="item in lookupOptions(field)" :key="optionValue(field,item)" :value="optionValue(field,item)">{{optionText(field,item)}}</option></select>
          <select v-else-if="field.type==='enum'" v-model="line[field.key]" required class="field"><option value="">اختر</option><option v-for="[val,label] in field.choices" :key="val" :value="val">{{label}}</option></select>
-         <input v-else v-model="line[field.key]" required class="field" />
+         <input v-else v-model="line[field.key]" :required="!field.optional" class="field" />
         </label>
         <button v-if="operationForm[operation.array].length>1" type="button" @click="operationForm[operation.array].splice(index,1)" class="text-right text-xs text-red-700 hover:underline">حذف البند</button>
        </div>

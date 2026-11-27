@@ -24,7 +24,7 @@ final class CorrespondenceReconcile extends Command
         $checked = 0;
         $stale = 0;
         DB::table('correspondence_tasks as t')->join('official_correspondences as c', 'c.id', '=', 't.correspondence_id')
-            ->where('t.status', 'open')->select(['t.*', 'c.public_id'])->orderBy('t.id')->chunkById(200, function ($tasks) use ($registry, $access, &$checked, &$stale): void {
+            ->where('t.status', 'open')->select(['t.*', 'c.public_id', 'c.workflow_instance_id'])->orderBy('t.id')->chunkById(200, function ($tasks) use ($registry, $access, &$checked, &$stale): void {
                 $users = User::whereIn('id', $tasks->pluck('assigned_to'))->get()->keyBy('id');
                 foreach ($tasks as $task) {
                     $user = $users->get($task->assigned_to);
@@ -36,6 +36,7 @@ final class CorrespondenceReconcile extends Command
                     $registry->alert((int) $task->assigned_to, (int) $task->action_id, $task->public_id);
                     if ($task->due_at && $task->due_at < now()->toDateTimeString()) {
                         $registry->alert((int) $task->assigned_to, (int) $task->action_id, $task->public_id, ':overdue:'.today()->toDateString(), 'مراسلة رسمية تجاوزت موعد المتابعة');
+                        $this->remindSecretariat($registry, $access, $task);
                         $policy = $access->policies('escalation')->first();
                         if ($policy && filled($policy->approval_reference)) {
                             $timings = json_decode($policy->configuration, true);
@@ -60,5 +61,27 @@ final class CorrespondenceReconcile extends Command
         $this->info("Checked: {$checked}; assignments requiring administrative review: {$stale}.");
 
         return $stale ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * The Secretariat follows a Board decision's deadline (SRS 3.6.2): whoever registered it is told once a day that
+     * it is overdue while someone else holds it, so they can remind or report, as long as they keep the role and
+     * still see the decision. Information only: no stage moves and no authority is given.
+     */
+    private function remindSecretariat(CorrespondenceRegistry $registry, CorrespondenceAccess $access, object $task): void
+    {
+        if (! $task->workflow_instance_id) {
+            return;
+        }
+        $registrarId = DB::table('workflow_events as e')->join('workflow_steps as s', 's.id', '=', 'e.from_step_id')
+            ->join('workflow_instances as i', 'i.id', '=', 'e.workflow_instance_id')
+            ->where('e.workflow_instance_id', $task->workflow_instance_id)->where('i.subject_type', 'official_correspondence')
+            ->where('i.subject_id', $task->correspondence_id)->where('s.code', 'register')->whereNotNull('e.workflow_transition_id')
+            ->orderByDesc('e.id')->value('e.actor_id');
+        $registrar = $registrarId ? User::find($registrarId) : null;
+        if ($registrar && (int) $registrar->id !== (int) $task->assigned_to && $access->role($registrar, 'secretariat')
+            && $access->visible($registrar)->where('c.id', $task->correspondence_id)->exists()) {
+            $registry->alert((int) $registrar->id, (int) $task->action_id, $task->public_id, ':followup:'.today()->toDateString(), 'قرار مجلس إدارة تجاوز موعد التنفيذ');
+        }
     }
 }

@@ -26,7 +26,8 @@ final class RentalSettlementWorkflow implements WorkflowSubject
 
     private const STATUS_BY_STEP = ['officer' => 'returned', 'finance_review' => 'in_review', 'ed_decision' => 'in_review', 'posting' => 'approved', 'rejected' => 'rejected'];
 
-    public function __construct(private readonly RentalLedger $ledger, private readonly RentalsAccess $access, private readonly RentalAudit $audit) {}
+    public function __construct(private readonly RentalLedger $ledger, private readonly RentalsAccess $access, private readonly RentalAudit $audit,
+        private readonly RentalContracts $contracts, private readonly RentalFinanceService $finance) {}
 
     public function beforeMove(object $instance, object $from, object $target, int $actorId): void
     {
@@ -35,6 +36,11 @@ final class RentalSettlementWorkflow implements WorkflowSubject
         $actor = User::findOrFail($actorId);
         if ($from->code === 'officer') {
             abort_unless($this->access->canManage($actor), 403, 'طلب التسوية لمسؤول ملف الإيجارات.');
+            // Also when a returned settlement is sent again: no settlement goes forward without its document.
+            $missing = $this->contracts->missingSupportingDocument('settlement', $settlement);
+            if ($missing !== null && $target->code !== 'rejected') {
+                throw ValidationException::withMessages(['workflow' => $missing]);
+            }
         }
         if ($target->code === 'completed') {
             abort_unless($this->access->canRecordFinance($actor), 403, 'تسجيل الترحيل لموظف الحسابات المخوّل.');
@@ -57,6 +63,8 @@ final class RentalSettlementWorkflow implements WorkflowSubject
             DB::table('aims_rental_settlements')->where('id', $settlement->id)->update(['status' => 'posted', 'posted_by' => $actorId, 'posted_at' => now(), 'updated_at' => now()]);
             if ($settlement->due_id) {
                 $this->ledger->refreshStatus((int) $settlement->due_id);
+                // The receivable registered with Accounts follows the posted settlement (append-only adjustment).
+                $this->finance->settleDue($settlement, $actorId);
             }
         } elseif (isset(self::STATUS_BY_STEP[$target->code])) {
             DB::table('aims_rental_settlements')->where('id', $settlement->id)->update(['status' => self::STATUS_BY_STEP[$target->code], 'updated_at' => now()]);

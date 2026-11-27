@@ -6,7 +6,7 @@ import { getJson, localToday, rosterTone } from './attendanceUi.js';
 /**
  * «جدول المناوبات»: who works when, from the canonical roster (exceptions, swaps, exemptions, assignments, default).
  * HR selects employees to assign a template or an exemption after previewing the impact; nothing applies before the
- * existing approval. An emergency change applies at once only for those holding the approval authority.
+ * existing approval. An emergency change is always sent for approval by someone other than its author.
  */
 const props = defineProps({
     schedules: { type: Array, default: () => [] },
@@ -111,10 +111,10 @@ function openCell(row, cell, day) { focus.value = { row, cell, day }; emergency.
 function submitEmergency() {
     const f = focus.value;
     if (!f || emergency.value.reason.trim().length < 10) { message.value = 'اكتب سبب التغيير الطارئ (10 أحرف على الأقل).'; return; }
-    if (!window.confirm(props.can.approveRoster ? 'تطبيق التغيير الطارئ الآن وإبلاغ الموظف؟' : 'إرسال التغيير الطارئ للاعتماد؟')) return;
+    if (!window.confirm('إرسال التغيير الطارئ للاعتماد؟')) return;
     busy.value = true;
     router.post('/admin/attendance/emergency-changes', { employee_id: f.row.employee_id, starts_on: f.day.date, ends_on: emergency.value.ends_on || f.day.date, ...emergency.value },
-        { preserveScroll: true, preserveState: true, onSuccess: () => { message.value = props.can.approveRoster ? 'طُبق التغيير.' : 'أُرسل للاعتماد.'; focus.value = null; load(); },
+        { preserveScroll: true, preserveState: true, onSuccess: () => { message.value = 'أُرسل للاعتماد.'; focus.value = null; load(); },
             onError: errors => { message.value = Object.values(errors).join(' — '); }, onFinish: () => { busy.value = false; } });
 }
 </script>
@@ -186,7 +186,7 @@ function submitEmergency() {
                 </template>
                 <label class="text-xs font-semibold">حتى تاريخ<input v-model="emergency.ends_on" type="date" :min="focus.day.date" class="field mt-1" /></label>
                 <label class="text-xs font-semibold md:col-span-4">السبب<input v-model="emergency.reason" maxlength="2000" class="field mt-1" /></label>
-                <div class="flex items-end"><button class="btn btn-primary btn-sm" :disabled="busy">{{ can.approveRoster ? 'تطبيق التغيير' : 'إرسال للاعتماد' }}</button></div>
+                <div class="flex items-end"><button class="btn btn-primary btn-sm" :disabled="busy">إرسال للاعتماد</button></div>
             </form>
         </div>
 

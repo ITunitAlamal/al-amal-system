@@ -3,7 +3,6 @@
 namespace App\Services\Rentals;
 
 use App\Models\User;
-use App\Services\Kpi\KpiEngine;
 use App\Services\Kpi\Sources\RentalContractsSource;
 use Illuminate\Support\Facades\DB;
 
@@ -15,8 +14,8 @@ use Illuminate\Support\Facades\DB;
  */
 final class RentalsDashboard
 {
-    /** Installed window of the indicator «عقود تنتهي قريبًا دون إجراء تجديد», used when its version cannot be read. */
-    private const DEFAULT_WINDOW_DAYS = 60;
+    /** Installed renewal-alert window (rentals_module_settings), used when the settings row cannot be read. */
+    private const DEFAULT_WINDOW_DAYS = 90;
 
     private const DECISIONS = [
         RentalApplicationWorkflow::DEFINITION => ['applications', 'طلبات استئجار بانتظار القرار', 'applications'],
@@ -25,7 +24,7 @@ final class RentalsDashboard
         RentalSettlementWorkflow::DEFINITION => ['settlements', 'تسويات بانتظار القرار', 'settlements'],
     ];
 
-    public function __construct(private readonly KpiEngine $kpis, private readonly RentalLedger $ledger, private readonly RentalsAccess $access) {}
+    public function __construct(private readonly RentalLedger $ledger, private readonly RentalsAccess $access) {}
 
     public static function canView(User $user): bool
     {
@@ -121,13 +120,14 @@ final class RentalsDashboard
         return ['dues' => (int) $row->dues, 'contracts' => (int) $row->contracts];
     }
 
-    /** The window set today on the indicator RENT_EXPIRING_NO_RENEWAL, so the block and the indicator agree. */
+    /**
+     * The renewal-alert window of the rentals settings (three months by default, SRS 3.8.7.1), the same window the
+     * daily alert uses, so «expiring soon» here and the alert agree.
+     */
     private function windowDays(): int
     {
-        $definition = DB::table('kpi_definitions')->where('code', 'RENT_EXPIRING_NO_RENEWAL')->value('id');
-        $version = $definition ? $this->kpis->versionAt((int) $definition, now()->toDateString()) : null;
-        $days = $version ? ($this->kpis->configuration($version)['params']['window_days'] ?? null) : null;
+        $days = (int) (DB::table('rentals_module_settings')->where('id', 1)->value('renewal_alert_days') ?? self::DEFAULT_WINDOW_DAYS);
 
-        return is_int($days) && $days >= 1 && $days <= 365 ? $days : self::DEFAULT_WINDOW_DAYS;
+        return $days >= 1 && $days <= 365 ? $days : self::DEFAULT_WINDOW_DAYS;
     }
 }

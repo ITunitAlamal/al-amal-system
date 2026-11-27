@@ -34,7 +34,9 @@ PHPUnit only stays off the live database because `phpunit.xml` overrides the con
 
 The owner's standing rules: apply changes directly, do not add test files, do not run the test suites, and do not use screenshots or browser automation to verify. Verify by reading code, routes and real data. Keep screens simple: few fields, one-step actions, automatic bookkeeping.
 
-Git: work on `develop`; `master` is fast-forwarded to it. There is no remote. Commit only when asked.
+Git: work on `develop`; `master` is fast-forwarded to it. The remote `origin` is the private GitHub repository `ITunitAlamal/al-amal-system`; push only when the owner asks. Commit only when asked.
+
+A git worktree at `C:\Projects\al-amal-staging` (its `vendor` and `node_modules` are junctions to this folder) is used to prepare larger changes away from live; they are copied here file by file after review.
 
 ## Architecture
 

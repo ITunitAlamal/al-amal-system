@@ -3,15 +3,19 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Models\User;
 use App\Services\Attendance\AttendanceAccess;
 use App\Services\Attendance\AttendanceCalendar;
 use App\Services\Attendance\AttendanceDailyService;
 use App\Services\Attendance\AttendanceDestinationPolicy;
+use App\Services\Attendance\AttendanceDeviceBackoff;
 use App\Services\Attendance\AttendanceLedger;
 use App\Services\Attendance\AttendancePermissionService;
 use App\Services\Attendance\AttendancePolicy;
 use App\Services\Attendance\AttendanceSettings;
+use App\Services\Attendance\PunchTimeReview;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Progress\ApprovalProgress;
 use App\Support\Attendance\ScheduleSettings;
 use Carbon\CarbonImmutable;
@@ -28,19 +32,31 @@ use Inertia\Inertia;
 
 class AttendanceController extends Controller
 {
+    /** HR operations: the system administrator or the HR head. The page's capability flags use this same check. */
+    private function isStaff(?User $user): bool
+    {
+        return (bool) ($user?->is_active && ($user->isSystemAdmin() || $user->isHrDepartmentHead()));
+    }
+
     private function staff(Request $request): void
     {
-        abort_unless($request->user()?->is_active && ($request->user()->isSystemAdmin() || $request->user()->isHrDepartmentHead()), 403);
+        abort_unless($this->isStaff($request->user()), 403);
     }
 
     private function executive(int $id): bool
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')->where('a.user_id', $id)->where('r.code', 'executive_director')->where('u.is_active', true)->exists();
+        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')->where('a.user_id', $id)->where('r.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->exists();
+    }
+
+    /** Approvals of assignments and exceptions: the executive director only (the technical administrator takes no business decision). */
+    private function isApprover(?User $user): bool
+    {
+        return (bool) ($user?->is_active && $this->executive((int) $user->id));
     }
 
     private function approver(Request $request): void
     {
-        abort_unless($request->user()?->is_active && ($request->user()->isSystemAdmin() || $this->executive((int) $request->user()->id)), 403);
+        abort_unless($this->isApprover($request->user()), 403);
     }
 
     private function audit(Request $r, string $type, int $id, string $action, array $details = []): void
@@ -59,7 +75,8 @@ class AttendanceController extends Controller
     {
         abort_unless($r->user()?->is_active && ($r->user()->isSystemAdmin() || $r->user()->isHrDepartmentHead() || $this->executive((int) $r->user()->id)), 403);
         $progress = app(ApprovalProgress::class);
-        $hr = $r->user()->isSystemAdmin() || $r->user()->isHrDepartmentHead();
+        $hr = $this->isStaff($r->user());
+        $approver = $this->isApprover($r->user());
         $access = app(AttendanceAccess::class);
         $completion = AttendanceLedger::hasTable('attendance_shift_swaps');
         try {
@@ -75,9 +92,21 @@ class AttendanceController extends Controller
             'can' => [
                 'sync' => $hr && config('attendance.zk_sync_enabled', false) === true,
                 'requestCorrection' => $hr,
-                'decideCorrection' => $r->user()->isSystemAdmin(),
+                'decideCorrection' => AttendancePunchCorrectionController::mayDecide($r->user()),
                 'revertAuto' => $hr,
                 'manage' => $hr,
+                // One flag per endpoint guard: the page shows a form or a button only when its endpoint accepts this
+                // user. $hr is staff() here, in AttendanceOperationsController and in
+                // AttendanceScheduleManageController::requestChange; the executive director decides the approvals.
+                'createSchedule' => $hr,
+                'requestScheduleChange' => $hr,
+                'createAssignment' => $hr,
+                'createOverride' => $hr,
+                'manualPunch' => $hr,
+                'manageDevices' => $hr,
+                'operations' => $hr,
+                'report' => $hr,
+                'userId' => (int) $r->user()->id,
                 'approveRoster' => $access->canApproveRoster($r->user()),
                 'decideHr' => $access->canDecideHr($r->user()),
                 'viewHrActions' => $completion && $access->canViewHrActions($r->user()),
@@ -107,8 +136,16 @@ class AttendanceController extends Controller
                     ->join('employees as e', 'e.id', '=', 'p.employee_id')->leftJoin('users as u', 'u.id', '=', 'c.requested_by')
                     ->where('c.status', 'pending')->orderBy('c.id')
                     ->get(['c.id', 'c.punch_id', 'p.employee_id', 'p.occurred_at', 'c.original_direction', 'c.corrected_direction', 'c.reason', 'c.requested_by',
-                        'c.created_at', 'u.name as requested_by_name', 'e.first_name_ar', 'e.father_name_ar', 'e.family_name_ar']),
+                        'c.created_at', 'u.name as requested_by_name', 'e.first_name_ar', 'e.father_name_ar', 'e.family_name_ar'])
+                    // Which of them this user decides (AttendanceAccess::correctionsToDecide, the endpoint's own rule).
+                    ->pipe(function ($rows) use ($r, $access) {
+                        $mine = $access->correctionsToDecide((int) $r->user()->id)?->whereIn('c.id', $rows->pluck('id'))->pluck('c.id')->map(fn ($id): int => (int) $id)->all() ?? [];
+
+                        return $rows->map(fn (object $row): object => (object) [...(array) $row, 'can_decide' => in_array((int) $row->id, $mine, true)]);
+                    }),
             ],
+            // Daylight-saving punches this user confirms (HR-20); the executive director's share has no other screen.
+            'timeReview' => app(PunchTimeReview::class)->queue($r->user(), true),
             'devices' => DB::table('attendance_devices')->orderBy('id')->get([
                 'id', 'name', 'location', 'host', 'port', 'protocol', 'is_active', 'sync_mode', 'last_synced_at',
                 'probe_enabled', 'probe_interval_seconds', 'assigned_agent',
@@ -124,20 +161,20 @@ class AttendanceController extends Controller
                 ->map(fn (object $row): object => (object) [...(array) $row, 'steps' => $progress->steps($row->status, [
                     'requestLabel' => 'إعداد التكليف', 'requestedBy' => $row->created_by ? (int) $row->created_by : null, 'requestedAt' => $row->created_at,
                     'decisionLabel' => 'اعتماد التكليف', 'decidedBy' => $row->approved_by ? (int) $row->approved_by : null, 'decidedAt' => $row->approved_at,
-                    'decisionOwner' => 'المدير التنفيذي أو مدير النظام',
+                    'decisionOwner' => 'المدير التنفيذي',
                 ])]),
             'overrides' => DB::table('attendance_overrides')->orderByDesc('id')->limit(60)->get(),
             'punches' => DB::table('attendance_punches as p')->leftJoin('employees as e', 'e.id', '=', 'p.employee_id')->orderByDesc('p.occurred_at')->limit(100)->get(['p.*', 'e.employee_number', 'e.first_name_ar', 'e.family_name_ar']),
             'employees' => DB::table('employees')->whereNull('deleted_at')->where('employment_status', 'active')->orderBy('first_name_ar')
                 ->get(['id', 'employee_number', 'first_name_ar', 'father_name_ar', 'family_name_ar', 'department_id']),
             'departments' => DB::table('departments')->whereNull('deleted_at')->where('is_active', true)->get(['id', 'name']),
-            'canApprove' => $r->user()->isSystemAdmin() || $this->executive((int) $r->user()->id),
+            'canApprove' => $approver,
             'canManageDeviceConnections' => $r->user()->isSystemAdmin(),
             'scheduleChangeRequests' => DB::table('attendance_schedule_change_requests')->orderByDesc('id')->limit(100)->get()
                 ->map(fn (object $row): object => (object) [...(array) $row, 'steps' => $progress->steps($row->status, [
                     'requestLabel' => 'طلب تعديل الدوام', 'requestedBy' => $row->requested_by ? (int) $row->requested_by : null, 'requestedAt' => $row->created_at,
                     'decisionLabel' => 'قرار الاعتماد', 'decidedBy' => $row->decided_by ? (int) $row->decided_by : null, 'decidedAt' => $row->decided_at,
-                    'decisionOwner' => 'المدير التنفيذي أو مدير النظام',
+                    'decisionOwner' => 'المدير التنفيذي',
                     'execution' => ['label' => 'تطبيق التعديل على القالب', 'done' => $row->status === 'approved', 'at' => $row->decided_at, 'owner' => 'تلقائي عند الاعتماد'],
                 ])]),
         ]);
@@ -150,11 +187,13 @@ class AttendanceController extends Controller
         $probeTtlBase = max(30, (int) config('attendance.health_probe_freshness_seconds', 90));
         $agentTtl = max(15, (int) config('attendance.agent_freshness_seconds', 45));
         $syncTtl = max(60, (int) config('attendance.sync_freshness_seconds', 900));
+        $backoff = AttendanceDeviceBackoff::ready();
         $devices = DB::table('attendance_devices')->orderBy('id')->get([
             'id', 'name', 'is_active', 'sync_mode', 'assigned_agent', 'probe_enabled', 'last_probe_at',
             'last_success_at', 'probe_latency_ms', 'probe_result', 'probe_error_code',
             'agent_last_seen_at', 'last_sync_success_at', 'last_synced_at', 'probe_started_at', 'probe_interval_seconds',
             ...(Schema::hasColumn('attendance_devices', 'driver') ? ['firmware', 'platform', 'clock_drift_seconds', 'last_failure_at', 'last_failure_code', 'sync_requested_at'] : []),
+            ...($backoff ? ['sync_failure_count', 'sync_retry_at', 'probe_failure_count', 'probe_retry_at'] : []),
         ]);
         $latestRuns = $devices->isEmpty()
             ? collect()
@@ -169,7 +208,8 @@ class AttendanceController extends Controller
                     '=',
                     'runs.id',
                 )
-                ->get(['runs.device_id', 'runs.status', 'runs.error', 'runs.started_at', 'runs.ended_at', ...(Schema::hasColumn('attendance_sync_runs', 'dry_run') ? ['runs.received', 'runs.inserted', 'runs.duplicates', 'runs.unmatched', 'runs.failed', 'runs.dry_run'] : [])])
+                ->get(['runs.device_id', 'runs.status', 'runs.error', 'runs.started_at', 'runs.ended_at', ...(Schema::hasColumn('attendance_sync_runs', 'dry_run') ? ['runs.received', 'runs.inserted', 'runs.duplicates', 'runs.unmatched', 'runs.failed', 'runs.dry_run'] : []),
+                    ...($backoff ? ['runs.attempts'] : [])])
                 ->keyBy('device_id');
 
         $statuses = $devices->map(function (object $device) use ($agentTtl, $latestRuns, $probeTtlBase, $syncTtl): array {
@@ -194,8 +234,10 @@ class AttendanceController extends Controller
                 $deviceState = 'checking';
             } elseif (! $lastProbeAt) {
                 $deviceState = 'unknown';
-            } elseif ($lastProbeAt->lessThan($now->subSeconds($probeTtl))) {
-                // No fresh probe: the last reading is old, which is not proof that the device is disconnected.
+            } elseif ($lastProbeAt->lessThan($now->subSeconds($probeTtl))
+                && ! (($device->probe_retry_at ?? null) && CarbonImmutable::parse($device->probe_retry_at)->greaterThan($now->subSeconds($probeTtlBase)))) {
+                // No fresh probe: the last reading is old, which is not proof that the device is disconnected. A device the
+                // agent is deliberately waiting on after failed probes (AttendanceDeviceBackoff) keeps its last reading.
                 $deviceState = 'stale';
             } elseif ($device->probe_error_code === 'device_busy') {
                 $deviceState = 'syncing';
@@ -245,6 +287,11 @@ class AttendanceController extends Controller
                 'last_sync_success_at' => $syncSuccessAt,
                 'probe_interval_seconds' => $probeInterval,
                 'probe_freshness_seconds' => $probeTtl,
+                // The punches of an active device are not current: the ledger may show missing punches or absences that
+                // are only not imported yet (the page warns about it).
+                'data_stale' => (bool) $device->is_active && in_array($syncState, ['failed', 'stale'], true),
+                'sync_failure_count' => (int) ($device->sync_failure_count ?? 0),
+                'sync_retry_at' => $device->sync_retry_at ?? null,
             ];
         })->values();
 
@@ -395,6 +442,9 @@ class AttendanceController extends Controller
                 if (Schema::hasColumn('attendance_devices', 'firmware')) {
                     $v += ['firmware' => null, 'platform' => null, 'clock_drift_seconds' => null, 'last_failure_at' => null, 'last_failure_code' => null];
                 }
+                if (AttendanceDeviceBackoff::ready()) {
+                    $v += ['sync_failure_count' => 0, 'sync_failed_at' => null, 'sync_retry_at' => null];
+                }
             }
             if ($probeConfigurationChanged) {
                 $v += [
@@ -407,6 +457,9 @@ class AttendanceController extends Controller
                     'probe_started_at' => null,
                     'probe_lock_token' => null,
                 ];
+                if (AttendanceDeviceBackoff::ready()) {
+                    $v += ['probe_failure_count' => 0, 'probe_retry_at' => null];
+                }
             }
             DB::table('attendance_devices')->where('id', $device)->update($v + ['updated_at' => now()]);
             $this->audit($r, 'device', $device, 'updated', [
@@ -499,7 +552,11 @@ class AttendanceController extends Controller
             abort_unless($row, 404);
             if ($row->status !== 'pending') {
                 throw ValidationException::withMessages(['decision' => 'تم البت في هذا الطلب مسبقًا.']);
-            }DB::table($table)->where('id', $id)->update(['status' => $v['decision'], 'approved_by' => $r->user()->id, 'approved_at' => now(), 'updated_at' => now()]);
+            }
+            if ((int) $row->created_by === (int) $r->user()->id) {
+                throw ValidationException::withMessages(['decision' => 'لا يعتمد مقدم الطلب طلبه.']);
+            }
+            DB::table($table)->where('id', $id)->update(['status' => $v['decision'], 'approved_by' => $r->user()->id, 'approved_at' => now(), 'updated_at' => now()]);
             $this->audit($r, $type, $id, $v['decision']);
             app(AttendanceDailyService::class)->refreshExisting(
                 $row->employee_id ? (int) $row->employee_id : null,

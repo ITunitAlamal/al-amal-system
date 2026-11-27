@@ -70,4 +70,32 @@ final class CustomFieldEntities
             ->pluck('s.name', 's.code')
             ->all();
     }
+
+    /**
+     * The actions that leave each step, so a step field can be tied to some of them ("action_codes" in
+     * visible_when): step code => [action code => action name]. Names come from the newest version.
+     *
+     * @return array<string, array<string, string>>
+     */
+    public function stepActions(string $entityType, string $scopeKey): array
+    {
+        if ($scopeKey === '' || (self::ENTITIES[$entityType]['scoped_by'] ?? null) !== 'workflow') {
+            return [];
+        }
+
+        $actions = [];
+        foreach (DB::table('workflow_transitions as t')
+            ->join('workflow_steps as s', 's.id', '=', 't.from_step_id')
+            ->join('workflow_versions as v', 'v.id', '=', 's.workflow_version_id')
+            ->join('workflow_definitions as d', 'd.id', '=', 'v.workflow_definition_id')
+            ->where('d.code', $scopeKey)
+            ->where('s.step_type', '!=', 'start')
+            ->orderBy('v.version_number')
+            ->orderBy('t.id')
+            ->get(['s.code as step_code', 't.action_code', 't.name']) as $row) {
+            $actions[$row->step_code][$row->action_code] = $row->name;
+        }
+
+        return $actions;
+    }
 }

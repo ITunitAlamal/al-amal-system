@@ -13,6 +13,7 @@ use App\Services\Hr\Import\SpreadsheetReader;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
@@ -245,7 +246,14 @@ class EmployeeImportController extends Controller
             'employee_quota_mb' => ['required', 'integer', 'between:10,10240'],
             'self_photo_upload' => ['required', Rule::in(['disabled', 'review'])],
             'self_view_pay' => ['required', 'boolean'],
+            // Days before a document's expiry that HR is told (EmployeeDocumentAlerts); empty = expired ones only.
+            'document_expiry_alert_days' => ['nullable', 'integer', 'between:1,365'],
         ]);
+        if (! Schema::hasColumn('hr_employee_file_settings', 'document_expiry_alert_days')) {
+            unset($data['document_expiry_alert_days']);
+        } else {
+            $data['document_expiry_alert_days'] ??= null;
+        }
         DB::transaction(function () use ($request, $data): void {
             $before = (array) DB::table('hr_employee_file_settings')->where('id', 1)->lockForUpdate()->first();
             DB::table('hr_employee_file_settings')->where('id', 1)->update([...$data, 'updated_by' => $request->user()->id, 'updated_at' => now()]);

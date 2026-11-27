@@ -10,8 +10,8 @@ use Illuminate\Validation\ValidationException;
 
 /**
  * The four rental requests the file officer prepares — application, contract (new, renewal, amendment),
- * termination and eviction, settlement. Each is saved as a draft, may be edited while a draft or returned, and is
- * sent to the central workflow engine when ready; from then on only the workflow moves it.
+ * termination and eviction, settlement. Each is saved as a draft, may be edited or withdrawn while a draft or
+ * returned, and is sent to the central workflow engine when ready; from then on only the workflow moves it.
  */
 final class RentalRequests
 {
@@ -31,6 +31,7 @@ final class RentalRequests
         private readonly RentalLedger $ledger,
         private readonly RentalConstants $constants,
         private readonly RentalAudit $audit,
+        private readonly RentalContracts $contracts,
     ) {}
 
     /** @param array{tenant_id: int, unit_id?: ?int, purpose?: ?string, study?: ?string} $data */
@@ -133,10 +134,50 @@ final class RentalRequests
                 'case' => $this->checkTermination(['contract_id' => (int) $row->contract_id, 'termination_reason_value_id' => (int) $row->termination_reason_value_id, 'departure_on' => $row->departure_on, 'reason' => $row->reason], $id),
                 'settlement' => $this->checkSettlement(['due_id' => (int) $row->due_id, 'type_value_id' => (int) $row->type_value_id, 'effect' => $row->effect, 'amount' => (string) $row->amount, 'reason' => $row->reason]),
             };
+            if (($missing = $this->contracts->missingSupportingDocument($type, $row)) !== null) {
+                throw ValidationException::withMessages(['documents' => $missing]);
+            }
             $instance = $this->engine->startForSubject($actor, $definition, $subject, $id, $this->access->departmentId($actor));
             DB::table($table)->where('id', $id)->update(['workflow_instance_id' => $instance->id, 'updated_at' => now()]);
 
             return $instance;
+        });
+    }
+
+    /**
+     * The file officer withdraws a request still in his hands, with a reason: a draft never sent, or one the workflow
+     * returned to him (its workflow closes as cancelled, the reason on its timeline). The record stays, «ملغى», and
+     * no longer blocks a new renewal, amendment or termination of the same contract. A contract's hand-entered
+     * schedule lines are cancelled with it; the application it was prepared from stays approved for a corrected
+     * contract. An application the executive director approved that will not become a contract is closed the same
+     * way («مغلق دون تعاقد») and gives back the unit it reserved; the director's decision stays as recorded.
+     */
+    public function withdraw(User $actor, string $type, int $id, string $reason): void
+    {
+        DB::transaction(function () use ($actor, $type, $id, $reason): void {
+            $table = self::TYPES[$type]['table'];
+            $row = DB::table($table)->where('id', $id)->lockForUpdate()->first();
+            abort_unless($row, 404);
+
+            if ($type === 'application' && $row->status === 'approved') {
+                $open = DB::table('aims_rental_contracts')->where('application_id', $id)->whereIn('status', RentalContracts::OPEN)->value('number');
+                if ($open !== null) {
+                    throw ValidationException::withMessages(['status' => 'على هذا الطلب العقد '.$open.' ولم يُبت فيه؛ اسحبه أو ألغِه أولًا.']);
+                }
+                $this->contracts->closeApplication($row, 'إغلاق طلب الاستئجار دون تعاقد: '.$reason, (int) $actor->id, 'application', 'application', $id);
+
+                return;
+            }
+            if (! in_array($row->status, self::EDITABLE, true)) {
+                throw ValidationException::withMessages(['status' => 'يُسحب الطلب وهو مسودة أو مُعاد لمسؤول الملف فقط؛ بعد الإرسال يبت فيه صاحب المرحلة.']);
+            }
+            if ($row->workflow_instance_id) {
+                $this->engine->cancel((int) $row->workflow_instance_id, $actor, $reason);
+            }
+            DB::table($table)->where('id', $id)->update(['status' => 'cancelled', 'updated_at' => now()]);
+            $dues = $type === 'contract' ? $this->contracts->cancelPlannedDues($row, 'سحب العقد '.$row->number.' قبل اعتماده: '.$reason) : 0;
+            $this->audit->log((int) $actor->id, 'rental.'.($type === 'case' ? 'termination' : $type).'.withdrawn', $table, $id,
+                ['status' => $row->status], ['status' => 'cancelled', 'reason' => $reason, 'cancelled_dues' => $dues]);
         });
     }
 
@@ -250,6 +291,9 @@ final class RentalRequests
             if (! $parent || ! in_array($parent->status, RentalContracts::OCCUPYING, true) || (int) $parent->tenant_id !== (int) $data['tenant_id']) {
                 throw ValidationException::withMessages(['parent_contract_id' => 'العقد الأصلي يجب أن يكون فعالًا أو منتهي المدة وللمستأجر نفسه.']);
             }
+            if ($this->contracts->openTermination((int) $parent->id)) {
+                throw ValidationException::withMessages(['parent_contract_id' => 'توجد معاملة إنهاء مفتوحة للعقد الأصلي؛ لا يُفتح تجديد أو ملحق قبل البت فيها.']);
+            }
             if ($kind === 'renewal' && $data['starts_on'] <= $parent->ends_on) {
                 throw ValidationException::withMessages(['starts_on' => 'يبدأ التجديد بعد نهاية العقد الأصلي ('.$parent->ends_on.')؛ للتعديل خلال المدة استخدم «ملحق / تعديل».']);
             }
@@ -333,10 +377,14 @@ final class RentalRequests
         if (! $contract || ! in_array($contract->status, RentalContracts::OCCUPYING, true)) {
             throw ValidationException::withMessages(['contract_id' => 'الإنهاء لعقد فعال أو منتهي المدة لم يُستلم بعد.']);
         }
-        $open = DB::table('aims_rental_cases')->where('contract_id', $contract->id)->where('kind', 'eviction')
-            ->whereNotIn('status', ['rejected', 'completed', 'cancelled'])->when($caseId, fn ($q) => $q->where('id', '<>', $caseId))->exists();
-        if ($open) {
+        if ($this->contracts->openTermination((int) $contract->id, $caseId)) {
             throw ValidationException::withMessages(['contract_id' => 'توجد معاملة إنهاء مفتوحة لهذا العقد.']);
+        }
+        // A renewal or an amendment still being prepared or decided would outlive the termination: settle it first.
+        $successor = DB::table('aims_rental_contracts')->where('parent_contract_id', $contract->id)->whereIn('status', RentalContracts::OPEN)->first(['number', 'kind', 'status']);
+        if ($successor) {
+            throw ValidationException::withMessages(['contract_id' => 'لهذا العقد «'.(RentalContracts::KINDS[$successor->kind] ?? 'عقد لاحق').'» مفتوح ('.$successor->number.' — '
+                .(RentalContracts::LABELS[$successor->status] ?? $successor->status).')؛ اسحبه أو ألغِه، أو انتظر قرار المدير التنفيذي فيه، قبل طلب الإنهاء.']);
         }
         $this->constants->assert('rental_termination_reasons', (int) $data['termination_reason_value_id'], 'termination_reason_value_id', true);
         if ($data['departure_on'] < $contract->starts_on) {
@@ -350,6 +398,9 @@ final class RentalRequests
         $due = DB::table('aims_rental_dues')->where('id', $data['due_id'])->first();
         if (! $due || $due->status === 'cancelled') {
             throw ValidationException::withMessages(['due_id' => 'الاستحقاق غير موجود أو ملغى.']);
+        }
+        if (! $this->ledger->isObligation((int) $due->id)) {
+            throw ValidationException::withMessages(['due_id' => 'عقد هذا الاستحقاق لم يُفعَّل بعد؛ لا تُطلب تسوية إلا على استحقاق عقد نافذ.']);
         }
         $this->constants->assert('rental_settlement_types', (int) $data['type_value_id'], 'type_value_id', true);
         if (! array_key_exists($data['effect'], RentalSettlementWorkflow::EFFECTS)) {

@@ -22,19 +22,24 @@ const appeal = useForm({ kind: 'campaign_omission', subject: 'orphan', subject_p
 const filing = ref(false);
 const kinds = { eligibility: 'الأهلية', campaign_omission: 'عدم الإدراج في حملة', other: 'أخرى' };
 const appealStatus = { open: ['مفتوح', 'info'], under_review: ['قيد المراجعة', 'warning'], accepted: ['مقبول', 'success'], rejected: ['مرفوض', 'danger'] };
+// Who may decide each appeal comes from the server (a.can_decide / a.conflict / a.can_escalate): the head, or the
+// person the head assigned it to (the executive director after escalation); never the preparer of the contested list.
 function decide(a, action) {
-    if (!props.abilities.edit) return;
-    ask({ title: { accept: 'قبول الاعتراض', reject: 'رفض الاعتراض', review: 'بدء مراجعة الاعتراض' }[action],
-        description: 'قرار الاعتراض لا يغيّر الكشف المعتمد للحملة؛ تعديل الكشف يحتاج طلبًا مستقلًا واعتماد المدير التنفيذي.',
+    ask({ title: { accept: 'قبول الاعتراض', reject: 'رفض الاعتراض', review: 'بدء مراجعة الاعتراض', escalate: 'تصعيد الاعتراض إلى المدير التنفيذي' }[action],
+        description: action === 'escalate' ? 'يُسند الاعتراض إلى المدير التنفيذي ليفصل فيه؛ اكتب سبب التصعيد.' : 'قرار الاعتراض لا يغيّر الكشف المعتمد للحملة؛ تعديل الكشف يحتاج طلبًا مستقلًا واعتماد المدير التنفيذي.',
         required: action !== 'review', danger: action === 'reject', url: `/orphans/reviews/appeals/${a.public_id}`, data: { action } });
 }
+function assignAppeal(a, id) { router.post(`/orphans/reviews/appeals/${a.public_id}`, { action: 'assign', user_id: id ? Number(id) : null }, { preserveScroll: true }); }
 </script>
 
 <template>
     <AppLayout title="الطلبات والمراجعات">
         <div class="mx-auto max-w-7xl space-y-5">
             <PageHeader eyebrow="شؤون الأيتام والكفالات" title="الطلبات والمراجعات" description="طلبات بوابة الأوصياء في طابور واحد قابل للإسناد، والاعتراضات. اعتماد الحساب منفصل عن اعتماد الوصاية لكل طفل." />
-            <Link href="/orphans/reviews/changes" class="inline-block text-sm font-semibold text-blue-700 hover:underline">طلبات تعديل البيانات من البوابة ←</Link>
+            <div class="flex flex-wrap gap-4">
+                <Link href="/orphans/reviews/changes" class="inline-block text-sm font-semibold text-blue-700 hover:underline">طلبات تعديل البيانات من البوابة ←</Link>
+                <Link href="/orphans/reviews/sensitive" class="inline-block text-sm font-semibold text-blue-700 hover:underline">التعديلات الحساسة على الملفات المعتمدة<template v-if="counts.sensitive"> ({{ counts.sensitive }})</template> ←</Link>
+            </div>
             <div class="grid gap-3 sm:grid-cols-4">
                 <button type="button" class="card text-start" @click="go({ tab: 'applications', status: '', assigned: '' })"><p class="text-sm text-slate-600">طلبات مفتوحة</p><p class="mt-1 text-2xl font-bold text-navy-800">{{ counts.open }}</p></button>
                 <button type="button" class="card text-start" @click="go({ tab: 'applications', assigned: 'me' })"><p class="text-sm text-slate-600">مسندة إليّ</p><p class="mt-1 text-2xl font-bold text-navy-800">{{ counts.mine }}</p></button>
@@ -91,9 +96,14 @@ function decide(a, action) {
                                 <span class="font-semibold">{{ kinds[a.kind] }}</span> · <Link :href="a.orphan_public_id ? `/orphans/registry/orphans/${a.orphan_public_id}` : `/orphans/registry/guardians/${a.guardian_public_id}`" class="text-blue-700 hover:underline">{{ a.subject_name }}</Link>
                                 <span v-if="a.campaign_id" class="text-slate-500">· حملة #{{ a.campaign_id }}</span><span class="text-slate-500">· {{ a.assignee || 'غير مسند' }}</span></div>
                             <p class="text-slate-700">{{ a.reason }}</p><p v-if="a.decision_note" class="text-slate-600">القرار: {{ a.decision_note }}</p>
-                            <div v-if="abilities.edit && ['open', 'under_review'].includes(a.status)" class="flex gap-1">
-                                <button v-if="a.status === 'open'" type="button" class="btn btn-sm btn-secondary" @click="decide(a, 'review')">بدء المراجعة</button>
-                                <button type="button" class="btn btn-sm btn-primary" @click="decide(a, 'accept')">قبول</button><button type="button" class="btn btn-sm btn-danger" @click="decide(a, 'reject')">رفض</button></div>
+                            <p v-if="a.conflict" class="text-xs text-gold-800">{{ a.conflict }}</p>
+                            <p v-if="a.escalated" class="text-xs text-slate-500">صُعّد إلى المدير التنفيذي.</p>
+                            <div v-if="['open', 'under_review'].includes(a.status)" class="flex flex-wrap items-center gap-1">
+                                <button v-if="a.status === 'open' && abilities.edit" type="button" class="btn btn-sm btn-secondary" @click="decide(a, 'review')">بدء المراجعة</button>
+                                <template v-if="a.can_decide"><button type="button" class="btn btn-sm btn-primary" @click="decide(a, 'accept')">قبول</button><button type="button" class="btn btn-sm btn-danger" @click="decide(a, 'reject')">رفض</button></template>
+                                <button v-if="a.can_escalate && !a.escalated" type="button" class="btn btn-sm btn-secondary" @click="decide(a, 'escalate')">تصعيد للمدير التنفيذي</button>
+                                <label v-if="abilities.assign && !a.escalated" class="text-xs">إسناد إلى<select :value="a.assigned_to ?? ''" class="field ms-1 inline-block w-auto py-1 text-xs" @change="assignAppeal(a, $event.target.value)">
+                                    <option value="">غير مسند</option><option v-for="s in staff" :key="s.id" :value="s.id">{{ s.name }}</option></select></label></div>
                         </li>
                         <li v-if="!appeals.data.length"><EmptyState title="لا توجد اعتراضات" description="قبول الاعتراض لا يعدّل أي كشف حملة معتمد؛ التعديل يمر بطلب تعديل يعتمده المدير التنفيذي." /></li>
                     </ul>

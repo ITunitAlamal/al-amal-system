@@ -5,6 +5,8 @@ namespace App\Services\Dashboard;
 use App\Models\User;
 use App\Services\Correspondence\CorrespondenceAccess;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Orphans\Extensions\CampaignExtension;
+use App\Services\Orphans\OrphanAccess;
 use App\Services\Workflow\WorkflowSubjects;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
@@ -39,8 +41,17 @@ final class PersonalWorkspace
      */
     public function actionCenter(User $user, array $stats): array
     {
-        $returned = DB::table('workflow_instances as i')->join('workflow_steps as s', 's.id', '=', 'i.current_step_id')
-            ->where('i.requested_by', $user->id)->where('i.status', 'in_progress')->where('s.assignment_type', 'requester')->count();
+        // A request waits for its author for one of two reasons, each with its own list in «طلباتي» (the status keys of
+        // TransactionTracker): back on its start step it was returned for editing; on any other step of the requester
+        // they verify that the work was done. Returned leave requests outside the engine are in the first list too.
+        $held = DB::table('workflow_instances as i')->join('workflow_steps as s', 's.id', '=', 'i.current_step_id')
+            ->where('i.requested_by', $user->id)->where('i.status', 'in_progress')->where('s.assignment_type', 'requester')
+            ->selectRaw("count(*) filter (where s.step_type = 'start') as returned, count(*) filter (where s.step_type <> 'start' and i.subject_type = 'aims_request') as verify")->first();
+        $returned = (int) ($held->returned ?? 0) + DB::table('employee_leave_requests')->where('requested_by', $user->id)
+            ->whereNull('workflow_instance_id')->where('status', 'returned')->count();
+        $verify = (int) ($held->verify ?? 0);
+        $verifyItem = $verify > 0 ? [['key' => 'verify', 'label' => 'طلبات بانتظار تحققي من الإنجاز', 'value' => $verify, 'detail' => null,
+            'url' => route('requests.index', ['status' => 'verify'], false), 'tone' => 'warning']] : [];
         $correspondence = $this->correspondenceTasks($user);
         $todo = $this->personalTasks->summary($user, 0);
         $employeeId = DB::table('employees')->where('user_id', $user->id)->whereNull('deleted_at')->value('id');
@@ -51,19 +62,20 @@ final class PersonalWorkspace
 
         // «شؤون الأيتام والكفالات»: the executive director's exclusive campaign-list decisions.
         $campaignItem = [];
-        if (app(\App\Services\Orphans\OrphanAccess::class)->isExecutive($user) && Schema::hasTable('campaign_lists')
-            && ($pending = app(\App\Services\Orphans\Extensions\CampaignExtension::class)->pendingForExecutive()) > 0) {
+        if (app(OrphanAccess::class)->isExecutive($user) && Schema::hasTable('campaign_lists')
+            && ($pending = app(CampaignExtension::class)->pendingForExecutive()) > 0) {
             $campaignItem = [['key' => 'campaign_lists', 'label' => 'كشوف حملات بانتظار اعتمادك', 'value' => $pending, 'detail' => null, 'url' => '/orphans', 'tone' => 'warning']];
         }
 
         return [...$swapItem, ...$campaignItem,
             ['key' => 'tasks', 'label' => 'مهام رسمية بانتظار إجرائي', 'value' => $stats['tasks'], 'detail' => $stats['overdue'] ? 'منها متأخرة: '.$stats['overdue'] : null,
                 'url' => route('tasks.index', [], false), 'tone' => $stats['overdue'] ? 'danger' : ($stats['tasks'] ? 'warning' : 'muted')],
-            ['key' => 'returned', 'label' => 'طلباتي المعادة للاستكمال', 'value' => $returned, 'detail' => null,
+            ['key' => 'returned', 'label' => 'طلباتي المعادة للتعديل', 'value' => $returned, 'detail' => null,
                 'url' => route('requests.index', ['status' => 'returned'], false), 'tone' => $returned ? 'warning' : 'muted'],
+            ...$verifyItem,
             ['key' => 'correspondence', 'label' => 'مراسلات تنتظر إجرائي', 'value' => $correspondence['pending'], 'detail' => $correspondence['unread'] ? 'غير مقروءة: '.$correspondence['unread'] : null,
                 'url' => route('correspondence.index', ['box' => 'needs_action'], false), 'tone' => $correspondence['pending'] ? 'warning' : 'muted'],
-            ['key' => 'todo', 'label' => 'مهامي الشخصية المستحقة', 'value' => $todo['today'] + $todo['overdue'], 'detail' => $todo['overdue'] ? 'متأخرة: '.$todo['overdue'] : null,
+            ['key' => 'todo', 'label' => 'المستحق اليوم في قائمتي الشخصية', 'value' => $todo['today'] + $todo['overdue'], 'detail' => $todo['overdue'] ? 'متأخرة: '.$todo['overdue'] : null,
                 'url' => route('todo.index', ['filter' => $todo['overdue'] ? 'overdue' : 'today'], false), 'tone' => $todo['overdue'] ? 'danger' : ($todo['today'] ? 'info' : 'muted')],
             ['key' => 'notifications', 'label' => 'إشعارات غير مقروءة', 'value' => $this->notifications->unreadCount($user), 'detail' => null,
                 'url' => route('notifications.index', ['filter' => 'unread'], false), 'tone' => 'info'],

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import vm from 'node:vm';
-import { computed, ref } from 'vue';
+import { computed, reactive, ref } from 'vue';
 import { columnStorageKey, normalizeHiddenColumns } from '../resources/js/Support/tableColumns.js';
 
 function component(path, context, exposed) {
@@ -12,6 +12,23 @@ function component(path, context, exposed) {
     vm.runInContext(`${source}\nglobalThis.api = { ${exposed} };`, context);
     return context.api;
 }
+
+test('external correspondence navigation follows secretariat access and is removed when that access ends', () => {
+    const props = reactive({
+        filters: { channel: 'internal', box: 'inbox' }, records: { data: [] },
+        counts: { all: 2, external_incoming: 3, external_outgoing: 4 },
+        isAdmin: true, canCreate: true, canCreateExternalArchive: false,
+    });
+    const context = { computed, ref, watch: () => {}, defineProps: () => props, usePage: () => ({ props: {} }) };
+    const api = component('Pages/Correspondence/Index.vue', context, 'channels');
+
+    assert.deepEqual(Array.from(api.channels.value, item => item.id), ['internal']);
+    props.canCreateExternalArchive = true;
+    assert.deepEqual(Array.from(api.channels.value, item => item.id), ['internal', 'external']);
+    assert.equal(api.channels.value[1].count, 7);
+    props.canCreateExternalArchive = false;
+    assert.deepEqual(Array.from(api.channels.value, item => item.id), ['internal']);
+});
 
 const columns = [{ key: 'name', required: true }, { key: 'number', required: true }, { key: 'actions', required: true }, { key: 'department' }, { key: 'status' }];
 

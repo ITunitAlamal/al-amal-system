@@ -34,6 +34,10 @@ final class PortalApplications
     {
         $self = $userId !== null && (int) $userId === (int) $actor->id && $application->assigned_to === null;
         abort_unless($this->access->canAssign($actor) || ($self && $this->access->allows($actor, 'portal')), 403, 'الإسناد لرئيس القسم؛ ويمكن للموظف المخول استلام طلب غير مسند.');
+        $assignee = $userId === null ? null : ((int) $userId === (int) $actor->id ? $actor : User::find($userId));
+        if ($assignee && ($conflict = $this->reviewConflict($application, $assignee)) !== null) {
+            abort(422, 'لا يُسند الطلب إلى هذا الموظف: '.$conflict);
+        }
         DB::table('portal_applications')->where('id', $application->id)->update(['assigned_to' => $userId, 'assigned_at' => now(),
             'status' => $application->status === 'submitted' ? 'under_review' : $application->status, 'updated_at' => now()]);
         $this->event($application->id, 'assigned', $actor->id, payload: ['assigned_to' => $userId]);
@@ -95,7 +99,7 @@ final class PortalApplications
      */
     public function approveChild(object $child, array $data, User $actor): void
     {
-        $this->access->assert($actor, 'portal');
+        $this->access->assertDecision($actor, 'portal');
         $application = DB::table('portal_applications')->find($child->application_id);
         $this->assertReviewer($application, $actor);
         abort_unless(in_array($child->status, ['pending', 'needs_completion'], true), 409, 'تم البت في هذا الطفل مسبقًا.');
@@ -199,6 +203,29 @@ final class PortalApplications
         abort_unless($this->access->allows($actor, 'portal'), 403, 'مراجعة طلبات البوابة تحتاج قدرة «مراجعة طلبات البوابة».');
         abort_if(in_array($application->status, ['draft', 'completed', 'rejected', 'withdrawn'], true), 409, $application->status === 'draft' ? 'الطلب مسودة لم تُرسل بعد.' : 'الطلب مغلق.');
         abort_if($application->assigned_to && (int) $application->assigned_to !== (int) $actor->id && ! $this->access->canAssign($actor), 403, 'الطلب مسند لموظف آخر.');
+        $conflict = $this->reviewConflict($application, $actor);
+        abort_if($conflict !== null, 403, (string) $conflict);
+    }
+
+    /**
+     * Why this person may not review or approve the request (owner decision 4, 2026-10-22: nobody reviews their own
+     * request): they entered it from the department, or they are the applicant or the matched guardian themselves
+     * (by the identity number on their employee file). Null when none applies; the head is bound by it too.
+     */
+    public function reviewConflict(object $application, User $actor): ?string
+    {
+        if ($application->source === 'staff' && (int) $application->created_by_user === (int) $actor->id) {
+            return 'أدخلتَ هذا الطلب بنفسك من القسم؛ يراجعه ويبت فيه موظف آخر مخوّل أو رئيس القسم.';
+        }
+        $own = DB::table('employees')->where('user_id', $actor->id)->whereNull('deleted_at')->whereNotNull('national_id')->pluck('national_id')
+            ->map(fn ($n): string => Identity::clean((string) $n))->filter()->map(fn (string $n): string => Identity::hash($n))->all();
+        if ($own === []) {
+            return null;
+        }
+        $guardianHash = $application->matched_guardian_id ? DB::table('orphan_guardians as g')->join('persons as p', 'p.id', '=', 'g.person_id')
+            ->where('g.id', $application->matched_guardian_id)->value('p.id_hash') : null;
+
+        return array_intersect($own, array_filter([$application->id_hash, $guardianHash])) !== [] ? 'أنت مقدم هذا الطلب أو الوصي فيه؛ لا تراجع طلبك ولا تبت فيه.' : null;
     }
 
     /** Closes the application when the account and every child have a decision. */

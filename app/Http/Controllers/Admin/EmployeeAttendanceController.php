@@ -11,6 +11,7 @@ use App\Services\Attendance\AttendanceRoster;
 use App\Services\Attendance\AttendanceSettings;
 use App\Services\Attendance\HrActionService;
 use App\Services\Attendance\ShiftSwapService;
+use App\Services\AuditService;
 use App\Services\Hr\EmployeeAccess;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
@@ -136,8 +137,14 @@ final class EmployeeAttendanceController extends Controller
         $hr = $this->isHr($request);
         $rows = $this->ledger->filter($this->ledger->rows(['from' => $range['from'], 'to' => $range['to'], 'employee_ids' => [$record->id]], $hr), $range['filter'] ?? null);
 
-        return AttendanceEmployeeLedgerController::workbookResponse($rows->all(), 'الحضور والانصراف — '.AttendanceLedger::fullName($record).' — من '.$range['from'].' إلى '.$range['to'],
+        $response = AttendanceEmployeeLedgerController::workbookResponse($rows->all(), 'الحضور والانصراف — '.AttendanceLedger::fullName($record).' — من '.$range['from'].' إلى '.$range['to'],
             'AIMS_Attendance_'.$record->employee_number.'_'.$range['from'].'_to_'.$range['to'].'.xlsx', $hr);
+        if ($response->isSuccessful()) {
+            app(AuditService::class)->event('attendance.employee_ledger.exported', ['subject_type' => 'employees', 'subject_id' => $record->id, 'sensitivity' => 'personal',
+                'ip' => $request->ip(), 'metadata' => ['from' => $range['from'], 'to' => $range['to'], 'rows' => $rows->count(), 'format' => 'xlsx']]);
+        }
+
+        return $response;
     }
 
     private function authorizedEmployee(Request $request, int $employee): Employee

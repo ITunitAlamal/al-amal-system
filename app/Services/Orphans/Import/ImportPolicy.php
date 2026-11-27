@@ -40,7 +40,7 @@ final class ImportPolicy
 
     /** Fixed invariants: code => level (reject | duplicate | conflict | review). Not editable. */
     public const FIXED = [
-        'missing_child_name' => 'reject', 'future_date' => 'reject', 'invalid_quantity' => 'reject', 'not_in_registry' => 'reject',
+        'missing_child_name' => 'reject', 'future_date' => 'reject', 'invalid_quantity' => 'reject', 'not_in_registry' => 'reject', 'not_eligible' => 'reject',
         'duplicate_in_file' => 'duplicate',
         'child_id_contradiction' => 'conflict', 'identity_other_role' => 'conflict', 'name_differs' => 'conflict', 'guardian_name_differs' => 'conflict',
         'impossible_chronology' => 'conflict', 'source_changed' => 'conflict',
@@ -48,7 +48,7 @@ final class ImportPolicy
     ];
 
     public const FIXED_LABELS = [
-        'missing_child_name' => 'اسم اليتيم غير موجود', 'future_date' => 'تاريخ ميلاد في المستقبل', 'invalid_quantity' => 'كمية غير صالحة', 'not_in_registry' => 'غير موجود في السجل',
+        'missing_child_name' => 'اسم اليتيم غير موجود', 'future_date' => 'تاريخ ميلاد في المستقبل', 'invalid_quantity' => 'كمية غير صالحة', 'not_in_registry' => 'غير موجود في السجل', 'not_eligible' => 'غير مؤهل للحملات',
         'duplicate_in_file' => 'تكرار بالبيانات نفسها في الملف', 'child_id_contradiction' => 'هوية اليتيم نفسها ببيانات مختلفة', 'identity_other_role' => 'الهوية لشخص بدور آخر',
         'name_differs' => 'الاسم يختلف عن السجل', 'guardian_name_differs' => 'اسم الوصي يختلف عن السجل', 'impossible_chronology' => 'تواريخ مستحيلة',
         'source_changed' => 'محتوى الصف تغيّر عند إعادة القراءة', 'missing_guardian' => 'لا وصي مرتبط', 'guardian_conflicts_registry' => 'يخالف وصاية معتمدة في السجل',

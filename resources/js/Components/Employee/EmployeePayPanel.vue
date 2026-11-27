@@ -78,7 +78,7 @@ function submit() {
         <div v-if="canRequest">
             <button v-if="!showForm" type="button" class="btn btn-secondary btn-sm" @click="showForm = true">طلب تعديل الراتب أو الحساب البنكي</button>
             <form v-else class="space-y-3 rounded-xl border border-slate-200 p-4" @submit.prevent="submit">
-                <p class="text-xs text-slate-600">يُرفع الطلب إلى المدير التنفيذي ولا يسري قبل اعتماده؛ السجل الحالي يُغلق قبل تاريخ السريان بيوم ولا يُمحى.</p>
+                <p class="text-xs text-slate-600">يُرفع الطلب إلى المدير التنفيذي (وتعديل المدير التنفيذي نفسه إلى رئيس قسم الحسابات) ولا يسري قبل اعتماده؛ السجل الحالي يُغلق قبل تاريخ السريان بيوم ولا يُمحى.</p>
                 <div class="flex flex-wrap gap-4 text-sm">
                     <label class="flex items-center gap-2"><input v-model="form.changes_pay" type="checkbox" /> تعديل الراتب والعلاوات</label>
                     <label class="flex items-center gap-2"><input v-model="form.changes_bank" type="checkbox" /> تعديل الحساب البنكي</label>

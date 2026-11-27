@@ -2,10 +2,12 @@
 
 namespace App\Console\Commands;
 
+use App\Services\Attendance\AttendanceDeviceBackoff;
 use App\Services\Attendance\AttendanceDeviceProber;
 use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
@@ -32,6 +34,7 @@ final class AttendanceProbeDevices extends Command
             'updated_at' => $now,
         ]);
 
+        $backoff = AttendanceDeviceBackoff::ready();
         $failedProbes = 0;
         foreach ($devices as $device) {
             if (! $device->is_active || ! $device->probe_enabled) {
@@ -49,6 +52,10 @@ final class AttendanceProbeDevices extends Command
             $probeNow = CarbonImmutable::now();
             $hasProbeRequest = $device->probe_requested_at !== null;
             if (! $hasProbeRequest && $device->last_probe_at && CarbonImmutable::parse($device->last_probe_at)->isAfter($probeNow->subSeconds($interval))) {
+                continue;
+            }
+            // A device that keeps failing is probed less often (AttendanceDeviceBackoff); "probe now" still runs at once.
+            if (! $hasProbeRequest && $backoff && $device->probe_retry_at && $probeNow->lessThan(CarbonImmutable::parse($device->probe_retry_at))) {
                 continue;
             }
 
@@ -90,12 +97,27 @@ final class AttendanceProbeDevices extends Command
                     'probe_error_code' => $result['error_code'],
                     'updated_at' => now(),
                 ];
+                $failures = (int) ($device->probe_failure_count ?? 0);
                 if ($result['result'] === 'connected') {
                     $status['last_success_at'] = now();
+                    if ($backoff) {
+                        $status += ['probe_failure_count' => 0, 'probe_retry_at' => null];
+                        if ($failures > 0) {
+                            Log::info('Attendance device reachable again', ['device_id' => (int) $device->id, 'failed_probes' => $failures]);
+                        }
+                    }
                 } else {
                     if ($result['error_code'] !== 'device_busy' && Schema::hasColumn('attendance_devices', 'last_failure_at')) {
                         $status['last_failure_at'] = now();
                         $status['last_failure_code'] = $result['error_code'];
+                    }
+                    // A busy device is syncing, not unreachable: it neither counts as a failure nor delays the next probe.
+                    if ($backoff && $result['error_code'] !== 'device_busy') {
+                        $retryIn = AttendanceDeviceBackoff::delay($failures + 1, $interval);
+                        $status += ['probe_failure_count' => $failures + 1, 'probe_retry_at' => now()->addSeconds($retryIn)];
+                        if ($failures === 0 || $device->probe_error_code !== $result['error_code']) {
+                            Log::warning('Attendance device unreachable', ['device_id' => (int) $device->id, 'code' => $result['error_code'], 'retry_in_seconds' => $retryIn]);
+                        }
                     }
                     $failedProbes++;
                     $this->warn("Device {$device->id} probe failed ({$result['error_code']}).");
@@ -124,6 +146,8 @@ final class AttendanceProbeDevices extends Command
             }
         }
 
-        return $failedProbes === 0 ? self::SUCCESS : self::FAILURE;
+        // An unreachable device is a recorded state of the device (shown on the attendance page and logged once above),
+        // not a failure of this command: failing it would log a stack trace on every scheduler run.
+        return $backoff || $failedProbes === 0 ? self::SUCCESS : self::FAILURE;
     }
 }

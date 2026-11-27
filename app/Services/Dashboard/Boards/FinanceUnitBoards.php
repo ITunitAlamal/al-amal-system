@@ -4,11 +4,12 @@ namespace App\Services\Dashboard\Boards;
 
 use App\Models\User;
 use App\Services\Finance\FinanceGuard;
+use App\Services\Rentals\RentalLedger;
 use Illuminate\Support\Facades\DB;
 
 /**
  * Role boards of the Accounts units, each from its own records and shown only to holders of that unit's permissions:
- * head (consolidated monitoring), procurement, stores, invoices and vouchers, payroll. A purchasing officer never
+ * head (consolidated monitoring), procurement, stores, invoices, payments, receipts and payroll. A purchasing officer never
  * gets salary or stock widgets, a storekeeper never gets payment or payroll figures, and so on.
  */
 final class FinanceUnitBoards
@@ -19,6 +20,8 @@ final class FinanceUnitBoards
         'procurement' => ['finance.procurement.manage', 'finance.procurement.review'],
         'stores' => ['finance.purchase.receive', 'finance.stock.receive', 'finance.stock.issue', 'finance.stock.count', 'finance.stock.count.approve', 'finance.warehouse.manage'],
         'invoices' => ['finance.purchase.invoice'],
+        'payments' => ['finance.payment.draft', 'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute', 'finance.payment.record'],
+        'receipts' => ['finance.receipt.draft', 'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute', 'finance.rentals.record'],
         'payroll' => ['finance.payroll.record', 'finance.payroll.publish'],
     ];
 
@@ -41,6 +44,8 @@ final class FinanceUnitBoards
             'procurement' => $this->procurement($user),
             'stores' => $this->stores(),
             'invoices' => $this->invoices(),
+            'payments' => ! $this->guard->documentaryMode() && $this->guard->canViewTransactions($user, 'payment') ? $this->transactions($user, 'payment') : $this->paymentVouchers(),
+            'receipts' => ! $this->guard->documentaryMode() && $this->guard->canViewTransactions($user, 'receipt') ? $this->transactions($user, 'receipt') : $this->rentalReceipts(),
             default => $this->payroll($user),
         };
     }
@@ -163,20 +168,44 @@ final class FinanceUnitBoards
 
     private function invoices(): array
     {
-        $unpaid = DB::table('finance_purchase_invoices')->where('state', '!=', 'paid');
         $toInvoice = DB::table('finance_purchase_orders as o')->whereIn('o.state', ['partial_received', 'received'])
             ->whereNotExists(fn ($q) => $q->from('finance_purchase_invoices as v')->whereColumn('v.order_id', 'o.id'));
+        $invoices = DB::table('finance_purchase_invoices');
+        $rows = (clone $toInvoice)->orderBy('o.created_at')->limit(8)->get(['o.number', 'o.amount', 'o.created_at'])
+            ->map(fn (object $row): array => ['cells' => ['reference' => $row->number, 'amount' => number_format((float) $row->amount, 2), 'age' => BoardKit::age($row->created_at)],
+                'status' => ['label' => 'مستلم — بانتظار الفاتورة', 'tone' => 'warning'], 'url' => $this->link('orders'), 'action' => 'تسجيل الفاتورة'])->all();
+
+        return [
+            'key' => 'finance-invoices', 'title' => 'فواتير الموردين', 'decision' => 'أي أوامر الشراء المستلمة تحتاج تسجيل فاتورة المورد؟', 'scope' => 'اختصاص الفواتير في قسم الحسابات',
+            'hero' => BoardKit::metric('أوامر مستلمة دون فاتورة', (clone $toInvoice)->count(), 'down', url: $this->link('orders')),
+            'kpis' => [BoardKit::metric('فواتير سُجّلت خلال آخر 7 أيام', (clone $invoices)->where('created_at', '>', now()->subDays(7))->count(), null,
+                BoardKit::weekOverWeek(clone $invoices, 'created_at'), url: $this->link('invoices'))],
+            'trend' => BoardKit::trend('فواتير الموردين أسبوعيًا', 'الفواتير المسجلة من اختصاص الفواتير فقط.', [
+                ['label' => 'فواتير', 'values' => BoardKit::weekly(clone $invoices, 'created_at')],
+            ]),
+            'bars' => BoardKit::bars('الفواتير حسب الحالة', 'حالة فواتير الموردين المسجلة.', [
+                ['label' => 'بانتظار السداد', 'value' => (clone $invoices)->where('state', '!=', 'paid')->count(), 'url' => $this->link('invoices')],
+                ['label' => 'مسددة', 'value' => (clone $invoices)->where('state', 'paid')->count(), 'url' => $this->link('invoices')],
+            ]),
+            'table' => BoardKit::table('أوامر تنتظر فاتورة المورد', [['key' => 'reference', 'label' => 'أمر الشراء'], ['key' => 'amount', 'label' => 'القيمة'], ['key' => 'age', 'label' => 'منذ الإصدار']],
+                $rows, 'لا توجد أوامر مستلمة تنتظر فاتورة.', $this->link('orders')),
+            'actions' => [['label' => 'فواتير الموردين', 'url' => $this->link('invoices'), 'icon' => 'receipt']],
+        ];
+    }
+
+    private function paymentVouchers(): array
+    {
+        $unpaid = DB::table('finance_purchase_invoices')->where('state', '!=', 'paid');
         $vouchers = DB::table('finance_purchase_invoices')->whereNotNull('external_recorded_at');
         $rows = (clone $unpaid)->orderBy('invoice_on')->limit(8)->get(['invoice_no', 'amount', 'currency', 'invoice_on'])
             ->map(fn (object $v): array => ['cells' => ['reference' => $v->invoice_no, 'amount' => number_format((float) $v->amount, 2).' '.$v->currency, 'age' => BoardKit::age($v->invoice_on)],
-                'status' => ['label' => 'بانتظار رقم سند الصرف', 'tone' => 'warning'], 'url' => $this->link('invoices'), 'action' => 'تسجيل السند', 'overdue' => $v->invoice_on < now()->subDays(30)->toDateString()])->all();
+                'status' => ['label' => 'بانتظار رقم سند الصرف', 'tone' => 'warning'], 'url' => $this->link('payment_vouchers'), 'action' => 'تسجيل السند', 'overdue' => $v->invoice_on < now()->subDays(30)->toDateString()])->all();
 
         return [
-            'key' => 'finance-invoices', 'title' => 'الفواتير وسندات الصرف', 'decision' => 'أي البضاعة المستلمة تحتاج فاتورة، وأي الفواتير تنتظر سند الصرف؟', 'scope' => 'المحاسب العام',
-            'hero' => BoardKit::metric('فواتير بانتظار سند الصرف', (clone $unpaid)->count(), 'down', url: $this->link('invoices')),
+            'key' => 'finance-payments', 'title' => 'الصرف', 'decision' => 'أي فواتير الموردين تنتظر تسجيل سند الصرف من البرنامج المحاسبي؟', 'scope' => 'اختصاص الصرف في قسم الحسابات',
+            'hero' => BoardKit::metric('فواتير بانتظار سند الصرف', (clone $unpaid)->count(), 'down', url: $this->link('payment_vouchers')),
             'kpis' => [
-                BoardKit::metric('أوامر مستلمة دون فاتورة', (clone $toInvoice)->count(), 'down', url: $this->link('orders')),
-                BoardKit::metric('سندات صرف سُجّلت', (clone $vouchers)->where('external_recorded_at', '>', now()->subDays(7))->count(), null, BoardKit::weekOverWeek(clone $vouchers, 'external_recorded_at'), url: $this->link('invoices')),
+                BoardKit::metric('سندات صرف سُجّلت', (clone $vouchers)->where('external_recorded_at', '>', now()->subDays(7))->count(), null, BoardKit::weekOverWeek(clone $vouchers, 'external_recorded_at'), url: $this->link('payment_vouchers')),
                 BoardKit::unavailable('أرصدة الصناديق والبنوك', 'الدفاتر تُمسك في البرنامج المحاسبي الخارجي؛ لا مصدر لها في AIMS.'),
             ],
             'trend' => BoardKit::trend('الفواتير والسندات أسبوعيًا', 'فواتير الموردين المسجلة مقابل سندات الصرف المسجلة في كل أسبوع.', [
@@ -184,12 +213,72 @@ final class FinanceUnitBoards
                 ['label' => 'سندات صرف', 'values' => BoardKit::weekly(clone $vouchers, 'external_recorded_at')],
             ]),
             'bars' => BoardKit::bars('الفواتير حسب الحالة', 'فواتير الموردين المسجلة.', [
-                ['label' => 'بانتظار السند', 'value' => (clone $unpaid)->count(), 'url' => $this->link('invoices')],
-                ['label' => 'مسددة', 'value' => DB::table('finance_purchase_invoices')->where('state', 'paid')->count(), 'url' => $this->link('invoices')],
+                ['label' => 'بانتظار السند', 'value' => (clone $unpaid)->count(), 'url' => $this->link('payment_vouchers')],
+                ['label' => 'مسددة', 'value' => DB::table('finance_purchase_invoices')->where('state', 'paid')->count(), 'url' => $this->link('payment_vouchers')],
             ]),
             'table' => BoardKit::table('فواتير تنتظر سند الصرف', [['key' => 'reference', 'label' => 'الفاتورة'], ['key' => 'amount', 'label' => 'القيمة'], ['key' => 'age', 'label' => 'منذ الفاتورة']],
-                $rows, 'لا توجد فواتير معلقة.', $this->link('invoices')),
-            'actions' => [['label' => 'فواتير الموردين', 'url' => $this->link('invoices'), 'icon' => 'receipt']],
+                $rows, 'لا توجد فواتير معلقة.', $this->link('payment_vouchers')),
+            'actions' => [['label' => 'سندات الصرف على الفواتير', 'url' => $this->link('payment_vouchers'), 'icon' => 'banknote']],
+        ];
+    }
+
+    private function transactions(User $user, string $kind): array
+    {
+        abort_unless($this->guard->canViewTransactions($user, $kind), 403);
+        $payment = $kind === 'payment';
+        $view = $payment ? 'payments' : 'receipts';
+        $label = $payment ? 'الصرف' : 'القبض';
+        $url = $this->link($view);
+        $transactions = DB::table('finance_transactions')->where('kind', $kind);
+        $states = ['draft' => 'draft', 'review' => 'pending_review', 'approve' => 'pending_director', 'execute' => 'approved'];
+        $mine = (clone $transactions)->whereIn('state', array_values(array_filter($states, fn (string $state, string $action): bool => $this->guard->allowsTransaction($user, $kind, $action), ARRAY_FILTER_USE_BOTH)));
+        $rows = (clone $mine)->orderBy('created_at')->limit(8)->get(['document_no', 'amount', 'currency', 'created_at', 'state'])
+            ->map(fn (object $row): array => ['cells' => ['reference' => $row->document_no, 'amount' => number_format((float) $row->amount, 2).' '.$row->currency, 'age' => BoardKit::age($row->created_at)],
+                'status' => ['label' => self::TRANSACTION_STATES[$row->state] ?? $row->state, 'tone' => 'warning'], 'url' => $url, 'action' => 'فتح'])->all();
+
+        return [
+            'key' => 'finance-'.$view, 'title' => $label, 'decision' => 'أي سندات '.$label.' تحتاج إجراءً ضمن صلاحياتك؟', 'scope' => 'اختصاص '.$label.' في قسم الحسابات',
+            'hero' => BoardKit::metric('سندات '.$label.' تنتظر إجراءك', (clone $mine)->count(), 'down', url: $url),
+            'kpis' => [BoardKit::metric('سندات '.$label.' المنفذة خلال آخر 7 أيام', (clone $transactions)->where('state', 'executed')->where('executed_at', '>', now()->subDays(7))->count(), null, url: $url)],
+            'trend' => BoardKit::trend('سندات '.$label.' المنفذة أسبوعيًا', 'سندات '.$label.' فقط ضمن مجال صلاحياتك.', [
+                ['label' => $label, 'values' => BoardKit::weekly((clone $transactions)->where('state', 'executed'), 'executed_at')],
+            ]),
+            'bars' => BoardKit::bars('سندات '.$label.' حسب الحالة', 'سندات '.$label.' التي تحتاج إجراءً ضمن صلاحياتك.',
+                (clone $mine)->select('state', DB::raw('count(*) as n'))->groupBy('state')->get()
+                    ->map(fn (object $row): array => ['label' => self::TRANSACTION_STATES[$row->state] ?? $row->state, 'value' => (int) $row->n, 'url' => $url])->all()),
+            'table' => BoardKit::table('سندات '.$label.' التي تحتاج إجراءً', [['key' => 'reference', 'label' => 'السند'], ['key' => 'amount', 'label' => 'المبلغ'], ['key' => 'age', 'label' => 'العمر']],
+                $rows, 'لا توجد سندات تنتظر إجراءك.', $url),
+            'actions' => [['label' => 'سندات '.$label, 'url' => $url, 'icon' => $payment ? 'banknote' : 'hand-coins']],
+        ];
+    }
+
+    private const TRANSACTION_STATES = ['draft' => 'مسودة', 'pending_review' => 'بانتظار المراجعة', 'pending_director' => 'بانتظار الاعتماد', 'approved' => 'بانتظار التنفيذ'];
+
+    private function rentalReceipts(): array
+    {
+        $url = route('finance.rentals', [], false);
+        $dues = DB::query()->fromSub(app(RentalLedger::class)->dues(), 'b')->where('b.remaining', '>', 0);
+        $receipts = DB::table('aims_rental_receipt_allocations')->whereNull('reversed_at');
+        $rows = (clone $dues)->orderBy('b.due_on')->limit(8)->get(['b.contract_number', 'b.remaining', 'b.currency_code', 'b.due_on', 'b.overdue'])
+            ->map(fn (object $row): array => ['cells' => ['reference' => $row->contract_number, 'amount' => number_format((float) $row->remaining, 2).' '.$row->currency_code, 'date' => $row->due_on],
+                'status' => ['label' => $row->overdue ? 'متأخر' : 'مستحق', 'tone' => $row->overdue ? 'warning' : 'info'], 'url' => $url, 'action' => 'تسجيل القبض', 'overdue' => (bool) $row->overdue])->all();
+
+        return [
+            'key' => 'finance-receipts', 'title' => 'القبض', 'decision' => 'أي استحقاقات الإيجار تحتاج تسجيل قبض من البرنامج المحاسبي؟', 'scope' => 'اختصاص القبض في قسم الحسابات',
+            'hero' => BoardKit::metric('استحقاقات لم تُسدَّد بالكامل', (clone $dues)->count(), 'down', url: $url),
+            'kpis' => [
+                BoardKit::metric('استحقاقات متأخرة', (clone $dues)->where('b.overdue', true)->count(), 'down', url: $url),
+                BoardKit::metric('قيود قبض سُجّلت خلال آخر 7 أيام', (clone $receipts)->where('created_at', '>', now()->subDays(7))->count(), null, url: $url),
+            ],
+            'trend' => BoardKit::trend('قيود قبض الإيجارات أسبوعيًا', 'تسجيلات القبض السارية دون المعكوسة، وليست عدد السندات الفريد.', [
+                ['label' => 'قيود قبض', 'values' => BoardKit::weekly(clone $receipts, 'created_at')],
+            ]),
+            'bars' => BoardKit::bars('الاستحقاقات المفتوحة حسب العملة', 'عدد الاستحقاقات غير المسددة، مع إبقاء كل عملة مستقلة.',
+                (clone $dues)->select('b.currency_code', DB::raw('count(*) as n'))->groupBy('b.currency_code')->get()
+                    ->map(fn (object $row): array => ['label' => $row->currency_code, 'value' => (int) $row->n, 'url' => $url])->all()),
+            'table' => BoardKit::table('أقدم استحقاقات لم تُسدَّد', [['key' => 'reference', 'label' => 'العقد'], ['key' => 'amount', 'label' => 'المتبقي'], ['key' => 'date', 'label' => 'تاريخ الاستحقاق']],
+                $rows, 'لا توجد استحقاقات غير مسددة.', $url),
+            'actions' => [['label' => 'قبض الإيجارات وتسوياتها', 'url' => $url, 'icon' => 'hand-coins']],
         ];
     }
 

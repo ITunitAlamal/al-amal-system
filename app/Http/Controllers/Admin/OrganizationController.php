@@ -9,6 +9,7 @@ use App\Services\Configuration\NavigationAccessRules;
 use App\Services\Organization\OrganizationStructure;
 use App\Services\Organization\ScopedDelegations;
 use App\Services\Organization\StructureChanges;
+use App\Services\Workflow\OpenStepRerouter;
 use App\Services\Workflow\WorkflowEngine;
 use App\Services\Workflow\WorkflowProgress;
 use App\Services\WorkflowVisibilityService;
@@ -87,7 +88,7 @@ class OrganizationController extends Controller
         abort_unless($user->canManageOrganization(), 403, 'تعيين رؤساء الأقسام لمدير النظام ورئيس الموارد البشرية.');
         $data = $request->validate(['head_user_id' => ['nullable', 'integer']], [], ['head_user_id' => 'الرئيس']);
         $head = isset($data['head_user_id']) ? (int) $data['head_user_id'] : null;
-        DB::transaction(function () use ($request, $department, $head, $user): void {
+        $formerHead = DB::transaction(function () use ($request, $department, $head, $user): ?int {
             $node = DB::table('departments')->where('id', $department)->whereNull('deleted_at')->lockForUpdate()->first();
             abort_unless($node, 404);
             if ($node->node_type === 'unit') {
@@ -98,9 +99,21 @@ class OrganizationController extends Controller
             }
             DB::table('departments')->where('id', $department)->update(['head_user_id' => $head, 'updated_at' => now()]);
             $this->audit->recordRow('organization.head.assigned', 'departments', $department, ['head_user_id' => $node->head_user_id], ['head_user_id' => $head], $user->id, $request->ip());
-        });
 
-        return back()->with('success', $head ? 'عُيّن الرئيس.' : 'أُلغي تعيين الرئيس.');
+            return $node->head_user_id !== null ? (int) $node->head_user_id : null;
+        });
+        // Open requests held under the former head's authority move to whoever holds the step now (never approved or skipped).
+        $rerouted = 0;
+        if ($formerHead !== $head) {
+            $rerouter = app(OpenStepRerouter::class);
+            try {
+                $rerouted = $rerouter->reroute($rerouter->staleInstanceIds($rerouter->forDepartment($department, $formerHead)), 'تغيّر رئيس القسم', $user->id);
+            } catch (\Throwable $e) {
+                report($e); // the appointment stands; the scheduled workflow:check-sla run reroutes them
+            }
+        }
+
+        return back()->with('success', ($head ? 'عُيّن الرئيس.' : 'أُلغي تعيين الرئيس.').($rerouted ? " وأُعيد توجيه {$rerouted} معاملة مفتوحة إلى صاحب الصلاحية الحالي." : ''));
     }
 
     public function propose(Request $request): RedirectResponse

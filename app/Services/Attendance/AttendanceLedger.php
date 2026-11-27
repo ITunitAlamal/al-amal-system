@@ -125,21 +125,28 @@ final class AttendanceLedger
      * Administrative actions under review or issued, per "employee|day" (the attendance day they came from, else the
      * incident date). Confidential: call only for viewers entitled to the register.
      *
+     * With $withReturned, an action its reviewer sent back to its author is listed too, as «مُعاد للتعديل»: it is a
+     * draft again in the register, but it is not a new draft and the day it came from still shows it (day detail only;
+     * the ledger's rows, filter and export keep counting actions under review or issued).
+     *
      * @param  list<int>  $employeeIds
      * @return array<string, list<array{id: int, status: string, label: string}>>
      */
-    public function hrActions(array $employeeIds, string $from, string $to): array
+    public function hrActions(array $employeeIds, string $from, string $to, bool $withReturned = false): array
     {
         if ($employeeIds === [] || ! self::hasTable('employee_hr_actions')) {
             return [];
         }
         $grouped = [];
         foreach (DB::table('employee_hr_actions as a')->join('master_data_values as t', 't.id', '=', 'a.type_value_id')
-            ->whereIn('a.employee_id', $employeeIds)->whereIn('a.status', ['in_review', 'issued'])
+            ->whereIn('a.employee_id', $employeeIds)
+            ->where(fn ($query) => $query->whereIn('a.status', ['in_review', 'issued'])
+                ->when($withReturned, fn ($returned) => $returned->orWhere(fn ($draft) => $draft->where('a.status', 'draft')->whereNotNull('a.reviewed_at'))))
             ->whereRaw('COALESCE(a.attendance_date, a.incident_date) BETWEEN ? AND ?', [$from, $to])
-            ->get(['a.id', 'a.employee_id', 'a.status', 'a.reference_no', DB::raw('COALESCE(a.attendance_date, a.incident_date) as day'), 't.name_ar']) as $action) {
+            ->get(['a.id', 'a.employee_id', 'a.status', 'a.reviewed_at', 'a.reference_no', DB::raw('COALESCE(a.attendance_date, a.incident_date) as day'), 't.name_ar']) as $action) {
+            $status = HrActionService::isReturned($action) ? HrActionService::RETURNED_LABEL : (self::HR_ACTION_STATUS[$action->status] ?? $action->status);
             $grouped[$action->employee_id.'|'.$action->day][] = ['id' => (int) $action->id, 'status' => $action->status,
-                'label' => $action->name_ar.' — '.(self::HR_ACTION_STATUS[$action->status] ?? $action->status).($action->reference_no ? ' ('.$action->reference_no.')' : '')];
+                'label' => $action->name_ar.' — '.$status.($action->reference_no ? ' ('.$action->reference_no.')' : '')];
         }
 
         return $grouped;
@@ -237,7 +244,7 @@ final class AttendanceLedger
             'work_date' => $date,
             'day' => $record ? $this->view->present($record) : null,
             'requests' => $this->requests([$employeeId], $date, $date)[$key] ?? [],
-            'hr_actions' => $withHrActions ? ($this->hrActions([$employeeId], $date, $date)[$key] ?? []) : [],
+            'hr_actions' => $withHrActions ? ($this->hrActions([$employeeId], $date, $date, true)[$key] ?? []) : [],
             'punches' => $punches->map(function (object $punch) use ($auto, $manual, $local, $tz, $date, $entryId, $exitId): array {
                 $raw = json_decode((string) $punch->raw_payload, true) ?: [];
                 $time = CarbonImmutable::parse($punch->occurred_at)->setTimezone($tz);

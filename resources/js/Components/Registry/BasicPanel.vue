@@ -17,7 +17,12 @@ const verifyForm = useForm({ source: '' });
 const failure = ref('');
 function save() {
     form.transform(data => { const out = { ...data }; if (!out.id_number) delete out.id_number; return out; })
-        .put(`/orphans/registry/persons/${props.person.public_id}`, { preserveScroll: true, onSuccess: () => { editing.value = false; } });
+        .put(`/orphans/registry/persons/${props.person.public_id}`, { preserveScroll: true, onSuccess: () => {
+            // Back to the saved record: a change sent to the head as a request must not be resent with the next edit.
+            form.defaults({ ...pick(props.person), id_number: '' });
+            form.reset();
+            editing.value = false;
+        } });
 }
 async function reveal() {
     failure.value = '';
@@ -43,6 +48,7 @@ const rows = p => [['الاسم الأول', p.first_name], ['اسم الأب', 
         <form v-else class="space-y-3 rounded-xl border border-slate-200 p-4" @submit.prevent="save">
             <PersonFields v-model="form" :errors="form.errors" :options="options" :except="person.public_id" />
             <p class="text-xs text-slate-500">اترك رقم الهوية فارغًا للإبقاء على الرقم الحالي؛ تغيير الرقم يلغي أي تحقق سابق.</p>
+            <p v-if="!abilities.decide" class="text-xs text-slate-500">إن كان الشخص مرتبطًا بملف معتمد، يُرسل تغيير الاسم أو الهوية أو تاريخ الميلاد أو الجنس طلبًا يعتمده رئيس القسم، وتُحفظ بقية الحقول مباشرة.</p>
             <label class="block text-sm">ملاحظات<textarea v-model="form.notes" class="field mt-1" rows="2" maxlength="3000" /></label>
             <div class="flex gap-2"><button type="submit" class="btn btn-primary" :disabled="form.processing">حفظ</button><button type="button" class="btn btn-secondary" @click="editing = false">إلغاء</button></div>
         </form>

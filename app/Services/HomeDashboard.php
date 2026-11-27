@@ -14,6 +14,7 @@ use App\Services\Finance\FinanceGuard;
 use App\Services\Progress\TransactionTracker;
 use App\Services\Workflow\WorkflowCatalog;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -66,6 +67,16 @@ final class HomeDashboard
             'finance' => $this->financePanel($user),
             'profile' => $employee ? $this->profile($employee, $user) : null,
         ];
+    }
+
+    /**
+     * Everything that waits for the user, the list for() counts and takes its first rows from (read once).
+     *
+     * @return Collection<int, array<string, mixed>>
+     */
+    public function tasks(User $user): Collection
+    {
+        return $this->tracker->tasksOf($user);
     }
 
     /**
@@ -162,6 +173,7 @@ final class HomeDashboard
         $options = [$this->accessRules->allows($user, 'leave_requester')
             ? ['label' => 'طلب إجازة', 'url' => route('leaves.create', [], false)]
             : ['label' => 'طلب إجازة', 'url' => null, 'reason' => $this->accessRules->explain($user, 'leave_requester')]];
+        $options[] = ['label' => 'إصدار قسيمة راتب (فيشة)', 'url' => route('payslips.create', [], false)];
         foreach ($this->catalog->startableFor($user) as $definition) {
             $reason = $this->catalog->unavailableReason($user, $definition);
             $options[] = $reason === null

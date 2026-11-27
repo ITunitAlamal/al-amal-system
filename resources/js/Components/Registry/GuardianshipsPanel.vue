@@ -40,7 +40,7 @@ const titles = { decide: 'البت في الوصاية لهذا الطفل', rep
                 <p v-if="l.decided_at" class="text-xs text-slate-500">القرار: {{ l.decided_by_name }} · {{ l.decided_at?.slice(0, 16) }}<span v-if="l.decision_note"> · {{ l.decision_note }}</span></p>
                 <p v-if="l.ended_reason" class="text-xs text-slate-500">سبب الإنهاء: {{ l.ended_reason }}</p>
                 <div v-if="!fromGuardian && ['claimed', 'pending', 'approved'].includes(l.status) && abilities.edit" class="mt-2 flex flex-wrap gap-1">
-                    <button v-if="abilities.portal && l.status !== 'approved'" type="button" class="btn btn-sm btn-primary" @click="open('decide', l)">البت في الوصاية</button>
+                    <button v-if="abilities.decide_portal && l.status !== 'approved'" type="button" class="btn btn-sm btn-primary" @click="open('decide', l)">البت في الوصاية</button>
                     <button type="button" class="btn btn-sm btn-secondary" @click="open('replace', l)">استبدال الوصي</button>
                     <button type="button" class="btn btn-sm btn-secondary" @click="open('end', l)">إنهاء</button>
                 </div>
@@ -63,7 +63,7 @@ const titles = { decide: 'البت في الوصاية لهذا الطفل', rep
             <template v-if="['replace', 'add'].includes(action.kind)">
                 <GuardianPicker v-model="picked" label="الوصي الجديد" />
                 <div class="grid gap-3 sm:grid-cols-3">
-                    <label class="text-sm">حالة الارتباط<select v-model="form.link_status" class="field mt-1"><option value="claimed">مُدّعاة</option><option value="pending">بانتظار التحقق</option><option v-if="abilities.portal" value="approved">معتمدة</option></select></label>
+                    <label class="text-sm">حالة الارتباط<select v-model="form.link_status" class="field mt-1"><option value="claimed">مُدّعاة</option><option value="pending">بانتظار التحقق</option><option v-if="abilities.decide_portal" value="approved">معتمدة</option></select></label>
                     <label class="text-sm">صلة القرابة<select v-model="form.kinship_value_id" class="field mt-1"><option :value="null">غير محددة</option><option v-for="k in options.kinship" :key="k.id" :value="k.id">{{ k.name }}</option></select></label>
                     <label class="text-sm">بداية السريان<input v-model="form.starts_on" type="date" class="field mt-1"></label>
                 </div>

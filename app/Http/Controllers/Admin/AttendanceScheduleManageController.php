@@ -6,6 +6,7 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Services\Attendance\AttendanceDailyService;
+use App\Services\Organization\EffectiveAssignments;
 use App\Support\Attendance\ScheduleSettings;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -15,21 +16,23 @@ use Illuminate\Validation\ValidationException;
 
 final class AttendanceScheduleManageController extends Controller
 {
+    /** HR prepares a template change (the system administrator or the HR head); the executive director decides it. */
     private function staff(Request $r): void
     {
-        abort_unless($r->user()?->is_active && ($r->user()->isSystemAdmin() || $r->user()->isHrDepartmentHead() || $this->executive((int) $r->user()->id)), 403);
+        abort_unless($r->user()?->is_active && ($r->user()->isSystemAdmin() || $r->user()->isHrDepartmentHead()), 403);
     }
 
+    /** The executive director only: the technical administrator takes no business decision (2026-10-22 centralization). */
     private function canApprove(Request $r): bool
     {
-        return $r->user()?->is_active && ($r->user()->isSystemAdmin() || $this->executive((int) $r->user()->id));
+        return $r->user()?->is_active && $this->executive((int) $r->user()->id);
     }
 
     private function executive(int $id): bool
     {
         return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
             ->join('users as u', 'u.id', '=', 'a.user_id')->where('a.user_id', $id)
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->exists();
+            ->where('r.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->exists();
     }
 
     private function audit(Request $r, int $id, string $action, array $details): void
@@ -77,13 +80,16 @@ final class AttendanceScheduleManageController extends Controller
 
     public function decide(Request $r, int $requestId)
     {
-        abort_unless($this->canApprove($r), 403);
+        abort_unless($this->canApprove($r), 403, 'يعتمد تعديل قالب الدوام المدير التنفيذي.');
         $v = $r->validate(['decision' => ['required', Rule::in(['approved', 'rejected'])]]);
         DB::transaction(function () use ($r, $requestId, $v) {
             $req = DB::table('attendance_schedule_change_requests')->where('id', $requestId)->lockForUpdate()->first();
             abort_unless($req, 404);
             if ($req->status !== 'pending') {
                 throw ValidationException::withMessages(['decision' => 'تم البت في الطلب مسبقًا.']);
+            }
+            if ((int) $req->requested_by === (int) $r->user()->id) {
+                throw ValidationException::withMessages(['decision' => 'لا يعتمد مقدم الطلب طلبه.']);
             }
             $row = DB::table('attendance_schedules')->where('id', $req->schedule_id)->lockForUpdate()->first();
             abort_unless($row, 404);

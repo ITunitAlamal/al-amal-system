@@ -39,11 +39,13 @@ use App\Http\Controllers\FormDraftController;
 use App\Http\Controllers\HomeController;
 use App\Http\Controllers\HrDashboardController;
 use App\Http\Controllers\KpiController;
-use App\Http\Controllers\MaintenanceRequestController;
+use App\Http\Controllers\MaintenanceAddendumController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\PayslipController;
 use App\Http\Controllers\PersonalTaskController;
 use App\Http\Controllers\QuickSearchController;
+use App\Http\Controllers\WorkflowAssignmentController;
+use App\Http\Controllers\WorkflowAttachmentController;
 use App\Http\Controllers\WorkflowDetailsController;
 use App\Http\Controllers\WorkflowRequestController;
 use App\Http\Controllers\WorkflowTaskController;
@@ -298,66 +300,6 @@ Route::middleware('auth')->group(function () {
         ->name('form-drafts.save');
 
     // -------------------------------------------------
-    // 3.10 صفحة تجربة الحفظ التلقائي - AIMS v1.1
-    // -------------------------------------------------
-
-    Route::get('/demo/maintenance-draft', function () {
-
-        $user = auth()->user();
-
-        abort_unless(
-            $user->isSystemAdmin(),
-            403,
-            'هذه الصفحة التجريبية متاحة لمدير النظام فقط.'
-        );
-
-        $navigation = [
-            [
-                'label' => 'لوحة التحكم',
-                'url' => route('ui.preview'),
-                'icon' => '▦',
-                'active' => false,
-            ],
-            [
-                'label' => 'إدارة الأقسام',
-                'url' => route('admin.departments.vue'),
-                'icon' => '🏢',
-                'active' => false,
-            ],
-            [
-                'label' => 'إدارة الموظفين',
-                'url' => route('admin.employees.index'),
-                'icon' => '👥',
-                'active' => false,
-            ],
-            [
-                'label' => 'سجل نشاط النظام',
-                'url' => route('admin.audit-logs.index'),
-                'icon' => '📋',
-                'active' => false,
-            ],
-            [
-                'label' => 'تجربة الحفظ التلقائي',
-                'url' => route('demo.maintenance-draft'),
-                'icon' => '💾',
-                'active' => true,
-            ],
-            [
-                'label' => 'إعدادات العملات والصلاحيات المالية',
-                'url' => route('admin.financial-settings.ui'),
-                'icon' => '💰',
-                'active' => false,
-            ],
-        ];
-
-        return Inertia::render('Demo/MaintenanceDraft', [
-            'username' => $user->name,
-            'navigation' => $navigation,
-        ]);
-
-    })->name('demo.maintenance-draft');
-
-    // -------------------------------------------------
     // 3.11 واجهة إعدادات العملات والصلاحيات المالية - Vue
     // -------------------------------------------------
 
@@ -455,6 +397,20 @@ Route::middleware('auth')->group(function () {
         ->whereUuid('publicId')->middleware('throttle:30,1')->name('workflows.resume');
     Route::post('/workflows/{publicId}/reopen', [WorkflowTaskController::class, 'reopen'])
         ->whereUuid('publicId')->middleware('throttle:30,1')->name('workflows.reopen');
+    // «إعادة تحديد المسؤول»: the executive director or the system administrator; the step's own rules choose.
+    Route::post('/workflows/{publicId}/reroute', [WorkflowTaskController::class, 'reroute'])
+        ->whereUuid('publicId')->middleware('throttle:30,1')->name('workflows.reroute');
+    // «إسناد إلى موظف» و«سحب الإسناد»: the head who supervises the current step (StepAssignments).
+    Route::post('/workflows/{publicId}/assign', [WorkflowAssignmentController::class, 'assign'])
+        ->whereUuid('publicId')->middleware('throttle:30,1')->name('workflows.assign');
+    Route::post('/workflows/{publicId}/withdraw-assignment', [WorkflowAssignmentController::class, 'withdraw'])
+        ->whereUuid('publicId')->middleware('throttle:30,1')->name('workflows.withdraw-assignment');
+    // «قرار فصل» of a required maintenance addendum, by the holder of the original's closing stage (MaintenanceAddenda).
+    Route::post('/workflows/{publicId}/addenda/{childPublicId}/separate', [MaintenanceAddendumController::class, 'separate'])
+        ->whereUuid(['publicId', 'childPublicId'])->middleware('throttle:20,1')->name('workflows.addenda.separate');
+    // مرفقات الطلبات العامة: every download is checked against the viewer's access and recorded; no public links.
+    Route::get('/workflows/{publicId}/attachments/{attachment}', [WorkflowAttachmentController::class, 'download'])
+        ->whereUuid(['publicId', 'attachment'])->middleware('throttle:60,1')->name('workflows.attachments.download');
 
     // -------------------------------------------------
     // 3.13.1 طلباتي ومهامي - محرك سير العمل الديناميكي
@@ -527,20 +483,13 @@ Route::middleware('auth')->group(function () {
         });
 
     // -------------------------------------------------
-    // 3.14 طلبات الصيانة - المسودات فقط
+    // 3.14 طلبات الصيانة: شاشة المسودات القديمة أُزيلت؛ الرابط القديم يفتح «طلب صيانة» من «طلباتي ← طلب جديد»
     // -------------------------------------------------
 
-    Route::prefix('maintenance/requests')
-        ->name('maintenance.requests.')
-        ->controller(MaintenanceRequestController::class)
-        ->group(function () {
-            Route::get('/create', 'create')->name('create');
-            Route::post('/', 'store')->name('store');
-            Route::get('/{publicId}/edit', 'edit')
-                ->whereUuid('publicId')->name('edit');
-            Route::put('/{publicId}', 'update')
-                ->whereUuid('publicId')->name('update');
-        });
+    Route::redirect('/maintenance/requests/create', '/requests/new/MAINTENANCE')->name('maintenance.requests.create');
+    // A draft saved on the old screen opens the new form with its title, description and location filled in.
+    Route::get('/maintenance/requests/{publicId}/edit', [WorkflowRequestController::class, 'legacyMaintenanceDraft'])
+        ->whereUuid('publicId')->name('maintenance.requests.edit');
 
     // -------------------------------------------------
     // 3.15 ثوابت النظام المركزية - مدير النظام فقط
@@ -735,6 +684,7 @@ Route::middleware(['web', 'auth'])->prefix('admin/attendance')->name('admin.atte
     Route::get('/employee-ledger/{employee}/{date}', [AttendanceEmployeeLedgerController::class, 'day'])->whereNumber('employee')->where('date', '\d{4}-\d{2}-\d{2}')->name('employee-ledger.day');
     Route::post('/devices/{device}/connection', [AttendanceOperationsController::class, 'activateDevice'])->name('devices.connection');
     Route::post('/raw-punches/{punch}/resolve', [AttendanceOperationsController::class, 'resolveUnmatched'])->whereNumber('punch')->name('raw-punches.resolve');
+    Route::post('/raw-punches/{punch}/resolve-time', [AttendanceOperationsController::class, 'resolvePunchTime'])->whereNumber('punch')->middleware('throttle:10,1')->name('raw-punches.resolve-time');
     Route::post('/devices/{device}/approve-import', [AttendanceOperationsController::class, 'approveImport'])->whereNumber('device')->name('devices.approve-import');
     Route::post('/devices/{device}/sync', [AttendanceOperationsController::class, 'syncDevice'])->whereNumber('device')->middleware('throttle:3,1')->name('devices.sync');
     Route::post('/mappings', [AttendanceOperationsController::class, 'mapping'])->name('mappings.store');
@@ -767,6 +717,7 @@ Route::middleware('auth')->prefix('correspondence')->name('correspondence.')->gr
     Route::get('/{publicId}/print', [CorrespondenceController::class, 'print'])->name('print');
     Route::get('/records/{id}', [CorrespondenceController::class, 'record'])->whereNumber('id')->name('record');
     Route::get('/', [CorrespondenceController::class, 'index'])->name('index');
+    Route::get('/decisions', [CorrespondenceController::class, 'decisions'])->name('decisions');
     Route::get('/create', [CorrespondenceController::class, 'create'])->name('create');
     Route::get('/external/create', [CorrespondenceController::class, 'createExternal'])->name('external.create');
     Route::post('/external', [CorrespondenceController::class, 'storeExternal'])->name('external.store');
@@ -780,6 +731,9 @@ Route::middleware('auth')->prefix('correspondence')->name('correspondence.')->gr
     Route::get('/{publicId}/edit', [CorrespondenceController::class, 'edit'])->whereUuid('publicId')->name('edit');
     Route::post('/{publicId}/draft', [CorrespondenceController::class, 'update'])->whereUuid('publicId')->name('update');
     Route::post('/{publicId}/actions', [CorrespondenceController::class, 'action'])->whereUuid('publicId')->name('action');
+    // Exceptional access to a confidential record, issued and revoked by the executive director (ConfidentialGrants).
+    Route::post('/{publicId}/confidential-access', [CorrespondenceController::class, 'grantConfidential'])->whereUuid('publicId')->middleware('throttle:20,1')->name('confidential.grant');
+    Route::post('/{publicId}/confidential-access/{grant}/revoke', [CorrespondenceController::class, 'revokeConfidential'])->whereUuid('publicId')->whereNumber('grant')->middleware('throttle:20,1')->name('confidential.revoke');
 });
 
 // HR auto-direction correction review; controller enforces HR/admin RBAC.

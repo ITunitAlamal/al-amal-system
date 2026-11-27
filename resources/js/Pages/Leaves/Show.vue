@@ -7,11 +7,13 @@ import EmptyState from '../../Components/EmptyState.vue';
 import PageHeader from '../../Components/PageHeader.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
 import StatusStepper from '../../Components/StatusStepper.vue';
+import StepAssignmentPanel from '../../Components/Workflow/StepAssignmentPanel.vue';
 
 const props = defineProps({
     username: String,
     navigation: Array,
     request: Object,
+    assignment: { type: Object, default: null },
     progress: { type: Object, default: () => ({ steps: [], summary: null }) },
     workflow: { type: Object, default: null },
     canApprove: Boolean,
@@ -83,8 +85,9 @@ function submitAction() {
             <section class="card">
                 <h2 class="card-title mb-4">مراحل الطلب</h2>
                 <StatusStepper :steps="progress.steps" :summary="progress.summary" />
-                <p v-if="progress.steps.some(step => step.state === 'upcoming')" class="mt-3 text-xs text-slate-500">المراحل الرمادية هي المسار المتوقع حسب إعدادات مسار الإجازات. خصم الأيام يتم مرة واحدة عند الاعتماد النهائي فقط.</p>
+                <p v-if="progress.steps.some(step => step.state === 'upcoming')" class="mt-3 text-xs text-slate-500">المراحل الرمادية هي المسار المتوقع حسب إعدادات مسار الإجازات. {{ workflow || settings?.approval_mode === 'workflow' ? 'يُخصم الرصيد مرة واحدة عند تسجيل الموارد البشرية للإجازة، لا عند الاعتماد.' : 'يُخصم الرصيد مرة واحدة عند اعتماد الطلب.' }}</p>
             </section>
+            <StepAssignmentPanel v-if="assignment && workflow" :assignment="assignment" :public-id="workflow.publicId" :revision="workflow.revision" />
 
             <section v-if="actions.length" class="card border-2 border-gold-300">
                 <h2 class="card-title">الإجراء المطلوب منك</h2>
@@ -133,6 +136,12 @@ function submitAction() {
                     <p class="mt-1 whitespace-pre-wrap text-sm leading-7">{{ request.reason }}</p>
                 </div>
             </section>
+
+            <!-- A registered leave has no cancel action: same guidance as the refusal in EmployeeLeaveRequestController::cancel. -->
+            <p v-if="request.status === 'approved'" class="alert-info" role="note">
+                <template v-if="isOwner">هذه الإجازة مسجلة وخُصمت من رصيدك، ولا يمكن إلغاؤها من هذه الصفحة. راجع رئيس قسم الموارد البشرية واذكر سبب الإلغاء؛ تُعاد الأيام إلى رصيدك بـ«تسوية موثقة» يسجلها مدير النظام من صفحة «أرصدة الإجازات».</template>
+                <template v-else>هذه الإجازة مسجلة وخُصمت من رصيد الموظف، ولا تُلغى من هذه الصفحة. يراجع الموظف رئيس قسم الموارد البشرية ويذكر سبب الإلغاء؛ تُعاد الأيام إلى رصيده بـ«تسوية موثقة» يسجلها مدير النظام من صفحة «أرصدة الإجازات».</template>
+            </p>
 
             <section v-if="canCancel" class="card flex flex-wrap gap-2">
                 <Link v-if="canEdit && request.status === 'draft'" :href="`/leaves/${request.id}/edit`" class="btn btn-secondary">تعديل المسودة</Link>

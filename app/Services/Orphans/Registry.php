@@ -93,7 +93,7 @@ final class Registry
             $status = 'claimed';
         }
         if ($status === 'approved') {
-            $this->access->assert($actor, 'portal');
+            $this->access->assertDecision($actor, 'portal');
             if (empty($data['starts_on'])) {
                 throw ValidationException::withMessages(['link.starts_on' => 'اعتماد الوصاية يحتاج تاريخ بدء السريان.']);
             }
@@ -121,7 +121,7 @@ final class Registry
     /** Approve or reject one child's guardianship (never a whole family). */
     public function decideGuardianship(OrphanGuardianship $link, string $decision, array $data, User $actor): void
     {
-        $this->access->assert($actor, 'portal');
+        $this->access->assertDecision($actor, 'portal');
         DB::transaction(function () use ($link, $decision, $data, $actor): void {
             $link = OrphanGuardianship::query()->lockForUpdate()->findOrFail($link->id);
             abort_unless(in_array($link->status, ['claimed', 'pending'], true), 409, 'تم البت في هذا الارتباط مسبقًا.');

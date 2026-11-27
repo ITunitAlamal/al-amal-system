@@ -47,7 +47,7 @@ final class WorkflowProgress
     /**
      * Progress of many requests for a list screen. Owners are named by role, as the requester sees them.
      *
-     * @param  Collection<int, object>  $instances  rows with id, workflow_version_id, current_step_id, status, started_at, due_at, sla_breached_at
+     * @param  Collection<int, object>  $instances  rows with id, workflow_version_id, subject_type, current_step_id, status, started_at, due_at, sla_breached_at
      * @return array<int, array{steps: list<array<string, mixed>>, summary: array<string, mixed>}> keyed by instance id
      */
     public function forList(Collection $instances, string $level = 'public_status'): array
@@ -220,11 +220,27 @@ final class WorkflowProgress
         }
         $current = $isOpen && $lastIndex !== null ? $steps[$path[$lastIndex]['id']] : null;
         $atRequester = $current?->assignment_type === 'requester';
+        // Why the request is with its requester: the note of the very move that brought it there (the reason of the
+        // return, or the completion note to verify), never an older reason.
+        $sentWith = $atRequester && $lastIndex > 0 ? ($path[$lastIndex - 1]['comment'] ?? null) : null;
+        // What the requester's turn is. The start step means the request really came back to be edited. Any other
+        // step of the requester is, on a generic request, the requester verifying what was done: never "returned
+        // for editing". On a module record such a step is a task of that module (a signing, a filing), named as is.
+        $requesterTurn = match (true) {
+            ! $atRequester => null,
+            $current->step_type === 'start' => 'edit',
+            ($instance->subject_type ?? null) === WorkflowEngine::SUBJECT_TYPE => 'verify',
+            default => 'task',
+        };
 
         return [
             'steps' => [...$result, ...$upcoming],
-            'summary' => $this->summary($instance, $result, $upcoming, $partial, $atRequester, $public) + [
-                'reason' => in_array($instance->status, ['rejected'], true) || $atRequester ? $reason : null,
+            'summary' => $this->summary($instance, $result, $upcoming, $partial, $requesterTurn, $public) + [
+                'reason' => match (true) {
+                    $atRequester => $sentWith,
+                    $instance->status === 'rejected' => $reason,
+                    default => null,
+                },
             ],
         ];
     }
@@ -232,9 +248,10 @@ final class WorkflowProgress
     /**
      * @param  list<array<string, mixed>>  $passed
      * @param  list<array<string, mixed>>  $upcoming
+     * @param  ?string  $requesterTurn  "edit", "verify" or "task" while the request waits for its requester; null otherwise
      * @return array<string, mixed>
      */
-    private function summary(object $instance, array $passed, array $upcoming, bool $partial, bool $atRequester, bool $public): array
+    private function summary(object $instance, array $passed, array $upcoming, bool $partial, ?string $requesterTurn, bool $public): array
     {
         $current = collect($passed)->firstWhere('state', 'current');
 
@@ -247,10 +264,16 @@ final class WorkflowProgress
                 'where' => ($current ? $current['label'].($current['owner'] ? ' — '.$current['owner'] : '') : 'قيد المعالجة').' · موعد المراجعة '.$instance->hold_until,
                 'next' => 'الاستئناف ثم: '.($upcoming[0]['label'] ?? 'إغلاق المعاملة'), 'dueAt' => null, 'overdue' => false, 'partial' => $partial,
             ],
-            $atRequester => [
+            $requesterTurn === 'edit' => [
                 'status' => $public ? 'مُعاد إليك للتعديل' : 'مُعاد لمقدم الطلب', 'tone' => 'warning',
                 'where' => $public ? 'لديك: عدّل الطلب ثم أعد إرساله' : 'لدى مقدم الطلب للتعديل',
                 'next' => 'إعادة الإرسال: '.($upcoming[0]['label'] ?? 'المراجعة'),
+                'dueAt' => $current['dueAt'] ?? null, 'overdue' => (bool) ($current['overdue'] ?? false), 'partial' => $partial,
+            ],
+            $requesterTurn === 'verify' => [
+                'status' => $public ? 'بانتظار تحققك من الإنجاز' : 'بانتظار تحقق مقدم الطلب', 'tone' => 'warning',
+                'where' => $public ? 'تحقّق من الإنجاز، ثم أكّد أو أعد الطلب للاستكمال مع ذكر السبب' : 'لدى مقدم الطلب للتحقق من الإنجاز',
+                'next' => 'بعد التأكيد: '.($upcoming[0]['label'] ?? 'إغلاق المعاملة'),
                 'dueAt' => $current['dueAt'] ?? null, 'overdue' => (bool) ($current['overdue'] ?? false), 'partial' => $partial,
             ],
             default => [

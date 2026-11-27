@@ -64,7 +64,26 @@ final class Persons
      */
     public function save(array $data, ?Person $person, ?int $actor, string $errorKey = 'id_number'): Person
     {
-        $person ??= new Person;
+        $person = $this->assign($data, $person ?? new Person, $errorKey);
+        $person->created_by ??= $actor;
+        $person->updated_by = $actor;
+        $person->save();
+
+        return $person;
+    }
+
+    /**
+     * What a save of $data would make of $person, as an unsaved copy (the same normalization and the same
+     * duplicate-identity refusal as save()); $person itself is untouched. Used to route sensitive registry changes
+     * through a request: the copy's dirty attributes are the change.
+     */
+    public function preview(array $data, Person $person, string $errorKey = 'id_number'): Person
+    {
+        return $this->assign($data, clone $person, $errorKey);
+    }
+
+    private function assign(array $data, Person $person, string $errorKey): Person
+    {
         $fill = [];
         foreach (['first_name', 'father_name', 'grandfather_name', 'family_name', 'extra_names', 'name_en', 'sex', 'date_of_birth', 'dob_status',
             'nationality_value_id', 'place_of_birth', 'vital_status', 'email', 'notes'] as $field) {
@@ -115,9 +134,6 @@ final class Persons
                 }
             }
         }
-        $person->created_by ??= $actor;
-        $person->updated_by = $actor;
-        $person->save();
 
         return $person;
     }

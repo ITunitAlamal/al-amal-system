@@ -3,7 +3,11 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Models\User;
+use App\Services\Attendance\AttendanceAccess;
 use App\Services\Attendance\AttendanceDailyService;
+use App\Services\Hr\EmployeeNames;
+use App\Services\Notifications\NotificationCenter;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -13,6 +17,24 @@ use Illuminate\Validation\ValidationException;
 
 final class AttendancePunchCorrectionController extends Controller
 {
+    /** To whoever requested a punch correction: it was approved or rejected. */
+    public const EVENT_DECIDED = 'attendance_correction_decided';
+
+    /** Where pending corrections are listed and decided («الحضور والانصراف» ← «تصحيح البصمات»). */
+    public const TASKS_URL = '/admin/attendance?tab=corrections';
+
+    private const DECIDER_RULE = 'يقرر تصحيح البصمة رئيس قسم الموارد البشرية، أو المدير التنفيذي إن كان رئيس القسم مقدم الطلب أو صاحب البصمة؛ ولا يقرره مقدم الطلب ولا صاحب البصمة.';
+
+    /**
+     * Whether decide() accepts this user at all (owner decision 8): the HR head or the executive director, never the
+     * system administrator. Each correction is narrowed by AttendanceAccess::correctionsToDecide, which the task
+     * inbox (TransactionTracker) and the pages use for the same rows.
+     */
+    public static function mayDecide(?User $user): bool
+    {
+        return $user !== null && app(AttendanceAccess::class)->mayDecideCorrections($user);
+    }
+
     private function hr(Request $request): void
     {
         abort_unless($request->user()?->is_active && ($request->user()->isSystemAdmin() || $request->user()->isHrDepartmentHead()), 403);
@@ -20,7 +42,13 @@ final class AttendancePunchCorrectionController extends Controller
 
     private function admin(Request $request): void
     {
-        abort_unless($request->user()?->is_active && $request->user()->isSystemAdmin(), 403);
+        abort_unless(self::mayDecide($request->user()), 403, self::DECIDER_RULE);
+    }
+
+    /** This correction, in its current status, is this user's to decide. */
+    private function decider(Request $request, int $correction, string $status): void
+    {
+        abort_unless((bool) app(AttendanceAccess::class)->correctionsToDecide((int) $request->user()->id, $status)?->where('c.id', $correction)->exists(), 403, self::DECIDER_RULE);
     }
 
     private function audit(Request $request, int $punchId, string $action, array $details): void
@@ -55,10 +83,14 @@ final class AttendancePunchCorrectionController extends Controller
                 'status' => 'pending', 'requested_by' => $request->user()->id,
                 'created_at' => now(), 'updated_at' => now(),
             ]);
+            // A pending correction blocks new ones on the punch, so one nobody may decide is not recorded.
+            if (! app(AttendanceAccess::class)->correctionHasDecider($id)) {
+                throw ValidationException::withMessages(['corrected_direction' => 'لا يوجد اليوم من يقرر هذا الطلب: '.self::DECIDER_RULE]);
+            }
             $this->audit($request, $punch, 'direction_correction_requested', ['correction_id' => $id, 'requested_direction' => $data['corrected_direction'], 'reason' => $data['reason']]);
         });
 
-        return back()->with('success', 'تم تسجيل طلب تصحيح البصمة للمراجعة الإدارية.');
+        return back()->with('success', 'سُجّل طلب تصحيح البصمة بانتظار قرار رئيس قسم الموارد البشرية (أو المدير التنفيذي إن كان رئيس القسم مقدمه أو صاحب البصمة).');
     }
 
     public function decide(Request $request, int $correction): RedirectResponse
@@ -72,6 +104,7 @@ final class AttendancePunchCorrectionController extends Controller
             $row = DB::table('attendance_punch_corrections')->where('id', $correction)->lockForUpdate()->first();
             abort_unless($row && $row->status === 'pending', 409);
             abort_if((int) $row->requested_by === (int) $request->user()->id, 403, 'لا يجوز اعتماد الطلب بواسطة مقدمه.');
+            $this->decider($request, $correction, 'pending');
             $punch = DB::table('attendance_punches')->where('id', $row->punch_id)->lockForUpdate()->first();
             abort_unless($punch && $punch->employee_id, 409);
             if ($data['decision'] === 'approve') {
@@ -86,9 +119,18 @@ final class AttendancePunchCorrectionController extends Controller
             if ($data['decision'] === 'approve') {
                 app(AttendanceDailyService::class)->recalculateAroundPunch((int) $punch->employee_id, CarbonImmutable::parse($punch->occurred_at));
             }
+            // Whoever asked for the correction hears the decision (never the decider: they cannot be the same person).
+            $employee = DB::table('employees')->where('id', $punch->employee_id)->first(['full_name_ar', 'first_name_ar', 'father_name_ar', 'grandfather_name_ar', 'family_name_ar']);
+            $day = CarbonImmutable::parse($punch->occurred_at, 'UTC')->setTimezone(config('app.timezone'))->format('Y-m-d H:i');
+            $note = trim((string) ($data['review_note'] ?? ''));
+            app(NotificationCenter::class)->notify((int) $row->requested_by, self::EVENT_DECIDED, [
+                'title' => ($data['decision'] === 'approve' ? 'اعتُمد طلب تصحيح البصمة' : 'رُفض طلب تصحيح البصمة').($employee ? ': '.EmployeeNames::display($employee) : ''),
+                'body' => 'حركة '.$day.($data['decision'] === 'approve' ? ' · أُعيد احتساب الدوام' : '').($note !== '' ? ' · ملاحظة المراجع: '.$note : ''),
+                'url' => self::TASKS_URL, 'dedupe' => 'punch-correction:'.$correction.':decided',
+            ]);
         });
 
-        return back()->with('success', 'تم تسجيل القرار وإعادة احتساب الدوام عند الاعتماد.');
+        return back()->with('success', 'تم تسجيل القرار وإعادة احتساب الدوام عند الاعتماد، وأُبلغ مقدم الطلب.');
     }
 
     public function revoke(Request $request, int $correction): RedirectResponse
@@ -98,6 +140,7 @@ final class AttendancePunchCorrectionController extends Controller
         DB::transaction(function () use ($request, $correction, $data): void {
             $row = DB::table('attendance_punch_corrections')->where('id', $correction)->lockForUpdate()->first();
             abort_unless($row && $row->status === 'approved', 409);
+            $this->decider($request, $correction, 'approved');
             $punch = DB::table('attendance_punches')->where('id', $row->punch_id)->lockForUpdate()->first();
             abort_unless($punch && $punch->employee_id, 409);
             DB::table('attendance_punch_corrections')->where('id', $correction)->update(['status' => 'revoked', 'revoked_by' => $request->user()->id, 'revoked_at' => now(), 'revocation_reason' => $data['reason'], 'updated_at' => now()]);

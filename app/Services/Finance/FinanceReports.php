@@ -17,7 +17,7 @@ final class FinanceReports
 {
     public const MAX_ROWS = 20000;
 
-    public const AREAS = ['procurement' => 'المشتريات', 'stores' => 'المخازن', 'accountant' => 'المحاسب العام', 'payroll' => 'مسير الرواتب'];
+    public const AREAS = ['procurement' => 'المشتريات', 'stores' => 'المخازن', 'accountant' => 'المحاسب العام', 'payments' => 'الصرف', 'receipts' => 'القبض', 'payroll' => 'مسير الرواتب'];
 
     /** Arabic labels of the state codes the finance services write (same vocabulary as the screens). */
     public const STATES = [
@@ -64,11 +64,11 @@ final class FinanceReports
                 'date' => 'c.created_at', 'search' => ['i.sku', 'i.name', 'w.name', 'c.reason'], 'states' => ['pending', 'approved', 'rejected'],
                 'columns' => ['created_at' => ['التاريخ', 'date'], 'warehouse' => ['المخزن', 'text'], 'sku' => ['رمز الصنف', 'text'], 'item' => ['الصنف', 'text'],
                     'recorded_qty' => ['الكمية المسجلة', 'qty'], 'physical_qty' => ['الكمية الفعلية', 'qty'], 'difference' => ['الفرق', 'qty'], 'state' => ['الحالة', 'state'], 'reason' => ['السبب', 'text']]],
-            'invoices' => ['title' => 'تقرير فواتير الموردين وسندات الصرف', 'area' => 'accountant', 'any' => ['finance.purchase.invoice', 'finance.procurement.review'],
+            'invoices' => ['title' => 'تقرير فواتير الموردين وسندات الصرف', 'area' => 'accountant', 'any' => ['finance.purchase.invoice', 'finance.procurement.review', 'finance.payment.record'],
                 'date' => 'inv.invoice_on', 'search' => ['inv.invoice_no', 'inv.external_voucher_no', 'po.number', 's.name'], 'states' => ['pending', 'paid'],
                 'columns' => ['invoice_no' => ['رقم الفاتورة', 'text'], 'invoice_on' => ['تاريخ الفاتورة', 'date'], 'order_number' => ['أمر الشراء', 'text'], 'supplier' => ['المورد', 'text'],
                     'currency' => ['العملة', 'text'], 'amount' => ['القيمة', 'money'], 'state' => ['الحالة', 'state'],
-                    'voucher_no' => ['رقم سند الصرف', 'text'], 'voucher_on' => ['تاريخ سند الصرف', 'date']]],
+                    'voucher_no' => ['رقم سند الصرف', 'text'], 'voucher_on' => ['تاريخ سند الصرف', 'date'], 'voucher_amount' => ['قيمة سند الصرف', 'money']]],
             'receipts' => $this->vouchers('receipt', 'تقرير سندات القبض'),
             'payments' => $this->vouchers('payment', 'تقرير سندات الصرف'),
             'payroll' => ['title' => 'ملخص مسيرات الرواتب', 'area' => 'payroll', 'any' => ['finance.payroll.manage', 'finance.payroll.approve', 'finance.payroll.record', 'finance.payroll.publish', 'finance.payroll.authorize'],
@@ -81,8 +81,8 @@ final class FinanceReports
     /** @return array<string, mixed> */
     private function vouchers(string $kind, string $title): array
     {
-        return ['title' => $title, 'area' => 'accountant', 'kind' => $kind,
-            'any' => ['finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute'],
+        return ['title' => $title, 'area' => $kind === 'payment' ? 'payments' : 'receipts', 'kind' => $kind,
+            'any' => array_map(fn (string $action): string => FinanceGuard::transactionPermission($kind, $action), ['draft', 'review', 'approve', 'execute']),
             'date' => 't.effective_on', 'search' => ['t.document_no', 't.counterparty'],
             'states' => ['draft', 'pending_review', 'pending_director', 'approved', 'executed', 'reversed'],
             'columns' => ['document_no' => ['رقم السند', 'text'], 'effective_on' => ['التاريخ', 'date'], 'counterparty' => [$kind === 'receipt' ? 'الدافع' : 'المستفيد', 'text'],
@@ -170,7 +170,7 @@ final class FinanceReports
             'invoices' => DB::table('finance_purchase_invoices as inv')->join('finance_purchase_orders as po', 'po.id', '=', 'inv.order_id')
                 ->leftJoin('finance_suppliers as s', 's.id', '=', 'po.supplier_id')
                 ->select(['inv.id', 'inv.invoice_no', 'inv.invoice_on', 'po.number as order_number', 's.name as supplier', 'inv.currency', 'inv.amount', 'inv.state',
-                    'inv.external_voucher_no as voucher_no', 'inv.external_voucher_on as voucher_on'])->orderByDesc('inv.id'),
+                    'inv.external_voucher_no as voucher_no', 'inv.external_voucher_on as voucher_on', 'inv.external_voucher_amount as voucher_amount'])->orderByDesc('inv.id'),
             'receipts', 'payments' => DB::table('finance_transactions as t')->where('t.kind', $definition['kind'])
                 ->select(['t.id', 't.document_no', 't.effective_on', 't.counterparty', 't.currency', 't.amount', 't.state'])->orderByDesc('t.id'),
             'payroll' => DB::table('finance_payroll_batches as b')

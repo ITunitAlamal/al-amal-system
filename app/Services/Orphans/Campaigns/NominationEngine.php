@@ -4,6 +4,7 @@ namespace App\Services\Orphans\Campaigns;
 
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
@@ -20,14 +21,70 @@ use Illuminate\Validation\ValidationException;
  */
 final class NominationEngine
 {
+    /** The seven approved selection dimensions (TRANSFORM §13); every criterion belongs to exactly one. */
+    public const DIMENSIONS = ['economic' => 'الوضع الاقتصادي', 'family' => 'الوضع الأسري', 'health' => 'الصحة', 'housing' => 'السكن', 'education' => 'التعليم',
+        'previous_assistance' => 'المساعدات السابقة', 'vulnerability' => 'الهشاشة ومستوى الاحتياج'];
+
+    /**
+     * key => [label, type, dimension]. Nothing is weighted here: each campaign's rule version sets the weights and,
+     * for «map» criteria, the points of each «ثوابت النظام» value.
+     */
     public const CRITERIA = [
-        'orphan_class' => ['فئة اليتم', 'map'], 'current_income_band' => ['فئة دخل الأسرة/الوصي الحالية', 'map'],
-        'father_pre_death_income' => ['دخل الأب قبل الوفاة (سياق تاريخي)', 'map'], 'needs_level' => ['مستوى الاحتياج في آخر تقييم اجتماعي', 'map'],
-        'dependents' => ['عدد المُعالين', 'cap'], 'displacement' => ['النزوح الحالي', 'flag'], 'age_younger' => ['صغر السن', 'age'],
-        'no_recent_benefit' => ['مدة منذ آخر استفادة مؤكدة', 'days'], 'not_sponsored' => ['غير مكفول حاليًا', 'flag'], 'support_need' => ['احتياج دعم غير سريري (إعاقة/رعاية مزمنة)', 'flag'],
+        'current_income_band' => ['فئة دخل الأسرة/الوصي الحالية', 'map', 'economic'], 'father_pre_death_income' => ['دخل الأب قبل الوفاة (سياق تاريخي)', 'map', 'economic'],
+        'orphan_class' => ['فئة اليتم', 'map', 'family'], 'dependents' => ['عدد المُعالين', 'cap', 'family'],
+        'support_need' => ['احتياج دعم غير سريري (إعاقة/رعاية مزمنة)', 'flag', 'health'],
+        'displacement' => ['النزوح الحالي', 'flag', 'housing'], 'housing_tenure' => ['حيازة السكن الحالي', 'map', 'housing'],
+        'shelter_type' => ['نوع المأوى الحالي', 'map', 'housing'], 'building_condition' => ['حالة المبنى الحالي', 'map', 'housing'],
+        'education_need' => ['حالة الالتحاق الدراسي لليتيم (آخر سجل تعليمي)', 'map', 'education'],
+        'no_recent_benefit' => ['مدة منذ آخر استفادة مؤكدة', 'days', 'previous_assistance'], 'not_sponsored' => ['غير مكفول حاليًا', 'flag', 'previous_assistance'],
+        'needs_level' => ['مستوى الاحتياج في آخر تقييم اجتماعي', 'map', 'vulnerability'], 'age_younger' => ['صغر السن', 'age', 'vulnerability'],
     ];
 
     public const OUTCOMES = ['primary' => 'الكشف الأساسي', 'reserve' => 'الاحتياط', 'review' => 'للمراجعة', 'ineligible' => 'غير مؤهل', 'insufficient_priority' => 'أولوية غير كافية'];
+
+    /** Base rule of every mode and every entry path: these orphan files are never campaign beneficiaries. */
+    public const EXCLUDED_FILE_STATUSES = ['ended', 'archived', 'provisional'];
+
+    /**
+     * The base rule for one unit key ("o:<id>", "h:<id>", "g:<id>"): an orphan file not excluded; an active household
+     * with a live member whose file is not excluded; an active guardian with an approved guardianship.
+     */
+    public static function eligibleUnit(string $unitKey): bool
+    {
+        return self::eligibleIds(substr($unitKey, 0, 1), [(int) substr($unitKey, 2)]) !== [];
+    }
+
+    /** Entries of a list that no longer pass the base rule (checked again at submission and approval). @return list<object> */
+    public static function ineligibleEntries(int $listId): array
+    {
+        $entries = DB::table('campaign_list_entries')->where('list_id', $listId)->orderBy('position')->get(['id', 'unit_key', 'orphan_id', 'household_id', 'guardian_id']);
+        $eligible = [];
+        foreach (['o', 'h', 'g'] as $kind) {
+            $ids = $entries->filter(fn (object $e): bool => str_starts_with($e->unit_key, $kind.':'))->map(fn (object $e): int => (int) substr($e->unit_key, 2))->unique()->values()->all();
+            foreach (array_chunk($ids, 5000) as $chunk) {
+                foreach (self::eligibleIds($kind, $chunk) as $id) {
+                    $eligible[$kind.':'.$id] = true;
+                }
+            }
+        }
+
+        return $entries->reject(fn (object $e): bool => isset($eligible[$e->unit_key]))->values()->all();
+    }
+
+    /** @param list<int> $ids @return list<int> the ids of one unit kind that pass the base rule */
+    private static function eligibleIds(string $kind, array $ids): array
+    {
+        $query = match ($kind) {
+            'o' => DB::table('orphans as o')->whereIn('o.id', $ids)->whereNotIn('o.status', self::EXCLUDED_FILE_STATUSES)->select('o.id'),
+            'h' => DB::table('households as h')->whereIn('h.id', $ids)->where('h.status', 'active')->whereExists(fn ($q) => $q->from('household_members as m')
+                ->join('orphans as o', 'o.person_id', '=', 'm.person_id')->whereColumn('m.household_id', 'h.id')->whereNull('m.ends_on')->whereNotIn('o.status', self::EXCLUDED_FILE_STATUSES))->select('h.id'),
+            'g' => DB::table('orphan_guardians as gg')->whereIn('gg.id', $ids)->where('gg.status', 'active')
+                ->whereExists(fn ($q) => $q->from('orphan_guardianships as g')->whereColumn('g.guardian_id', 'gg.id')->where('g.status', 'approved'))->select('gg.id'),
+            default => null,
+        };
+
+        return $query ? $query->pluck('id')->map(fn ($id): int => (int) $id)->all() : [];
+    }
 
     /** Validates and freezes a rule version (immutable rows; a change is a new version). */
     public function saveRules(object $campaign, array $rules, User $actor): int
@@ -37,6 +94,10 @@ final class NominationEngine
         // Map points keyed by «ثوابت النظام» value id; blank entries are «not configured» (missing), never zero.
         $criteria = array_map(fn ($c) => [...collect($c)->only(['key', 'weight', 'cap', 'max_age', 'days'])->all(),
             'map' => (object) array_filter((array) ($c['map'] ?? []), fn ($v, $k) => $v !== null && $v !== '' && (int) $k > 0, ARRAY_FILTER_USE_BOTH)], $criteria);
+        // Education is read from the child's own record; a household or guardian unit has none, so every candidate would be «missing».
+        if ($campaign->beneficiary_unit !== 'orphan' && in_array('education_need', array_column($criteria, 'key'), true)) {
+            throw ValidationException::withMessages(['criteria' => 'معيار «'.self::CRITERIA['education_need'][0].'» يخص الحملات التي وحدتها اليتيم فقط.']);
+        }
         if ($mode !== 'general') {
             $sum = array_sum(array_map(fn ($c) => (float) $c['weight'], $criteria));
             if ($criteria === [] || abs($sum - 100) > 0.001) {
@@ -191,7 +252,8 @@ final class NominationEngine
                 }
                 $points = $value === null ? null : round($weight * $value, 3);
                 $total += $points ?? 0;
-                $contributions[] = ['key' => $c['key'], 'label' => self::CRITERIA[$c['key']][0], 'weight' => $weight, 'value' => $value, 'points' => $points, 'source' => $source, 'missing' => $value === null || in_array(self::CRITERIA[$c['key']][0], $scoreMissing, true)];
+                $contributions[] = ['key' => $c['key'], 'label' => self::CRITERIA[$c['key']][0], 'dimension' => self::CRITERIA[$c['key']][2], 'weight' => $weight, 'value' => $value, 'points' => $points,
+                    'source' => $source, 'missing' => $value === null || in_array(self::CRITERIA[$c['key']][0], $scoreMissing, true)];
             }
             $score = round($total, 3);
             if ($scoreMissing !== []) {
@@ -222,8 +284,36 @@ final class NominationEngine
             'no_recent_benefit' => [$f['last_benefit'] === null ? 1.0 : min(1, now()->diffInDays($f['last_benefit']) / max(1, (int) ($c['days'] ?? 180))), 'سجل الاستفادة المؤكدة'],
             'not_sponsored' => [$f['sponsored'] ? 0.0 : 1.0, 'الكفالات النشطة'],
             'support_need' => [$f['support_need'] ? 1.0 : 0.0, 'احتياجات الدعم غير السريرية'],
+            'housing_tenure' => $map($f['tenure_value_id'], 'العنوان الحالي (الحيازة)'),
+            'shelter_type' => $map($f['shelter_type_value_id'], 'العنوان الحالي (نوع المأوى)'),
+            'building_condition' => $map($f['building_condition_value_id'], 'العنوان الحالي (حالة المبنى)'),
+            'education_need' => $map($f['education_status_value_id'], 'آخر سجل تعليمي لليتيم'),
             default => [null, null],
         };
+    }
+
+    /**
+     * Per-dimension subtotals of one candidate's contributions, in the order of DIMENSIONS. Runs made before the
+     * dimensions were stored take the dimension from the criterion key.
+     *
+     * @return list<array{key: string, label: string, weight: float, points: float, missing: bool}>
+     */
+    public static function dimensionTotals(array $contributions): array
+    {
+        $totals = [];
+        foreach ($contributions as $c) {
+            $dimension = $c['dimension'] ?? (self::CRITERIA[$c['key'] ?? ''][2] ?? null);
+            if ($dimension === null || ! isset(self::DIMENSIONS[$dimension])) {
+                continue;
+            }
+            $totals[$dimension] ??= ['key' => $dimension, 'label' => self::DIMENSIONS[$dimension], 'weight' => 0.0, 'points' => 0.0, 'missing' => false];
+            $totals[$dimension]['weight'] += (float) ($c['weight'] ?? 0);
+            $totals[$dimension]['points'] += (float) ($c['points'] ?? 0);
+            $totals[$dimension]['missing'] = $totals[$dimension]['missing'] || ! empty($c['missing']);
+        }
+
+        return array_values(array_map(fn (array $t): array => [...$t, 'weight' => round($t['weight'], 3), 'points' => round($t['points'], 3)],
+            array_filter(array_replace(array_fill_keys(array_keys(self::DIMENSIONS), null), $totals))));
     }
 
     private function compare(array $a, array $b, object $rules): int
@@ -320,8 +410,10 @@ final class NominationEngine
         if ($campaign->beneficiary_unit === 'orphan') {
             $query = DB::table('orphans as o')->join('persons as p', 'p.id', '=', 'o.person_id')
                 ->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.person_id', '=', 'p.id')->where('a.kind', 'current')->whereNull('a.ends_on'))
-                ->whereNotIn('o.status', ['ended', 'archived', 'provisional'])
+                ->whereNotIn('o.status', self::EXCLUDED_FILE_STATUSES)
                 ->selectRaw("o.id, o.status, o.registered_on, o.orphan_class_value_id, p.sex, p.date_of_birth, a.governorate_value_id, a.locality_value_id,
+                    a.tenure_value_id, a.shelter_type_value_id, a.building_condition_value_id,
+                    (select e.status_value_id from education_records e where e.orphan_id = o.id and e.status_value_id is not null order by e.id desc limit 1) as education_status,
                     exists (select 1 from registry_addresses d where d.person_id = p.id and d.kind = 'displacement' and d.ends_on is null) as displaced,
                     exists (select 1 from orphan_guardianships g where g.orphan_id = o.id and g.status = 'approved' and (g.starts_on is null or g.starts_on <= '$today') and (g.ends_on is null or g.ends_on >= '$today')) as approved_guardian,
                     (select g.guardian_id from orphan_guardianships g where g.orphan_id = o.id and g.status = 'approved' order by g.is_primary desc, g.id limit 1) as guardian_id,
@@ -335,8 +427,8 @@ final class NominationEngine
             }
         } elseif ($campaign->beneficiary_unit === 'household') {
             $query = DB::table('households as h')->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.household_id', '=', 'h.id')->where('a.kind', 'current')->whereNull('a.ends_on'))
-                ->where('h.status', 'active')->whereExists(fn ($q) => $q->from('household_members as m')->join('orphans as o', 'o.person_id', '=', 'm.person_id')->whereColumn('m.household_id', 'h.id')->whereNull('m.ends_on')->whereNotIn('o.status', ['ended', 'archived', 'provisional']))
-                ->selectRaw("h.id, h.dependents_count, h.members_count, a.governorate_value_id, a.locality_value_id,
+                ->where('h.status', 'active')->whereExists(fn ($q) => $q->from('household_members as m')->join('orphans as o', 'o.person_id', '=', 'm.person_id')->whereColumn('m.household_id', 'h.id')->whereNull('m.ends_on')->whereNotIn('o.status', self::EXCLUDED_FILE_STATUSES))
+                ->selectRaw("h.id, h.dependents_count, h.members_count, a.governorate_value_id, a.locality_value_id, a.tenure_value_id, a.shelter_type_value_id, a.building_condition_value_id,
                     exists (select 1 from registry_addresses d where d.household_id = h.id and d.kind = 'displacement' and d.ends_on is null) as displaced,
                     (select max(b.delivered_on) from benefit_records b where b.household_id = h.id and b.kind = 'delivery' and not exists (select 1 from benefit_records r where r.reverses_id = b.id)) as last_benefit");
             foreach ($query->cursor() as $r) {
@@ -346,7 +438,7 @@ final class NominationEngine
             $query = DB::table('orphan_guardians as gg')->join('persons as p', 'p.id', '=', 'gg.person_id')
                 ->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.person_id', '=', 'p.id')->where('a.kind', 'current')->whereNull('a.ends_on'))->where('gg.status', 'active')
                 ->whereExists(fn ($q) => $q->from('orphan_guardianships as g')->whereColumn('g.guardian_id', 'gg.id')->where('g.status', 'approved'))
-                ->selectRaw("gg.id, gg.person_id, a.governorate_value_id, a.locality_value_id, (select count(*) from orphan_guardianships g where g.guardian_id = gg.id and g.status = 'approved') as children,
+                ->selectRaw("gg.id, gg.person_id, a.governorate_value_id, a.locality_value_id, a.tenure_value_id, a.shelter_type_value_id, a.building_condition_value_id, (select count(*) from orphan_guardianships g where g.guardian_id = gg.id and g.status = 'approved') as children,
                     exists (select 1 from registry_addresses d where d.person_id = p.id and d.kind = 'displacement' and d.ends_on is null) as displaced");
             foreach ($query->cursor() as $r) {
                 $rows['g:'.$r->id] = (array) $r;
@@ -385,6 +477,10 @@ final class NominationEngine
                 'income_band_value_id' => $economic['income_band_value_id'] ?? null, 'income_source_label' => null,
                 'father_income_band_value_id' => isset($r['father_income']) ? (int) $r['father_income'] ?: null : null, 'needs_level_value_id' => $need['needs_level_value_id'] ?? null, 'dependents' => $dependents !== null ? (int) $dependents : null,
                 'economic' => $economic ? [$economic['owner'], $economic['source'], $economic['verification'], (string) $economic['as_of']] : null, 'needs_as_of' => $need['as_of'] ?? null,
+                // Housing from the unit's current address, education from the child's latest record (null = missing, never «no need»).
+                'tenure_value_id' => ! empty($r['tenure_value_id']) ? (int) $r['tenure_value_id'] : null, 'shelter_type_value_id' => ! empty($r['shelter_type_value_id']) ? (int) $r['shelter_type_value_id'] : null,
+                'building_condition_value_id' => ! empty($r['building_condition_value_id']) ? (int) $r['building_condition_value_id'] : null,
+                'education_status_value_id' => ! empty($r['education_status']) ? (int) $r['education_status'] : null,
             ];
             unset($rows[$key]);
         }
@@ -401,6 +497,8 @@ final class NominationEngine
             'economic' => $f['economic'] ? ['owner' => $f['economic'][0], 'income_band' => $f['income_band_value_id'], 'dependents' => $f['dependents'], 'source' => $f['economic'][1],
                 'verification' => $f['economic'][2], 'as_of' => $f['economic'][3]] : null,
             'father_pre_death_income' => $f['father_income_band_value_id'], 'needs' => $f['needs_level_value_id'] ? ['needs_level_value_id' => $f['needs_level_value_id'], 'as_of' => $f['needs_as_of']] : null,
+            'housing' => ['tenure' => $f['tenure_value_id'] ?? null, 'shelter_type' => $f['shelter_type_value_id'] ?? null, 'building_condition' => $f['building_condition_value_id'] ?? null],
+            'education_status' => $f['education_status_value_id'] ?? null,
             'taken_at' => $takenAt];
     }
 
@@ -419,7 +517,10 @@ final class NominationEngine
     private function latestNeeds(array $orphanIds, array $householdIds): array
     {
         $today = today()->toDateString();
+        // Only a needs level the head reviewed and approved feeds the score (ORP-19; req-04 §7 step 3-4).
+        $reviewed = Schema::hasColumn('social_assessments', 'review_outcome');
         $pick = fn (string $column, array $ids) => $ids === [] ? [] : DB::table('social_assessments')->whereIn($column, array_unique($ids))->where('status', 'completed')->whereNotNull('needs_level_value_id')
+            ->when($reviewed, fn ($q) => $q->where('review_outcome', 'approved'))
             ->where(fn ($q) => $q->whereNull('valid_until')->orWhere('valid_until', '>=', $today))->orderBy($column)->orderByDesc('completed_on')->orderByDesc('id')
             ->selectRaw("distinct on ($column) $column as owner_id, needs_level_value_id, completed_on as as_of")->get()->mapWithKeys(fn ($r) => [(int) $r->owner_id => (array) $r])->all();
 

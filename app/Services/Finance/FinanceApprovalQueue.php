@@ -13,13 +13,14 @@ use Illuminate\Support\Facades\Schema;
 final class FinanceApprovalQueue
 {
     /**
-     * permission => list of [kind, label, table, state, url pattern, amount column]
+     * permission => list of [kind, label, table, state, url pattern, amount column, optional voucher kind]
      *
-     * @var array<string, list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string}>>
+     * @var array<string, list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6?: string}>>
      */
     private const QUEUES = [
         'finance.procurement.director_approve' => [['purchase', 'اعتماد طلب شراء', 'finance_purchase_requests', 'pending_director', '/finance/purchases/{id}/director', 'total_amount']],
-        'finance.transaction.approve' => [['transaction', 'اعتماد سند مالي', 'finance_transactions', 'pending_director', '/finance/transactions/{id}/approve', 'amount']],
+        'finance.payment.approve' => [['transaction', 'اعتماد سند صرف', 'finance_transactions', 'pending_director', '/finance/transactions/{id}/approve', 'amount', 'payment']],
+        'finance.receipt.approve' => [['transaction', 'اعتماد سند قبض', 'finance_transactions', 'pending_director', '/finance/transactions/{id}/approve', 'amount', 'receipt']],
         'finance.budget.approve' => [
             ['budget_transfer', 'اعتماد مناقلة', 'finance_budget_transfers', 'pending', '/finance/budgets/transfers/{id}/approve', 'amount'],
             ['budget_exception', 'اعتماد استثناء', 'finance_budget_exceptions', 'pending', '/finance/budgets/exceptions/{id}/approve', 'amount'],
@@ -63,8 +64,11 @@ final class FinanceApprovalQueue
     public function entries(User $user, int $perQueue = 100): array
     {
         $queue = [];
-        foreach ($this->sources($user) as [$kind, $label, $table, $state, $path, $money]) {
-            $rows = DB::table($table)->where('state', $state)->orderBy('id')->limit($perQueue)->get();
+        foreach ($this->sources($user) as $source) {
+            [$kind, $label, $table, $state, $path, $money] = $source;
+            $rows = DB::table($table)->where('state', $state)
+                ->when($source[6] ?? null, fn ($q, string $voucherKind) => $q->where('kind', $voucherKind))
+                ->orderBy('id')->limit($perQueue)->get();
             foreach ($rows as $row) {
                 if (isset($row->created_by) && (int) $row->created_by === (int) $user->id) {
                     continue;
@@ -76,12 +80,34 @@ final class FinanceApprovalQueue
         return $queue;
     }
 
+    /**
+     * Approved purchases not yet delivered in full, which the executive director may cancel with a reason
+     * (FinanceOperations::cancelPurchase). Empty for anyone else, or before the cancellation columns exist.
+     *
+     * @return list<array{id: int, number: string, amount: mixed, currency: string, order: ?string, order_state: ?string, partial: bool}>
+     */
+    public function cancellable(User $user, int $limit = 100): array
+    {
+        if (! $this->guard->allows($user, 'finance.procurement.director_approve') || ! Schema::hasColumn('finance_purchase_requests', 'cancelled_by')) {
+            return [];
+        }
+
+        return DB::table('finance_purchase_requests as p')->leftJoin('finance_purchase_orders as o', 'o.purchase_request_id', '=', 'p.id')
+            ->where('p.state', 'approved')->where(fn ($q) => $q->whereNull('o.id')->orWhereIn('o.state', ['issued', 'partial_received']))
+            ->where('p.created_by', '<>', $user->id)->orderBy('p.id')->limit($limit)
+            ->get(['p.id', 'p.number', 'p.total_amount', 'p.currency', 'o.number as order_number', 'o.state as order_state'])
+            ->map(fn (object $row): array => ['id' => (int) $row->id, 'number' => $row->number, 'amount' => $row->total_amount, 'currency' => $row->currency,
+                'order' => $row->order_number, 'order_state' => $row->order_state, 'partial' => $row->order_state === 'partial_received'])->all();
+    }
+
     /** Counts per label, for summaries. @return array<string, int> */
     public function counts(User $user): array
     {
         $counts = [];
-        foreach ($this->sources($user) as [, $label, $table, $state]) {
+        foreach ($this->sources($user) as $source) {
+            [, $label, $table, $state] = $source;
             $count = DB::table($table)->where('state', $state)
+                ->when($source[6] ?? null, fn ($q, string $voucherKind) => $q->where('kind', $voucherKind))
                 ->when(Schema::hasColumn($table, 'created_by'), fn ($q) => $q->where(fn ($inner) => $inner->whereNull('created_by')->orWhere('created_by', '!=', $user->id)))
                 ->count();
             if ($count > 0) {
@@ -93,7 +119,7 @@ final class FinanceApprovalQueue
     }
 
     /**
-     * @return list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string}>
+     * @return list<array{0: string, 1: string, 2: string, 3: string, 4: string, 5: string, 6?: string}>
      */
     private function sources(User $user): array
     {

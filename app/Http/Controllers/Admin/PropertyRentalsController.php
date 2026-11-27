@@ -94,6 +94,8 @@ class PropertyRentalsController extends Controller
             'readings' => DB::table('aims_rental_meter_readings as m')->leftJoin('users as u', 'u.id', '=', 'm.recorded_by')->orderByDesc('m.id')->limit(200)
                 ->get(['m.*', 'u.name as recorded_by_name']),
             'notices' => DB::table('aims_rental_notices')->orderByDesc('id')->limit(200)->get(),
+            'maintenanceLinks' => app(RentalMaintenance::class)->linked(null, null, 50),
+            'costBearers' => RentalMaintenance::COST_BEARERS,
             'registryDocuments' => DB::table('aims_rental_documents as d')->leftJoin('master_data_values as v', 'v.id', '=', 'd.document_type_value_id')
                 ->whereIn('d.owner_type', ['property', 'unit', 'tenant'])->orderByDesc('d.id')->limit(1000)
                 ->get(['d.id', 'd.owner_type', 'd.owner_id', 'd.title', 'd.version', 'd.supersedes_id', 'v.name_ar as type']),
@@ -363,6 +365,27 @@ class PropertyRentalsController extends Controller
         $instance = $maintenance->open($r->user(), $d['unit_id'] ?? null, $d['contract_id'] ?? null, $d['description'], (int) $d['priority_value_id']);
 
         return back()->with('success', 'فُتح طلب الصيانة '.$instance->reference_no.' في المسار المركزي، ويظهر في سجل العين.');
+    }
+
+    /** One click after the linked maintenance request closed: the unit still «تحت الصيانة» becomes vacant. */
+    public function maintenanceRelease(Request $r, int $id, RentalMaintenance $maintenance): RedirectResponse
+    {
+        $this->authorizeAccess($r);
+        $maintenance->releaseUnit($r->user(), $id);
+
+        return back()->with('success', 'أصبحت العين شاغرة، وحُفظ مرجع طلب الصيانة في سجلها.');
+    }
+
+    /** Who bears the cost of a maintenance request (institution or tenant) and its accounting reference. */
+    public function maintenanceCost(Request $r, int $id, RentalMaintenance $maintenance): RedirectResponse
+    {
+        $this->authorizeAccess($r);
+        $d = $r->validate(['cost_bearer' => ['required', Rule::in(array_keys(RentalMaintenance::COST_BEARERS))], 'cost_reference' => 'nullable|string|max:150']);
+        $maintenance->recordCost($r->user(), $id, $d['cost_bearer'], $d['cost_reference'] ?? null);
+
+        return back()->with('success', $d['cost_bearer'] === 'tenant'
+            ? 'حُفظ تحميل التكلفة على المستأجر. تُطالَب بها بطلب تسوية «زيادة المستحق» على استحقاق العقد.'
+            : 'حُفظ تحميل التكلفة على المؤسسة.');
     }
 
     public function reading(Request $r, RentalDocuments $documents): RedirectResponse

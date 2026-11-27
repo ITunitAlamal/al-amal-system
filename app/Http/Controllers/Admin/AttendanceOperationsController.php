@@ -3,10 +3,13 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Services\Attendance\AttendanceAccess;
 use App\Services\Attendance\AttendanceDailyService;
 use App\Services\Attendance\AttendanceDestinationPolicy;
 use App\Services\Attendance\AttendancePolicy;
 use App\Services\Attendance\AttendanceRawImporter;
+use App\Services\Attendance\PunchTimeReview;
+use App\Services\AuditService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -134,19 +137,82 @@ final class AttendanceOperationsController extends Controller
         return back()->with('success', 'تم ربط الحركة بالرقم الوظيفي المطابق مع حفظ أصلها وسجل المراجعة.');
     }
 
+    private const TIME_RULE = 'يؤكد وقت الحركة رئيس قسم الموارد البشرية، والمدير التنفيذي إن كانت الحركة لرئيس القسم أو لم يُعيَّن رئيس للقسم؛ ولا يؤكدها صاحب الحركة.';
+
+    /**
+     * A device punch whose wall time a daylight-saving change repeated or skipped («time_review») stays out of the
+     * calculation until HR confirms which instant it stands for (AttendanceRawImporter::timeReadings). The raw record
+     * never changes (trigger attendance_raw_immutable): confirming the reading stored at import marks the punch
+     * reviewed; choosing the other reading records a manual punch at that instant and sets the device punch aside
+     * as evidence («time_replaced»). The employee's days are recalculated and every step is audited.
+     */
+    public function resolvePunchTime(Request $r, int $punch): RedirectResponse
+    {
+        abort_unless($r->user()?->is_active, 403);
+        $v = $r->validate([
+            'occurred_at' => ['required', 'string', 'max:40'],
+            'direction' => ['nullable', Rule::in(['in', 'out'])],
+            'reason' => ['required', 'string', 'min:5', 'max:1000'],
+        ]);
+        $message = DB::transaction(function () use ($r, $punch, $v): string {
+            $row = DB::table('attendance_punches')->where('id', $punch)->lockForUpdate()->first();
+            abort_unless($row && $row->raw_payload && $row->match_status === 'time_review', 409, 'الحركة ليست بانتظار تأكيد الوقت.');
+            $employee = app(PunchTimeReview::class)->employeeFor($row);
+            abort_unless(app(AttendanceAccess::class)->mayResolvePunchTime($r->user(), $employee), 403, self::TIME_RULE);
+            $chosen = collect(AttendanceRawImporter::timeReadings((string) $row->device_local_time, (string) $row->device_timezone))
+                ->first(fn (CarbonImmutable $reading): bool => $reading->toIso8601String() === $v['occurred_at']);
+            if (! $chosen) {
+                throw ValidationException::withMessages(['occurred_at' => 'اختر إحدى قراءات الوقت المعروضة للحركة.']);
+            }
+            $stored = CarbonImmutable::parse($row->occurred_at)->utc();
+            $detail = ['stored' => $stored->toIso8601String(), 'confirmed' => $chosen->toIso8601String(), 'device_local_time' => $row->device_local_time,
+                'device_timezone' => $row->device_timezone, 'employee_id' => $employee, 'reason' => $v['reason']];
+
+            if ($chosen->equalTo($stored)) {
+                DB::table('attendance_punches')->where('id', $punch)->update(['employee_id' => $employee, 'match_status' => $employee ? 'reviewed' : 'unmatched', 'updated_at' => now()]);
+                $this->audit($r, 'punch', $punch, 'time_review_resolved', $detail + ['reading' => 'stored']);
+                if ($employee === null) {
+                    return 'تأكد وقت الحركة؛ لا يطابق معرّف الجهاز رقمًا وظيفيًا واحدًا، فانتقلت إلى الحركات غير المطابقة.';
+                }
+                app(AttendanceDailyService::class)->recalculateAroundPunch($employee, $chosen);
+
+                return 'تأكد وقت الحركة كما قُرئ عند الاستيراد، وأُعيد احتساب يوم الموظف.';
+            }
+
+            if ($employee === null) {
+                throw ValidationException::withMessages(['occurred_at' => 'لا يطابق معرّف الجهاز رقمًا وظيفيًا واحدًا؛ صحّح الرقم الوظيفي في ملف الموظف ثم أكّد الوقت.']);
+            }
+            $direction = in_array($row->direction, ['in', 'out'], true) ? $row->direction : ($v['direction'] ?? null);
+            if ($direction === null) {
+                throw ValidationException::withMessages(['direction' => 'اتجاه الحركة غير معروف من الجهاز؛ حدد دخولًا أو خروجًا.']);
+            }
+            DB::table('attendance_punches')->where('id', $punch)->update(['employee_id' => $employee, 'match_status' => 'time_replaced', 'updated_at' => now()]);
+            $manual = DB::table('attendance_punches')->insertGetId([
+                'employee_id' => $employee, 'source' => 'manual', 'direction' => $direction, 'occurred_at' => $chosen->format('Y-m-d H:i:sP'),
+                'source_key' => 'time_review:'.$punch, 'reason' => mb_substr('تأكيد وقت حركة الجهاز #'.$punch.' عند تغيير التوقيت: '.$v['reason'], 0, 2000),
+                'created_by' => $r->user()->id, 'created_at' => now(), 'updated_at' => now(),
+            ]);
+            $this->audit($r, 'punch', $punch, 'time_review_resolved', $detail + ['reading' => 'other', 'replacement_punch_id' => $manual, 'direction' => $direction]);
+            $this->audit($r, 'punch', $manual, 'manual_created', ['reason' => $v['reason'], 'replaces_device_punch' => $punch]);
+            $daily = app(AttendanceDailyService::class);
+            $daily->recalculateAroundPunch($employee, $stored);
+            $daily->recalculateAroundPunch($employee, $chosen);
+
+            return 'تأكد وقت الحركة بالقراءة الأخرى: سُجلت حركة بهذا الوقت مع حفظ حركة الجهاز الأصلية دليلًا، وأُعيد احتساب يوم الموظف.';
+        });
+
+        return back()->with('success', $message);
+    }
+
+    /**
+     * The default template is a schedule change: it is requested from «قوالب الدوام» (action set_default) and approved
+     * by the executive director (AttendanceScheduleManageController). The technical administrator no longer sets it
+     * directly; the route stays so an old link gets this answer instead of a 404.
+     */
     public function setDefaultSchedule(Request $r, int $schedule)
     {
         $this->admin($r);
-        DB::transaction(function () use ($r, $schedule) {
-            $row = DB::table('attendance_schedules')->where('id', $schedule)->lockForUpdate()->first();
-            abort_unless($row && $row->is_active, 404);
-            DB::table('attendance_schedules')->where('is_default', true)->update(['is_default' => false, 'updated_at' => now()]);
-            DB::table('attendance_schedules')->where('id', $schedule)->update(['is_default' => true, 'updated_at' => now()]);
-            $this->audit($r, 'schedule', $schedule, 'set_default', []);
-            app(AttendanceDailyService::class)->refreshExisting();
-        });
-
-        return back()->with('success', 'تم تعيين قالب الدوام الافتراضي.');
+        abort(403, 'تعيين القالب الافتراضي تعديل على الدوام: اطلبه من «قوالب الدوام» ويعتمده المدير التنفيذي.');
     }
 
     public function mapping(Request $r)
@@ -180,7 +246,13 @@ final class AttendanceOperationsController extends Controller
             'mappings' => DB::table('attendance_employee_device_ids')->orderBy('device_id')->get(),
             'grace_minutes' => app(AttendancePolicy::class)->graceMinutes(),
             'canApproveImport' => $r->user()->isSystemAdmin(),
+            // Manual corrections are decided by the HR head (or the executive director), not with the import approval.
+            'decidableCorrections' => collect(['pending', 'approved'])
+                ->flatMap(fn (string $status): array => app(AttendanceAccess::class)->correctionsToDecide((int) $r->user()->id, $status)?->pluck('c.id')->all() ?? [])
+                ->map(fn ($id): int => (int) $id)->values()->all(),
             'unmatched' => Schema::hasColumn('attendance_punches', 'raw_payload') ? DB::table('attendance_punches')->where('match_status', 'unmatched')->orderBy('id')->limit(100)->get(['id', 'device_id', 'raw_user_id', 'device_local_time', 'device_timezone']) : [],
+            // Daylight-saving punches held until their instant is confirmed (HR-20).
+            'time_review' => app(PunchTimeReview::class)->queue($r->user()),
             'daily' => DB::table('attendance_daily_results')->orderByDesc('work_date')->limit(100)->get(),
             'correction_punches' => DB::table('attendance_punches as p')->join('employees as e', 'e.id', '=', 'p.employee_id')
                 ->where('p.source', 'device')->whereNotNull('p.raw_payload')->whereNotNull('p.employee_id')
@@ -210,6 +282,8 @@ final class AttendanceOperationsController extends Controller
         if (! empty($v['employee_id'])) {
             $query->where('d.employee_id', $v['employee_id']);
         }
+        app(AuditService::class)->event('attendance.report.exported', ['subject_type' => 'attendance_daily_results', 'sensitivity' => 'personal', 'ip' => $r->ip(),
+            'metadata' => ['from' => $v['from'], 'to' => $v['to'], 'employee_id' => $v['employee_id'] ?? null, 'rows' => (clone $query)->reorder()->count(), 'format' => 'csv']]);
 
         return response()->streamDownload(function () use ($query) {
             $out = fopen('php://output', 'w');

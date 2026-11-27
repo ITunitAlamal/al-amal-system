@@ -12,6 +12,7 @@
         main { max-width: 760px; margin: 0 auto; }
         .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }
         .toolbar button { font: inherit; padding: 6px 16px; border-radius: 8px; border: 1px solid #174275; background: #174275; color: #fff; cursor: pointer; }
+        .toolbar a { color: #174275; text-decoration: none; padding: 6px; }
         .toolbar p { margin: 0; font-size: 12px; color: #475569; }
         header { border-bottom: 3px solid #174275; padding-bottom: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
         h1 { margin: 0; font-size: 20px; color: #174275; }
@@ -36,6 +37,9 @@
 <main>
     <div class="toolbar" role="region" aria-label="أدوات الطباعة">
         <button type="button" onclick="window.print()">طباعة أو حفظ PDF</button>
+        @if ($slip['own'])
+            <a href="{{ route('payslips.create') }}">العودة إلى قسائم راتبي</a>
+        @endif
         <p>لحفظ القسيمة PDF اختر الوجهة «حفظ بتنسيق PDF» في نافذة الطباعة.</p>
     </div>
     <header>

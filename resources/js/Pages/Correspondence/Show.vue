@@ -1,7 +1,7 @@
 <script setup>
 import { formatDateTime } from '../../Support/dates.js';
-import { computed, ref, watch } from 'vue';
-import { useForm, Link } from '@inertiajs/vue3';
+import { computed, reactive, ref, watch } from 'vue';
+import { useForm, Link, router } from '@inertiajs/vue3';
 import { createUuid } from '../../Support/uuid.js';
 import AppLayout from '../../Layouts/AppLayout.vue';
 import PageHeader from '../../Components/PageHeader.vue';
@@ -9,26 +9,53 @@ import StatusStepper from '../../Components/StatusStepper.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
 import CorrespondenceFiles from '../../Components/CorrespondenceFiles.vue';
 import CopyReference from '../../Components/CopyReference.vue';
+import AppDialog from '../../Components/AppDialog.vue';
+import DecisionDialog from '../../Components/DecisionDialog.vue';
 import { confirmRecordAction, correspondenceConsequences } from '../../Support/actionConfirmation.js';
 
 const props = defineProps({
     letter: Object, history: Array, task: Object, allowed: Array, sourceDepartment: Number, workflow: Object, workflowActions: Array,
     workflowRevision: Number, settings: Object, replyTo: Object, meta: Object, canPrintAudit: Boolean,
-    effectiveEdition: Object, canProposeEdition: Boolean, editions: Array,
+    effectiveEdition: Object, canProposeEdition: Boolean, editions: Array, parentLetter: Object, referrals: Array,
+    exceptionalAccess: String, confidentialAccess: Object, decision: Object,
 });
+
+// Exceptional access to a confidential record: issued and revoked by the executive director, audited by the server.
+const grantOpen = ref(false);
+const grant = useForm({ user_id: '', ends_on: '', reason: '' });
+const today = new Date().toISOString().slice(0, 10);
+function issueGrant() {
+    grant.post(`/correspondence/${props.letter.public_id}/confidential-access`, { preserveScroll: true, onSuccess: () => { grant.reset(); grantOpen.value = false; } });
+}
+const revoking = ref(null);
+const revokeDecision = computed(() => revoking.value ? { title: 'إلغاء الاطلاع الاستثنائي', description: revoking.value.user_name, required: true, danger: true, confirmLabel: 'إلغاء الاطلاع', maxLength: 1000 } : null);
+const revokeBusy = ref(false);
+const revokeError = ref('');
+function revokeGrant(note) {
+    revokeBusy.value = true;
+    revokeError.value = '';
+    router.post(`/correspondence/${props.letter.public_id}/confidential-access/${revoking.value.id}/revoke`, { revoke_reason: note }, {
+        preserveScroll: true,
+        onSuccess: () => { revoking.value = null; },
+        onError: errors => { revokeError.value = Object.values(errors)[0] || 'تعذر الإلغاء.'; },
+        onFinish: () => { revokeBusy.value = false; },
+    });
+}
 
 const statusLabels = { draft: 'مسودة', issued: 'مرسلة', processing: 'قيد المتابعة', processed: 'أُنجزت — بانتظار الطلب المرتبط', closed: 'منتهية', archived: 'مؤرشفة', withdrawn: 'مسحوبة' };
 const statusTones = { draft: 'warning', issued: 'info', processing: 'info', processed: 'success', closed: 'success', archived: 'muted', withdrawn: 'muted' };
 const eventLabels = { issue: 'أُرسلت', receive: 'استُلمت', read: 'فُتحت', acknowledge: 'أُقرّ بالاستلام', forward: 'أُحيلت', reply: 'رد', return: 'أُعيدت', refuse: 'رُفض التكليف', complete: 'أُنجزت', close: 'أُغلقت', archive: 'أُرشفت', external_register: 'قُيّدت في الأرشيف الخارجي', withdraw: 'سُحبت', correction: 'تصحيح', workflow: 'إجراء في مسار القرار' };
 const actionLabels = { reply: 'رد', forward: 'إحالة', return: 'إعادة للاستكمال', refuse: 'رفض التكليف مع إعادته', complete: 'إنجاز وإغلاق', correction: 'إضافة مرفقات / تصحيح موثق', withdraw: 'سحب المراسلة', close: 'إغلاق', archive: 'أرشفة', reopen: 'إعادة فتح موثقة', reassign: 'إعادة إسناد', workflow: 'متابعة مسار القرار' };
-Object.assign(eventLabels, { reopen: 'أُعيد فتحها', reassign: 'أُعيد إسنادها' });
+Object.assign(eventLabels, { reopen: 'أُعيد فتحها', reassign: 'أُعيد إسنادها', refer: 'أُحيلت للمتابعة' });
+// A referral writes and sends a linked «إحالة» letter: incoming mail from the Secretariat, or Board work handed to a colleague.
+actionLabels.refer = props.letter.channel === 'external' ? 'إحالة للمتابعة' : 'إحالة إلى موظف في القسم';
 const date = value => formatDateTime(value);
 const replacement = useForm({ submission_key: createUuid(), subject: props.effectiveEdition?.subject || props.letter.subject, body: props.effectiveEdition?.body || props.letter.body, reason: '', substantive: true, attachments: [] });
 function proposeEdition() {
     replacement.post(`/correspondence/${props.letter.public_id}/editions`, { forceFormData: true });
 }
 
-const mainActions = computed(() => ['reply', 'forward', 'complete', 'workflow'].filter(action => props.allowed.includes(action)));
+const mainActions = computed(() => ['reply', 'forward', 'complete', 'workflow', 'refer'].filter(action => props.allowed.includes(action)));
 const otherActions = computed(() => ['return', 'refuse', 'close', 'withdraw', 'correction', 'archive', 'reopen', 'reassign'].filter(action => props.allowed.includes(action)));
 const originals = computed(() => props.history.filter(entry => entry.is_original).flatMap(entry => entry.attachments));
 const timeline = computed(() => props.history.filter(entry => !['draft', 'draft_edit'].includes(entry.action)));
@@ -42,8 +69,16 @@ const followUp = computed(() => {
 
 const form = useForm({ idempotency_key: createUuid(), revision: props.letter.revision, action: '', note: '', recipient_id: '', recipient_department_id: '', due_at: '', attachments: [], replacements: [], transition_id: '', workflow_revision: props.workflowRevision });
 const chosenTransition = computed(() => props.workflowActions?.find(transition => String(transition.id) === String(form.transition_id)));
-const picksRecipient = computed(() => ['forward', 'return', 'refuse', 'reopen', 'reassign'].includes(form.action) || (form.action === 'reply' && !props.replyTo));
-const needsNote = computed(() => ['reply', 'forward', 'return', 'refuse', 'withdraw', 'correction', 'workflow', 'reopen', 'reassign'].includes(form.action));
+// A head of several departments: the executive director names the department that executes the decision.
+const executingDepartments = computed(() => chosenTransition.value?.executing_departments?.[form.recipient_id] || []);
+watch(() => [form.transition_id, form.recipient_id], () => { if (form.action === 'workflow') { form.recipient_department_id = ''; } });
+// A decision the Secretariat returned: the board secretary completes or corrects its data with his action back to registration.
+const decisionFields = reactive({ decision_number: props.decision?.decision_number || '', decision_date: props.decision?.decision_date || '', meeting_number: props.decision?.meeting_number || '', meeting_date: props.decision?.meeting_date || '' });
+const editsDecision = computed(() => form.action === 'workflow' && Boolean(chosenTransition.value?.decision_fields));
+form.transform(data => (editsDecision.value ? { ...data, decision: { ...decisionFields } } : data));
+const picksRecipient = computed(() => ['forward', 'return', 'refuse', 'reopen', 'reassign', 'refer'].includes(form.action) || (form.action === 'reply' && !props.replyTo));
+const needsNote = computed(() => ['reply', 'forward', 'return', 'refuse', 'withdraw', 'correction', 'workflow', 'reopen', 'reassign', 'refer'].includes(form.action));
+const optionalDue = computed(() => ['forward', 'refer'].includes(form.action));
 const takesFiles = computed(() => ['reply', 'forward', 'return', 'refuse', 'complete', 'correction', 'workflow'].includes(form.action));
 const recipients = ref([]);
 const recipientKey = ref('');
@@ -62,7 +97,7 @@ watch(() => props.letter.revision, value => { form.revision = value; form.workfl
 async function loadRecipients() {
     try {
         const query = new URLSearchParams({ department_id: props.sourceDepartment, type_value_id: props.letter.type_value_id, classification_value_id: props.letter.classification_value_id, letter: props.letter.public_id });
-        if (['reopen', 'reassign'].includes(form.action)) { query.set('action', form.action); }
+        if (['reopen', 'reassign', 'refer'].includes(form.action)) { query.set('action', form.action); }
         const response = await fetch(`/correspondence/recipients?${query}`, { headers: { Accept: 'application/json' } });
         if (!response.ok) { throw new Error(); }
         recipients.value = (await response.json()).recipients;
@@ -94,7 +129,7 @@ function send(action) {
     if (consequence && !confirmRecordAction(actionLabels[form.action], `${props.letter.reference || 'مسودة'} — ${props.letter.subject}`, consequence)) { return; }
     form.post(`/correspondence/${props.letter.public_id}/actions`, {
         forceFormData: true, preserveScroll: true,
-        onSuccess: () => { form.reset('attachments', 'replacements', 'note'); form.idempotency_key = createUuid(); },
+        onSuccess: () => { form.reset('attachments', 'replacements', 'note'); form.idempotency_key = createUuid(); if (form.action === 'refer') { form.action = ''; } },
     });
 }
 </script>
@@ -129,6 +164,37 @@ function send(action) {
                 <Link :href="`/correspondence/${letter.public_id}/edit`" class="btn btn-secondary">تحرير</Link>
             </section>
 
+            <p v-if="exceptionalAccess" class="alert-warning print:hidden" role="status">تطّلع على هذه المراسلة {{ meta.classification || 'السرية' }} باطلاع استثنائي من المدير التنفيذي حتى {{ date(exceptionalAccess) }}، للاطلاع فقط، ويُسجَّل كل فتح وطباعة وتنزيل في سجل النظام.</p>
+
+            <section v-if="confidentialAccess" class="card space-y-3 print:hidden">
+                <div class="flex flex-wrap items-start justify-between gap-2 border-b border-slate-100 pb-3">
+                    <div>
+                        <h2 class="font-bold text-navy-800">الاطلاع الاستثنائي</h2>
+                        <p class="mt-1 text-sm text-slate-500">لا يطّلع مدير النظام ولا غيره على المراسلة {{ meta.classification }} إلا بتداولها المعتمد أو باطلاع تمنحه أنت لشخص محدد حتى تاريخ محدد.</p>
+                    </div>
+                    <button type="button" class="btn btn-secondary" @click="grantOpen = true">منح اطلاع استثنائي</button>
+                </div>
+                <ul v-if="confidentialAccess.grants.length" class="divide-y divide-slate-100 rounded-lg border border-slate-200 text-sm">
+                    <li v-for="item in confidentialAccess.grants" :key="item.id" class="flex flex-wrap items-center justify-between gap-2 p-3">
+                        <span><span class="font-semibold text-navy-800">{{ item.user_name }}</span> — حتى {{ date(item.ends_at) }} — {{ item.reason }}</span>
+                        <span class="flex items-center gap-2">
+                            <StatusBadge :label="item.state" :tone="item.state === 'ساري' ? 'warning' : 'muted'" />
+                            <button v-if="item.can_revoke" type="button" class="btn btn-secondary" @click="revokeError = ''; revoking = item">إلغاء</button>
+                        </span>
+                    </li>
+                </ul>
+            </section>
+            <AppDialog :open="grantOpen" title="منح اطلاع استثنائي" description="للاطلاع على هذه المراسلة وحدها حتى التاريخ المحدد، دون أي إجراء عليها." :busy="grant.processing" @close="grantOpen = false">
+                <form class="space-y-3" @submit.prevent="issueGrant">
+                    <p v-for="(error, key) in grant.errors" :key="key" class="alert-error" role="alert">{{ error }}</p>
+                    <label class="field-label">الموظف<select v-model="grant.user_id" class="field mt-1" required><option value="" disabled>اختر</option><option v-for="person in confidentialAccess?.candidates || []" :key="person.id" :value="person.id">{{ person.name }}</option></select></label>
+                    <label class="field-label">ينتهي في نهاية يوم<input v-model="grant.ends_on" type="date" class="field mt-1" :min="today" required /></label>
+                    <label class="field-label">سبب الاطلاع<textarea v-model="grant.reason" class="field mt-1" rows="3" minlength="5" maxlength="1000" required></textarea></label>
+                    <div class="flex flex-wrap gap-2"><button class="btn btn-primary" :disabled="grant.processing">منح الاطلاع</button><button type="button" class="btn btn-secondary" :disabled="grant.processing" @click="grantOpen = false">إلغاء</button></div>
+                </form>
+            </AppDialog>
+            <DecisionDialog :decision="revokeDecision" :busy="revokeBusy" :error="revokeError" @close="revoking = null" @confirm="revokeGrant" />
+
             <section class="card">
                 <h2 class="mb-4 text-base font-bold text-navy-800">{{ letter.channel === 'external' ? 'بيانات الأرشفة الخارجية' : 'ملخص المراسلة' }}</h2>
                 <dl class="grid gap-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
@@ -141,7 +207,46 @@ function send(action) {
                     <div v-if="followUp"><dt class="text-slate-500">حالة المتابعة</dt><dd class="mt-1 font-medium">{{ followUp }}</dd></div>
                     <div v-if="task?.due_at && !task.completed_at"><dt class="text-slate-500">الموعد المطلوب</dt><dd class="mt-1 font-semibold">{{ date(task.due_at) }}</dd></div>
                     <div v-if="meta.type_code && meta.type_code !== 'memo'"><dt class="text-slate-500">نوع المراسلة</dt><dd class="mt-1 font-medium">{{ meta.type }}</dd></div>
+                    <div v-if="parentLetter" class="sm:col-span-2 lg:col-span-3"><dt class="text-slate-500">{{ parentLetter.channel === 'external' ? 'البريد الوارد المُحال' : 'المراسلة المرتبطة' }}</dt><dd class="mt-1 font-medium"><Link :href="`/correspondence/${parentLetter.public_id}`" class="text-blue-700 underline underline-offset-2">{{ parentLetter.reference || 'بدون رقم' }}</Link> — {{ parentLetter.subject }}</dd></div>
                 </dl>
+            </section>
+
+            <section v-if="decision" class="card">
+                <div class="mb-4 flex flex-wrap items-start justify-between gap-2">
+                    <h2 class="text-base font-bold text-navy-800">بيانات قرار مجلس الإدارة</h2>
+                    <Link v-if="decision.recorded_at" href="/correspondence/decisions" class="text-sm font-semibold text-blue-700 underline underline-offset-2 print:hidden">سجل القرارات</Link>
+                </div>
+                <dl class="grid gap-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
+                    <div><dt class="text-slate-500">رقم القرار</dt><dd class="mt-1 font-semibold text-navy-800">{{ decision.decision_number || '—' }}</dd></div>
+                    <div><dt class="text-slate-500">تاريخ القرار</dt><dd class="mt-1 font-medium">{{ decision.decision_date || '—' }}</dd></div>
+                    <div><dt class="text-slate-500">الجلسة</dt><dd class="mt-1 font-medium">{{ decision.meeting_number || '—' }}<span v-if="decision.meeting_date" class="text-slate-500"> — {{ decision.meeting_date }}</span></dd></div>
+                    <div><dt class="text-slate-500">الحالة</dt><dd class="mt-1 font-medium">{{ decision.closed_at ? `مغلق ${date(decision.closed_at)}` : (decision.recorded_at ? (workflow?.summary?.where || workflow?.summary?.status || 'قيد المتابعة') : (letter.status === 'draft' ? 'لم يُرسل بعد' : 'بانتظار تسجيل السكرتاريا')) }}</dd></div>
+                </dl>
+                <div v-if="decision.assignments.length" class="mt-4 border-t border-slate-100 pt-3">
+                    <h3 class="mb-2 text-sm font-bold text-slate-700">الأقسام المكلفة بالتنفيذ</h3>
+                    <ul class="divide-y divide-slate-100 rounded-lg border border-slate-200 text-sm">
+                        <li v-for="item in decision.assignments" :key="item.id" class="flex flex-wrap items-center justify-between gap-2 p-3">
+                            <span><span class="font-semibold text-navy-800">{{ item.department }}</span> — {{ item.head }}<span v-if="item.due_at && item.status === 'executing'" class="text-slate-500"> — الموعد {{ date(item.due_at) }}</span></span>
+                            <span class="flex items-center gap-2">
+                                <StatusBadge v-if="item.overdue" label="متأخر" tone="danger" />
+                                <StatusBadge :label="item.label" :tone="{ executing: 'info', reported: 'warning', accepted: 'success' }[item.status] || 'muted'" />
+                            </span>
+                        </li>
+                    </ul>
+                </div>
+            </section>
+
+            <section v-if="referrals?.length" class="card print:hidden">
+                <h2 class="mb-3 font-bold text-navy-800">الإحالات المرتبطة</h2>
+                <ul class="divide-y divide-slate-100 rounded-lg border border-slate-200 text-sm">
+                    <li v-for="item in referrals" :key="item.public_id" class="flex flex-wrap items-center justify-between gap-2 p-3">
+                        <Link :href="`/correspondence/${item.public_id}`" class="font-semibold text-blue-700 underline underline-offset-2">{{ item.reference || item.subject }}</Link>
+                        <span class="flex flex-wrap items-center gap-2 text-slate-600">
+                            <span v-if="item.holder_name && item.task_status === 'open'">لدى {{ item.holder_name }}</span>
+                            <StatusBadge :status="item.status" :label="statusLabels[item.status] || item.status" :tone="statusTones[item.status] || 'muted'" />
+                        </span>
+                    </li>
+                </ul>
             </section>
 
             <article class="card space-y-4">
@@ -237,11 +342,20 @@ function send(action) {
                                 <label v-if="chosenTransition?.needs_pick" class="block text-sm font-semibold">مسؤول المرحلة التالية
                                     <select v-model="form.recipient_id" class="field mt-1 w-full" required><option value="">اختر</option><option v-for="person in chosenTransition.pick_options" :key="person.id" :value="person.id">{{ person.name }}</option></select>
                                 </label>
+                                <label v-if="executingDepartments.length" class="block text-sm font-semibold">القسم المكلف بالتنفيذ
+                                    <select v-model="form.recipient_department_id" class="field mt-1 w-full" required><option value="">اختر</option><option v-for="item in executingDepartments" :key="item.id" :value="item.id">{{ item.name }}</option></select>
+                                </label>
+                                <template v-if="editsDecision">
+                                    <label class="block text-sm font-semibold">رقم القرار<input v-model="decisionFields.decision_number" class="field mt-1 w-full" maxlength="100" required></label>
+                                    <label class="block text-sm font-semibold">تاريخ القرار<input v-model="decisionFields.decision_date" type="date" class="field mt-1 w-full" required></label>
+                                    <label class="block text-sm font-semibold">رقم الجلسة<input v-model="decisionFields.meeting_number" class="field mt-1 w-full" maxlength="100" required></label>
+                                    <label class="block text-sm font-semibold">تاريخ الجلسة <span class="font-normal text-slate-500">(اختياري)</span><input v-model="decisionFields.meeting_date" type="date" class="field mt-1 w-full"></label>
+                                </template>
                             </template>
 
                             <p v-if="form.action === 'reply' && replyTo" class="rounded-lg bg-slate-50 p-3 text-sm lg:col-span-2">إلى: <span class="font-semibold text-navy-800">{{ replyTo.label }}</span></p>
                             <template v-if="picksRecipient">
-                                <label class="block text-sm font-semibold" :class="['forward', 'return', 'refuse', 'reopen', 'reassign'].includes(form.action) ? 'lg:col-span-2' : ''">إلى
+                                <label class="block text-sm font-semibold" :class="['forward', 'return', 'refuse', 'reopen', 'reassign', 'refer'].includes(form.action) ? 'lg:col-span-2' : ''">إلى
                                     <select v-model="recipientKey" class="field mt-1 w-full" required>
                                         <option value="">اختر المستلم</option>
                                         <optgroup v-for="group in groups" :key="group.name" :label="group.name">
@@ -250,12 +364,12 @@ function send(action) {
                                     </select>
                                 </label>
                                 <p v-if="loadError" class="text-sm text-red-700" role="alert">{{ loadError }}</p>
-                                <label v-if="['forward', 'reopen', 'reassign'].includes(form.action)" class="block text-sm font-semibold">موعد المتابعة {{ form.action === 'forward' ? '(اختياري)' : '(مطلوب)' }}
-                                    <input v-model="form.due_at" type="datetime-local" class="field mt-1 w-full" :required="form.action !== 'forward'" />
+                                <label v-if="['forward', 'reopen', 'reassign', 'refer'].includes(form.action)" class="block text-sm font-semibold">موعد المتابعة {{ optionalDue ? '(اختياري)' : '(مطلوب)' }}
+                                    <input v-model="form.due_at" type="datetime-local" class="field mt-1 w-full" :required="!optionalDue" />
                                 </label>
                             </template>
 
-                            <label class="block text-sm font-semibold lg:col-span-2">{{ form.action === 'complete' ? 'ملاحظة (اختيارية)' : (form.action === 'reply' ? 'نص الرد' : 'الملاحظة') }}
+                            <label class="block text-sm font-semibold lg:col-span-2">{{ form.action === 'complete' ? 'ملاحظة (اختيارية)' : (form.action === 'reply' ? 'نص الرد' : (form.action === 'refer' ? 'نص الإحالة (المطلوب من المستلم)' : 'الملاحظة')) }}
                                 <textarea v-model="form.note" class="field mt-1 w-full" rows="5" :required="needsNote"></textarea>
                             </label>
                             <div v-if="takesFiles" class="lg:col-span-2">

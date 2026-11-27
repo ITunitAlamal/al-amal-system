@@ -38,11 +38,15 @@ class CaseStudyController extends Controller
             'household' => ['public_id' => $home->public_id, 'reference_no' => $home->reference_no, 'name' => $home->display_name],
             'study' => $row ? ['public_id' => $row->public_id, 'status' => $row->status, 'status_label' => CaseStudies::STATUS[$row->status], 'version' => $version,
                 'lock_version' => (int) $row->lock_version, 'assessed_on' => $row->assessed_on, 'assessor' => $names($row->assessor_id), 'submitted_at' => $row->submitted_at,
-                'reviewer' => $names($row->reviewed_by), 'reviewed_at' => $row->reviewed_at, 'review_note' => $row->review_note, 'mine' => (int) $row->assessor_id === (int) $user->id] : null,
+                'reviewer' => $names($row->reviewed_by), 'reviewed_at' => $row->reviewed_at, 'review_note' => $row->review_note, 'mine' => (int) $row->assessor_id === (int) $user->id,
+                'assigned_to' => isset($row->assigned_to) ? (int) $row->assigned_to : null, 'assignee' => $names(isset($row->assigned_to) ? (int) $row->assigned_to : null),
+                'recommendation' => CaseStudies::RECOMMENDATIONS[$row->review_recommendation ?? ''] ?? null] : null,
             'history' => DB::table('household_case_studies')->where('household_id', $home->id)->orderByDesc('id')->get(['public_id', 'status', 'assessed_on', 'reviewed_at'])
                 ->map(fn ($h): array => [...(array) $h, 'status_label' => CaseStudies::STATUS[$h->status]])->all(),
             'schema' => $schema, 'answers' => $answers, 'options' => $this->studies->options($version, $answers), 'persons' => $this->studies->persons($home->id),
-            'canHealth' => $mayHealth, 'canEdit' => $this->access->canEdit($user), 'canReview' => $this->access->isHead($user),
+            'canHealth' => $mayHealth, 'canEdit' => $this->access->canEdit($user) && (! isset($row->assigned_to) || (int) $row->assigned_to === (int) $user->id || $this->access->isHead($user)),
+            'canReview' => $this->access->isHead($user), 'recommendations' => CaseStudies::RECOMMENDATIONS,
+            'staff' => $this->access->isHead($user) ? $this->access->staff() : [],
         ]);
     }
 
@@ -75,10 +79,19 @@ class CaseStudyController extends Controller
         return back()->with('success', 'أُرسلت الدراسة لمراجعة رئيس القسم.');
     }
 
+    /** The head assigns the study to a researcher (ORP-19; req-04 «تعيين الباحث»). */
+    public function assign(Request $request, string $study): RedirectResponse
+    {
+        $data = $request->validate(['assigned_to' => ['nullable', 'integer', 'exists:users,id']]);
+        $this->studies->assign($this->studies->find($study), isset($data['assigned_to']) ? (int) $data['assigned_to'] : null, $request->user());
+
+        return back()->with('success', isset($data['assigned_to']) ? 'عُيّن الباحث للدراسة.' : 'أُلغي تعيين الباحث.');
+    }
+
     public function decide(Request $request, string $study, string $decision): RedirectResponse
     {
-        $data = $request->validate(['note' => ['nullable', 'string', 'max:2000']]);
-        $this->studies->decide($this->studies->find($study), $decision, $data['note'] ?? null, $request->user());
+        $data = $request->validate(['note' => ['nullable', 'string', 'max:2000'], 'recommendation' => ['nullable', 'string', 'in:'.implode(',', array_keys(CaseStudies::RECOMMENDATIONS))]]);
+        $this->studies->decide($this->studies->find($study), $decision, $data['note'] ?? null, $request->user(), $data['recommendation'] ?? null);
 
         return back()->with('success', $decision === 'review' ? 'سُجلت مراجعة الدراسة.' : 'أُعيدت الدراسة للاستكمال.');
     }

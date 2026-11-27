@@ -44,7 +44,7 @@ final class AidController extends Controller
         };
 
         return Inertia::render('Orphans/Aid/Index', ['tab' => $tab, 'rows' => $data, 'filters' => ['q' => $q, 'status' => $request->query('status')], 'abilities' => $this->access->abilities($request->user()),
-            'labels' => ['sponsorship' => Aid::SPONSORSHIP_STATUS, 'coverage' => Aid::COVERAGE, 'assistance' => Aid::ASSISTANCE_STATUS],
+            'labels' => ['sponsorship' => Aid::SPONSORSHIP_STATUS, 'coverage' => Aid::COVERAGE, 'assistance' => Aid::ASSISTANCE_STATUS, 'fulfillment' => Aid::FULFILLMENT_KINDS],
             'options' => ['types' => $this->queries->values('assistance_types'), 'programs' => $this->queries->values('sponsorship_types'), 'frequencies' => $this->queries->values('sponsorship_frequencies'),
                 'currencies' => DB::table('currencies')->orderBy('code')->pluck('code')],
             'sponsors' => $tab === 'sponsorships' ? DB::table('sponsors')->where('status', 'active')->orderBy('name')->get(['id', 'name', 'reference_no']) : []]);
@@ -62,7 +62,13 @@ final class AidController extends Controller
                 ->leftJoin('households as h', 'h.id', '=', 'b.household_id')->where('b.sponsorship_id', $s->id)->orderByRaw('b.ends_on IS NOT NULL')->orderBy('b.id')
                 ->get(['b.id', 'b.share_amount', 'b.starts_on', 'b.ends_on', 'b.ended_reason', 'p.full_name', 'o.public_id as orphan_public_id', 'o.reference_no as orphan_reference', 'h.reference_no as household_reference']),
             'dues' => DB::table('sponsorship_dues')->where('sponsorship_id', $s->id)->orderBy('period_start')->get()
-                ->map(fn ($d): array => [...(array) $d, 'collected' => Aid::collected($d->finance_receivable_id), 'receivable' => $d->finance_receivable_id ? DB::table('finance_receivables')->where('id', $d->finance_receivable_id)->value('reference') : null]),
+                ->map(function ($d): array {
+                    $collected = Aid::collected($d->finance_receivable_id, (int) $d->id);
+
+                    return [...(array) $d, 'collected' => $collected, 'receivable' => $d->finance_receivable_id ? DB::table('finance_receivables')->where('id', $d->finance_receivable_id)->value('reference') : null,
+                        // Same rule as Aid::overdueDues(): referred, past its date, collected below the amount.
+                        'overdue' => $d->status === 'referred' && $d->due_on < today()->toDateString() && round((float) $collected, 2) < round((float) $d->amount, 2)];
+                }),
             'benefits' => Aid::benefits(['sponsorship_id' => $s->id]),
             'labels' => ['sponsorship' => Aid::SPONSORSHIP_STATUS, 'coverage' => Aid::COVERAGE], 'abilities' => $this->access->abilities($request->user()),
         ]);
@@ -97,19 +103,27 @@ final class AidController extends Controller
     public function sponsorshipAction(Request $request, string $publicId): RedirectResponse
     {
         $s = DB::table('sponsorships')->where('public_id', $publicId)->firstOrFail();
-        $data = $request->validate(['action' => ['required', Rule::in(['status', 'schedule', 'refer', 'add_orphan', 'add_household', 'end_line'])], 'status' => ['nullable', Rule::in(array_keys(Aid::SPONSORSHIP_STATUS))],
+        $data = $request->validate(['action' => ['required', Rule::in(['status', 'schedule', 'refer', 'add_orphan', 'add_household', 'end_line'])],
+            'status' => ['required_if:action,status', 'nullable', Rule::in(array_keys(Aid::TRANSITIONS))], 'expected_status' => ['required_if:action,status', 'nullable', Rule::in(array_keys(Aid::TRANSITIONS))],
             'reason' => 'nullable|string|max:300', 'due_id' => 'nullable|integer', 'line_id' => 'nullable|integer', 'orphan_public_id' => 'nullable|string|exists:orphans,public_id',
             'household_reference' => 'nullable|string|exists:households,reference_no', 'share_amount' => 'nullable|numeric|min:0']);
         $user = $request->user();
         $message = match ($data['action']) {
-            'status' => tap('تم تحديث حالة الكفالة.', fn () => $this->aid->setStatus($s, $data['status'] ?? 'draft', $data['reason'] ?? null, $user)),
-            'schedule' => tap('تم تحديث جدول الاستحقاقات.', function () use ($s, $user): void { $this->access->assert($user, 'sponsorships'); $this->aid->schedule($s); }),
+            'status' => tap('تم تحديث حالة الكفالة.', fn () => $this->aid->setStatus($s, $data['status'], $data['reason'] ?? null, $user, $data['expected_status'])),
+            'schedule' => tap('تم تحديث جدول الاستحقاقات.', function () use ($s, $user): void {
+                $this->access->assert($user, 'sponsorships');
+                $this->aid->schedule($s);
+            }),
             'refer' => tap('أُحيل الاستحقاق للحسابات؛ التحصيل يُؤكَّد من الحسابات.', fn () => $this->aid->refer(DB::table('sponsorship_dues')->where('sponsorship_id', $s->id)->where('id', $data['due_id'] ?? 0)->firstOrFail(), $user)),
-            'add_orphan' => tap('أُضيف اليتيم إلى الكفالة.', function () use ($s, $data, $user): void { $this->access->assert($user, 'sponsorships');
-                $this->aid->addBeneficiary($s->id, ['orphan_id' => DB::table('orphans')->where('public_id', $data['orphan_public_id'] ?? '')->value('id') ?? abort(422)], today()->toDateString(), $user, $data['share_amount'] ?? null); }),
-            'add_household' => tap('أُضيفت الأسرة إلى الكفالة.', function () use ($s, $data, $user): void { $this->access->assert($user, 'sponsorships');
-                $this->aid->addBeneficiary($s->id, ['household_id' => DB::table('households')->where('reference_no', $data['household_reference'] ?? '')->value('id') ?? abort(422)], today()->toDateString(), $user, $data['share_amount'] ?? null); }),
-            'end_line' => tap('أُنهي سطر المستفيد مع حفظه.', fn () => $this->aid->endBeneficiary((int) ($data['line_id'] ?? 0), $data['reason'] ?: 'إنهاء', $user)),
+            'add_orphan' => tap('أُضيف اليتيم إلى الكفالة.', function () use ($s, $data, $user): void {
+                $this->access->assert($user, 'sponsorships');
+                $this->aid->addBeneficiary($s->id, ['orphan_id' => DB::table('orphans')->where('public_id', $data['orphan_public_id'] ?? '')->value('id') ?? abort(422)], today()->toDateString(), $user, $data['share_amount'] ?? null);
+            }),
+            'add_household' => tap('أُضيفت الأسرة إلى الكفالة.', function () use ($s, $data, $user): void {
+                $this->access->assert($user, 'sponsorships');
+                $this->aid->addBeneficiary($s->id, ['household_id' => DB::table('households')->where('reference_no', $data['household_reference'] ?? '')->value('id') ?? abort(422)], today()->toDateString(), $user, $data['share_amount'] ?? null);
+            }),
+            'end_line' => tap('أُنهي سطر المستفيد مع حفظه.', fn () => $this->aid->endBeneficiary((int) $s->id, (int) ($data['line_id'] ?? 0), (string) ($data['reason'] ?? ''), $user)),
         };
 
         return back()->with('success', $message);
@@ -143,7 +157,8 @@ final class AidController extends Controller
             'sponsorship_public_id' => 'nullable|string|exists:sponsorships,public_id', 'assistance_public_id' => 'nullable|string|exists:assistance_requests,public_id',
             'type_value_id' => 'nullable|integer|exists:master_data_values,id', 'description' => 'required|string|max:500', 'quantity' => 'nullable|numeric|min:0', 'unit_label' => 'nullable|string|max:30',
             'amount' => 'nullable|numeric|min:0', 'currency' => 'nullable|string|exists:currencies,code', 'recipient_name' => 'required|string|max:300', 'delivered_on' => 'required|date|before_or_equal:today',
-            'fulfillment_ref' => 'nullable|string|max:140'], [], ['recipient_name' => 'اسم المستلم الفعلي', 'delivered_on' => 'تاريخ التسليم', 'fulfillment_ref' => 'مرجع التنفيذ']);
+            'fulfillment_ref' => 'nullable|string|max:140', 'fulfillment_kind' => ['nullable', Rule::in(array_keys(Aid::FULFILLMENT_KINDS))]],
+            [], ['recipient_name' => 'اسم المستلم الفعلي', 'delivered_on' => 'تاريخ التسليم', 'fulfillment_ref' => 'مرجع التنفيذ', 'fulfillment_kind' => 'نوع مرجع التنفيذ']);
         $unit = $data['unit'] === 'orphan' ? ['orphan_id' => DB::table('orphans')->where('public_id', $data['orphan_public_id'] ?? '')->value('id')]
             : ['household_id' => DB::table('households')->where('reference_no', $data['household_reference'] ?? '')->value('id')];
         $this->aid->recordBenefit([...$data, 'unit' => $data['unit_label'] ?? null,

@@ -3,6 +3,8 @@
 namespace App\Services\Finance;
 
 use App\Models\User;
+use App\Services\Orphans\Aid;
+use App\Services\Orphans\SponsorshipCollections;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
 
@@ -21,16 +23,16 @@ final class FinanceDocumentCycle
      *
      * @return list<array{key: string, label: string, owner: string, count: int, module: string, area: string}>
      */
-    public function stages(): array
+    public function stages(User $user): array
     {
         $requests = DB::table('finance_purchase_requests')->selectRaw('state, count(*) as c')->groupBy('state')->pluck('c', 'state');
         // Functional area of each stage, for the department overview: المشتريات / المخازن / المحاسب العام.
         $areas = ['draft' => 'procurement', 'pending_finance_head' => 'procurement', 'pending_director' => 'procurement', 'pending_board_treasurer' => 'procurement',
             'awaiting_order' => 'procurement', 'ready_to_close' => 'procurement', 'awaiting_receipt' => 'stores', 'counts_pending' => 'stores',
-            'awaiting_invoice' => 'accountant', 'awaiting_voucher' => 'accountant', 'closed' => 'archive'];
+            'awaiting_invoice' => 'accountant', 'awaiting_voucher' => 'payments', 'closed' => 'archive', 'awaiting_sponsor_receipt' => 'receipts'];
         $stage = fn (string $key, string $label, string $owner, int $count, string $module): array => compact('key', 'label', 'owner', 'count', 'module') + ['area' => $areas[$key]];
 
-        return [
+        $stages = [
             $stage('draft', 'طلبات شراء قيد الإعداد', 'المشتريات', (int) ($requests['draft'] ?? 0), 'purchases'),
             $stage('pending_finance_head', 'بانتظار مراجعة رئيس الحسابات', 'رئيس الحسابات', (int) ($requests['pending_finance_head'] ?? 0), 'purchases'),
             $stage('pending_director', 'بانتظار اعتماد المدير التنفيذي', 'المدير التنفيذي', (int) ($requests['pending_director'] ?? 0), 'purchases'),
@@ -38,11 +40,23 @@ final class FinanceDocumentCycle
             $stage('awaiting_order', 'معتمدة بانتظار عروض الأسعار وأمر الشراء', 'المشتريات', $this->approvedWithoutOrder()->count(), 'quotes'),
             $stage('awaiting_receipt', 'أوامر شراء بانتظار الاستلام', 'أمين المخزن', $this->ordersInState(['issued', 'partial_received'])->count(), 'orders'),
             $stage('awaiting_invoice', 'مستلمة بانتظار فاتورة المورد', 'المحاسب', $this->receivedWithoutInvoice()->count(), 'orders'),
-            $stage('awaiting_voucher', 'فواتير بانتظار رقم سند الصرف من '.$this->guard->externalSystemName(), 'المحاسب', $this->unpaidInvoices()->count(), 'invoices'),
+            $stage('awaiting_voucher', 'فواتير بانتظار رقم سند الصرف من '.$this->guard->externalSystemName(), 'منفّذ الصرف', $this->unpaidInvoices()->count(), 'payment_vouchers'),
             $stage('ready_to_close', 'جاهزة للإغلاق', 'المشتريات', $this->readyToClose()->count(), 'orders'),
             $stage('closed', 'دورات مستندية مغلقة', '—', DB::table('finance_purchase_orders')->where('state', 'closed')->count(), 'archive'),
             $stage('counts_pending', 'محاضر جرد بانتظار الاعتماد', 'رئيس الحسابات', DB::table('finance_inventory_counts')->where('state', 'pending')->count(), 'counts'),
+            $stage('awaiting_sponsor_receipt', 'استحقاقات كفالات محالة بانتظار تسجيل القبض من '.$this->guard->externalSystemName(), 'منفّذ القبض', $this->uncollectedDues()->count(), 'sponsorship_receipts'),
         ];
+        $permissions = [
+            'procurement' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.procurement.director_approve', 'finance.procurement.board_approve'],
+            'stores' => ['finance.purchase.receive', 'finance.warehouse.manage', 'finance.stock.receive', 'finance.stock.issue', 'finance.stock.count', 'finance.stock.count.approve'],
+            'accountant' => ['finance.purchase.invoice'],
+            'payments' => ['finance.payment.record'],
+            'archive' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.purchase.invoice', 'finance.payment.record'],
+            'receipts' => [SponsorshipCollections::PERMISSION],
+        ];
+        $visible = array_keys(array_filter($permissions, fn (array $codes): bool => collect([...$codes, 'finance.monitor'])->contains(fn (string $code): bool => $this->guard->allows($user, $code))));
+
+        return array_values(array_filter($stages, fn (array $stage): bool => in_array($stage['area'], $visible, true)));
     }
 
     /**
@@ -83,15 +97,35 @@ final class FinanceDocumentCycle
             $add('board', 'موافقة أمين الصندوق', 'purchases', DB::table('finance_purchase_requests')->where('state', 'pending_board_treasurer')->where('created_by', '<>', $user->id)->orderBy('id')->limit(100)->get(),
                 fn ($row) => $row->number, $purchaseDetail);
         }
+        // The same per-transaction rule as the actions (FinanceSod): an order is not offered to whoever the step refuses.
+        $sod = app(FinanceSod::class);
+        $uid = (int) $user->id;
+        $actors = [];
+        $refused = function (int $orderId) use ($sod, $uid, &$actors): bool {
+            $actors[$orderId] ??= $sod->orderActors($orderId);
+
+            return isset($actors[$orderId][$uid]);
+        };
         if ($allows('finance.purchase.receive')) {
-            $add('receive', 'استلام أصناف أمر الشراء', 'orders', $this->ordersInState(['issued', 'partial_received'])->where('o.created_by', '<>', $user->id)->orderBy('o.id')->limit(100)->get(['o.*']),
+            $add('receive', 'استلام أصناف أمر الشراء', 'orders', $this->ordersInState(['issued', 'partial_received'])->where('o.created_by', '<>', $user->id)->orderBy('o.id')->limit(100)->get(['o.*'])
+                ->reject(fn ($row) => isset($sod->orderOrigin((int) $row->id)[$uid])),
                 fn ($row) => $row->number, fn ($row) => $row->state === 'partial_received' ? 'استلام جزئي سابق' : 'لم يُستلم شيء بعد');
         }
         if ($allows('finance.purchase.invoice')) {
-            $add('invoice', 'تسجيل فاتورة المورد', 'orders', $this->receivedWithoutInvoice()->orderBy('o.id')->limit(100)->get(['o.*']),
+            $add('invoice', 'تسجيل فاتورة المورد', 'orders', $this->receivedWithoutInvoice()->orderBy('o.id')->limit(100)->get(['o.*'])->reject(fn ($row) => $refused((int) $row->id)),
                 fn ($row) => $row->number, fn ($row) => (string) $row->amount);
-            $add('voucher', 'تسجيل رقم سند الصرف من '.$this->guard->externalSystemName(), 'invoices', $this->unpaidInvoices()->orderBy('id')->limit(100)->get(),
+        }
+        if ($this->guard->documentaryMode() && $allows('finance.payment.record')) {
+            $add('voucher', 'تسجيل رقم سند الصرف من '.$this->guard->externalSystemName(), 'payment_vouchers', $this->unpaidInvoices()->orderBy('id')->limit(100)->get()
+                ->reject(fn ($row) => $refused((int) $row->order_id)),
                 fn ($row) => $row->invoice_no, fn ($row) => trim($row->amount.' '.$row->currency));
+        }
+        // ACC-09: referred sponsorship dues not fully collected, past or at their date, for whoever records sponsor receipts.
+        if ($this->guard->documentaryMode() && $allows(SponsorshipCollections::PERMISSION)) {
+            $add('sponsor_receipt', 'تسجيل قبض استحقاق كفالة من '.$this->guard->externalSystemName(), 'sponsorship_receipts',
+                $this->uncollectedDues()->where('d.due_on', '<=', today()->toDateString())->where(fn ($q) => $q->whereNull('d.referred_by')->orWhere('d.referred_by', '<>', $user->id))
+                    ->orderBy('d.due_on')->limit(100)->get(['d.id', 'd.amount', 'd.currency', 'd.due_on', 'd.referred_at as created_at', 's.reference_no']),
+                fn ($row) => $row->reference_no.' · '.$row->due_on, fn ($row) => trim($row->amount.' '.$row->currency));
         }
         if ($allows('finance.stock.count.approve')) {
             $add('count', 'اعتماد محضر الجرد', 'counts', DB::table('finance_inventory_counts')->where('state', 'pending')->where('counted_by', '<>', $user->id)->orderBy('id')->limit(100)->get(),
@@ -146,6 +180,13 @@ final class FinanceDocumentCycle
     private function unpaidInvoices()
     {
         return DB::table('finance_purchase_invoices')->where('state', '<>', 'paid');
+    }
+
+    /** Sponsorship dues referred to Accounts whose recorded collection is still below the amount. */
+    private function uncollectedDues()
+    {
+        return DB::table('sponsorship_dues as d')->join('sponsorships as s', 's.id', '=', 'd.sponsorship_id')->where('d.status', 'referred')
+            ->whereRaw(Aid::collectedSql('d').' < d.amount');
     }
 
     private function readyToClose()

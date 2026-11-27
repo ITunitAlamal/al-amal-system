@@ -24,6 +24,10 @@ const form = useForm({
 const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })();
 const balance = computed(() => props.balances?.[form.leave_type_value_id] ?? null);
 const countingLabel = computed(() => ({ calendar: 'أيام تقويمية (تشمل العطل)', working: 'أيام عمل فقط (دون العطل الرسمية والراحة الأسبوعية)' })[props.settings?.counting_mode] ?? null);
+// The balance is debited when Human Resources registers the approved leave (workflow mode), not at approval.
+const debitNote = computed(() => (props.settings?.approval_mode === 'workflow'
+    ? 'يُخصم الرصيد عند تسجيل الموارد البشرية للإجازة بعد اعتمادها، ولا يُخصم شيء قبل ذلك.'
+    : 'لا تُخصم أيام من رصيدك قبل اعتماد الطلب.'));
 const submit = () => (props.existing ? form.put(`/leaves/${props.existing.id}`, { preserveScroll: true }) : form.post('/leaves', { preserveScroll: true }));
 </script>
 
@@ -32,7 +36,7 @@ const submit = () => (props.existing ? form.put(`/leaves/${props.existing.id}`, 
         <div class="mx-auto max-w-3xl space-y-5">
             <Link href="/leaves" class="text-sm font-semibold text-blue-700 hover:underline">→ طلبات الإجازات</Link>
             <PageHeader eyebrow="الإجازات" :title="existing ? (existing.status === 'returned' ? `تعديل الطلب المُعاد #${existing.id}` : `تعديل مسودة #${existing.id}`) : 'طلب إجازة جديد'"
-                :description="existing?.status === 'returned' ? 'عدّل ما طُلب منك، ثم ارجع إلى صفحة الطلب وأعد إرساله ليكمل مساره. لا تُخصم أيام قبل الاعتماد النهائي.' : 'يُحفظ الطلب مسودة أولًا، ولا تُخصم أيام من رصيدك حتى يُعتمد.'" />
+                :description="existing?.status === 'returned' ? `عدّل ما طُلب منك، ثم ارجع إلى صفحة الطلب وأعد إرساله ليكمل مساره. ${debitNote}` : `يُحفظ الطلب مسودة أولًا. ${debitNote}`" />
 
             <form class="card space-y-5 p-6" novalidate @submit.prevent="submit">
                 <div>

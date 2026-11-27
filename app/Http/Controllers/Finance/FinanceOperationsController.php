@@ -3,12 +3,15 @@
 namespace App\Http\Controllers\Finance;
 
 use App\Http\Controllers\Controller;
+use App\Services\Finance\DepartmentBudgets;
 use App\Services\Finance\FinanceGuard;
 use App\Services\Finance\FinanceMoney;
 use App\Services\Finance\FinanceOperations;
 use App\Services\Finance\FinanceSettlementService;
+use App\Services\Finance\StockMovementSources;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
 
@@ -25,7 +28,7 @@ class FinanceOperationsController extends Controller
         'funds' => ['finance_restricted_funds', 'finance.fund.manage', ['name' => 'required|string|max:255', 'purpose' => 'required|string', 'currency' => 'required|exists:currencies,code']],
     ];
 
-    public function index(Request $request)
+    public function index(Request $request, DepartmentBudgets $budgets)
     {
         $this->guard->assert($request->user(), 'finance.view');
         $summary = [];
@@ -39,10 +42,13 @@ class FinanceOperationsController extends Controller
         $sees = fn (array $codes): bool => collect([...$codes, 'finance.monitor'])->contains(fn (string $code): bool => $this->guard->allows($user, $code));
         $summary['purchases'] = $sees(['finance.procurement.manage', 'finance.procurement.review'])
             ? DB::table('finance_purchase_requests')->select('state', DB::raw('count(*) as count'))->groupBy('state')->get() : [];
-        $summary['transactions'] = $sees(['finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute'])
-            ? DB::table('finance_transactions')->select('state', DB::raw('count(*) as count'))->groupBy('state')->get() : [];
+        $transactionKinds = array_values(array_filter(['payment', 'receipt'], fn (string $kind): bool => $this->guard->canViewTransactions($user, $kind)));
+        $summary['transactions'] = $transactionKinds !== []
+            ? DB::table('finance_transactions')->whereIn('kind', $transactionKinds)->select('state', DB::raw('count(*) as count'))->groupBy('state')->get() : [];
 
-        return Inertia::render('Finance/Index', ['summary' => $summary, 'allowed' => $this->guard->uiPermissions($request->user())]);
+        return Inertia::render('Finance/Index', ['summary' => $summary, 'allowed' => $this->guard->uiPermissions($user),
+            'transactionKinds' => $transactionKinds, 'transactionKind' => in_array($request->query('kind'), $transactionKinds, true) ? $request->query('kind') : null,
+            'canManageDepartmentBudgets' => $budgets->canManage($user)]);
     }
 
     public function browse(Request $request, string $module)
@@ -124,6 +130,20 @@ class FinanceOperationsController extends Controller
         return response()->json(['ok' => true]);
     }
 
+    /** Cancelling an approved purchase, its unfilled order or an order's undelivered remainder: the executive director's decision. */
+    public function purchaseCancel(Request $request, int $id)
+    {
+        abort_unless(DB::table('finance_purchase_requests')->where('id', $id)->exists(), 404);
+        $this->guard->assert($request->user(), 'finance.procurement.director_approve');
+        if (! Schema::hasColumn('finance_purchase_requests', 'cancelled_by')) {
+            throw ValidationException::withMessages(['state' => 'الإلغاء غير متاح قبل تحديث قاعدة البيانات.']);
+        }
+        $data = $request->validate(['reason' => 'required|string|min:10|max:2000'], [], ['reason' => 'سبب الإلغاء']);
+        $outcome = $this->ops->cancelPurchase($id, (int) $request->user()->id, trim($data['reason']));
+
+        return response()->json(['ok' => true, 'outcome' => $outcome]);
+    }
+
     public function purchaseLines(Request $request, int $id)
     {
         $this->guard->assert($request->user(), 'finance.procurement.manage');
@@ -140,20 +160,27 @@ class FinanceOperationsController extends Controller
         if (! $this->guard->allows($request->user(), 'finance.stock.receive') && ! $this->guard->allows($request->user(), 'finance.stock.issue')) {
             $this->guard->assert($request->user(), 'finance.stock.receive');
         }
-        $data = $request->validate(['warehouse_id' => 'required|exists:finance_warehouses,id', 'stock_item_id' => 'required|exists:finance_stock_items,id', 'kind' => 'required|in:receipt,return_in,adjust_in,issue,return_out,adjust_out', 'quantity' => 'required|regex:/^\d{1,9}(\.\d{1,3})?$/', 'unit_cost' => 'required|regex:/^\d{1,9}(\.\d{1,4})?$/', 'reference_type' => 'nullable|string|max:55', 'reference_id' => 'nullable|string|max:140', 'note' => 'nullable|string|max:1000']);
+        $data = $request->validate(['warehouse_id' => 'required|exists:finance_warehouses,id', 'stock_item_id' => 'required|exists:finance_stock_items,id', 'kind' => 'required|in:receipt,return_in,adjust_in,issue,return_out,adjust_out', 'quantity' => 'required|regex:/^\d{1,9}(\.\d{1,3})?$/', 'unit_cost' => 'required|regex:/^\d{1,9}(\.\d{1,4})?$/', 'reference_type' => 'required|string|max:55', 'reference_id' => 'required|string|max:140', 'note' => 'nullable|string|max:1000'],
+            [], ['reference_type' => 'نوع المرجع', 'reference_id' => 'رقم المرجع']);
         $incoming = in_array($data['kind'], ['receipt', 'return_in', 'adjust_in'], true);
         $this->guard->assert($request->user(), $incoming ? 'finance.stock.receive' : 'finance.stock.issue');
         if (str_starts_with($data['kind'], 'adjust_')) {
             throw ValidationException::withMessages(['kind' => 'تسوية الجرد تُنفذ حصريًا عبر اعتماد محضر الجرد']);
         }
-        $id = $this->ops->stockMovement($data, $request->user()->id);
+        // Every movement entered by hand stands on an approved source it names (StockMovementSources::SOURCES).
+        $id = DB::transaction(function () use ($data, $request): int {
+            DB::table('finance_warehouses')->where('id', $data['warehouse_id'])->lockForUpdate()->first();
+
+            return $this->ops->stockMovement(app(StockMovementSources::class)->assert($data, $request->user()), $request->user()->id);
+        });
 
         return response()->json(['id' => $id], 201);
     }
 
     public function createTransaction(Request $request)
     {
-        $this->guard->assert($request->user(), 'finance.transaction.draft');
+        $kind = $request->validate(['kind' => 'required|in:receipt,payment'])['kind'];
+        $this->guard->assert($request->user(), FinanceGuard::transactionPermission($kind, 'draft'));
         $data = $request->validate(['kind' => 'required|in:receipt,payment', 'treasury_id' => 'required|exists:finance_treasuries,id', 'budget_line_id' => 'nullable|exists:finance_budget_lines,id', 'source_id' => 'nullable|exists:finance_sources,id', 'amount' => 'required|regex:/^\d{1,12}(\.\d{1,2})?$/', 'effective_on' => 'required|date', 'counterparty' => 'nullable|string|max:255', 'description' => 'nullable|string|max:2000']);
         if ($data['kind'] === 'payment' && empty($data['budget_line_id'])) {
             throw ValidationException::withMessages(['budget_line_id' => 'بند الموازنة مطلوب للصرف']);
@@ -177,15 +204,18 @@ class FinanceOperationsController extends Controller
 
     public function transactionAction(Request $request, int $id, string $action)
     {
-        $map = ['submit' => ['finance.transaction.draft', 'draft', 'pending_review'], 'review' => ['finance.transaction.review', 'pending_review', 'pending_director'], 'approve' => ['finance.transaction.approve', 'pending_director', 'approved'], 'execute' => ['finance.transaction.execute', 'approved', 'executed']];
+        $map = ['submit' => ['draft', 'draft', 'pending_review'], 'review' => ['review', 'pending_review', 'pending_director'], 'approve' => ['approve', 'pending_director', 'approved'], 'execute' => ['execute', 'approved', 'executed']];
         abort_unless(isset($map[$action]), 404);
         [$perm,$from,$to] = $map[$action];
-        $this->guard->assert($request->user(), $perm);
-        DB::transaction(function () use ($request, $id, $action, $from, $to) {
+        $transaction = DB::table('finance_transactions')->find($id, ['id', 'kind']);
+        abort_unless($transaction, 404);
+        $this->guard->assert($request->user(), FinanceGuard::transactionPermission($transaction->kind, $perm));
+        DB::transaction(function () use ($request, $id, $action, $perm, $from, $to) {
             $row = DB::table('finance_transactions')->lockForUpdate()->find($id);
             if (! $row || $row->state !== $from) {
                 throw ValidationException::withMessages(['state' => 'الحركة ليست في المرحلة المطلوبة']);
             }
+            $this->guard->assert($request->user(), FinanceGuard::transactionPermission($row->kind, $perm));
             $actor = $request->user()->id;
             if ($action === 'approve' && $row->reversal_of_id !== null) {
                 $this->guard->assert($request->user(), 'finance.reversal.approve');
@@ -271,13 +301,14 @@ class FinanceOperationsController extends Controller
         $this->guard->assert($request->user(), 'finance.view');
         // finance.view alone NEVER discloses payroll, banks, personal payees, or restricted funds.
         $scopes = [
-            'transactions' => ['finance.transaction.draft', 'finance.transaction.review', 'finance.transaction.approve', 'finance.transaction.execute'],
+            'transactions' => ['finance.payment.draft', 'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute',
+                'finance.receipt.draft', 'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute'],
             'purchases' => ['finance.procurement.manage', 'finance.procurement.review'],
             // The storekeeper receives against orders and the accountant invoices them, so both see the orders.
             'orders' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.purchase.receive', 'finance.purchase.invoice'],
             'quotes' => ['finance.procurement.manage', 'finance.procurement.review'],
             'purchase_receipts' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.purchase.receive', 'finance.purchase.invoice'],
-            'invoices' => ['finance.purchase.invoice', 'finance.procurement.review'],
+            'invoices' => ['finance.purchase.invoice', 'finance.procurement.review', 'finance.payment.record', 'finance.payment.draft'],
             'invoice_payments' => ['finance.purchase.invoice'],
             'stock' => ['finance.stock.receive', 'finance.stock.issue', 'finance.warehouse.manage'],
             'counts' => ['finance.stock.count', 'finance.stock.count.approve'],
@@ -292,12 +323,21 @@ class FinanceOperationsController extends Controller
             'budget_exceptions' => ['finance.budget.manage', 'finance.budget.transfer', 'finance.budget.approve'],
             'budget_transfers' => ['finance.budget.manage', 'finance.budget.transfer', 'finance.budget.approve'],
             'cheques' => ['finance.cheque.manage'],
-            'allocations' => ['finance.receivable.manage', 'finance.transaction.execute'],
+            'allocations' => ['finance.receivable.manage', 'finance.receipt.execute'],
         ];
         // The head's monitoring reads every unit's records except individual salary lines.
         $readers = $module === 'payroll_items' ? $scopes[$module] : [...($scopes[$module] ?? []), 'finance.monitor'];
         abort_unless(collect($readers)->contains(fn ($permission) => $this->guard->allows($request->user(), $permission)), 403);
         $query = DB::table($map[$module]);
+        if ($module === 'transactions') {
+            $data = $request->validate(['kind' => 'nullable|in:payment,receipt']);
+            $kinds = array_values(array_filter(['payment', 'receipt'], fn (string $kind): bool => $this->guard->canViewTransactions($request->user(), $kind)));
+            if (! empty($data['kind'])) {
+                abort_unless(in_array($data['kind'], $kinds, true), 403, 'لا تملك صلاحية الاطلاع على هذا النوع من السندات');
+                $kinds = [$data['kind']];
+            }
+            $query->whereIn('kind', $kinds);
+        }
         // Outside procurement and the head's monitoring, purchase orders are a hand-off only: the storekeeper sees
         // the orders awaiting receipt, the accountant those awaiting the supplier's invoice (owner report 2026-11-01).
         if ($module === 'orders' && ! collect(['finance.procurement.manage', 'finance.procurement.review', 'finance.monitor'])

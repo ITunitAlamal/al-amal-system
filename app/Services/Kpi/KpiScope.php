@@ -3,6 +3,7 @@
 namespace App\Services\Kpi;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Organization\ScopedDelegations;
 use Illuminate\Support\Facades\DB;
 
@@ -42,7 +43,7 @@ final class KpiScope
             return null;
         }
         $assignments = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $user->id)->get(['a.department_id', 'r.code']);
+            ->where('a.user_id', $user->id)->whereRaw(EffectiveAssignments::sql('a'))->get(['a.department_id', 'r.code']);
         $kpiRoles = DB::table('permission_role as pr')->join('permissions as p', 'p.id', '=', 'pr.permission_id')
             ->join('roles as r', 'r.id', '=', 'pr.role_id')->where('p.code', self::PERMISSION)->pluck('r.code')->all();
 

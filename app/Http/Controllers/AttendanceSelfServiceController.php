@@ -11,6 +11,7 @@ use App\Services\Attendance\AttendancePermissionService;
 use App\Services\Attendance\AttendanceSettings;
 use App\Services\Attendance\HrActionService;
 use App\Services\Attendance\ShiftSwapService;
+use App\Services\AuditService;
 use App\Services\Hr\EmployeeAccess;
 use App\Services\Workflow\WorkflowEngine;
 use App\Services\Workflow\WorkflowProgress;
@@ -109,6 +110,8 @@ final class AttendanceSelfServiceController extends Controller
         $user = $request->user();
         $participant = $row->workflow_instance_id && $visibility->accessLevel($user, (int) $row->workflow_instance_id) !== null;
         abort_unless($participant || $this->mayRead($user, [(int) $row->employee_id], (int) $row->requested_by), 403);
+        app(AuditService::class)->event('attendance.permission.attachment_downloaded', ['subject_type' => 'attendance_permission_requests', 'subject_id' => $row->id,
+            'sensitivity' => 'restricted', 'ip' => $request->ip(), 'metadata' => ['employee_id' => (int) $row->employee_id]]);
 
         return Storage::disk('local')->download($row->attachment_path, $row->attachment_name ?: 'attachment', ['Cache-Control' => 'no-store, private']);
     }

@@ -8,6 +8,7 @@ use App\Services\Finance\FinanceAccessGrants;
 use App\Services\Finance\FinanceGuard;
 use App\Services\Finance\FinanceMoney;
 use App\Services\Finance\FinancePermissionCatalog;
+use App\Services\Organization\RoleSeparation;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -18,11 +19,6 @@ use Inertia\Inertia;
 /** System admin manages finance staff assignments; this never gives the admin business approval privileges. */
 final class FinanceSetupController extends Controller
 {
-    /** Specialization => the finance role it adds in «الحسابات». */
-    private const ROLES = ['finance_head' => 'finance_head', 'general_accountant' => 'finance_accountant', 'procurement' => 'finance_procurement',
-        'warehouse' => 'finance_warehouse', 'cash_executor' => 'finance_cash_executor', 'director_approver' => 'finance_director_approver',
-        'payroll' => 'finance_payroll', 'auditor' => 'finance_auditor'];
-
     public function __construct(private readonly FinanceGuard $guard) {}
 
     private function authorizeAdmin(Request $r): void
@@ -134,7 +130,7 @@ final class FinanceSetupController extends Controller
     public function assign(Request $r): JsonResponse
     {
         $this->authorizeAdmin($r);
-        $d = $r->validate(['user_id' => 'required|exists:users,id', 'specialization' => ['required', Rule::in(array_keys(self::ROLES))], 'is_primary' => 'required|boolean',
+        $d = $r->validate(['user_id' => 'required|exists:users,id', 'specialization' => ['required', Rule::in(array_keys(FinancePermissionCatalog::TEMPLATES))], 'is_primary' => 'required|boolean',
             'valid_until' => 'nullable|date_format:Y-m-d|after_or_equal:today', 'reason' => 'required|string|min:5|max:1000']);
         $grant = app(FinanceAccessGrants::class)->request($r->user(), User::findOrFail($d['user_id']), ['kind' => 'specialization', 'code' => $d['specialization'],
             'is_primary' => $d['is_primary'], 'valid_until' => $d['valid_until'] ?? null, 'reason' => $d['reason']]);
@@ -148,10 +144,20 @@ final class FinanceSetupController extends Controller
         $this->authorizeAdmin($r);
         $d = $r->validate(['user_id' => 'required|exists:users,id', 'decision_reference' => 'required|string|min:5|max:1000']);
         DB::transaction(function () use ($d, $r) {
-            $user = DB::table('users')->where('id', $d['user_id'])->first();
+            $user = User::findOrFail($d['user_id']);
             if (! $user->is_active) {
                 throw ValidationException::withMessages(['user_id' => 'المستخدم غير فعال']);
             }
+            // The role reaches workflow decision steps too, so the technical role never receives it, nor does the assigner.
+            if ((int) $user->id === (int) $r->user()->id) {
+                throw ValidationException::withMessages(['user_id' => 'لا يُسنِد أحد لنفسه اختصاصًا أو صلاحية مالية.']);
+            }
+            if ($user->isSystemAdmin()) {
+                throw ValidationException::withMessages(['user_id' => FinanceAccessGrants::ADMIN_REFUSED]);
+            }
+            // The treasurer is a Board member (owner decision 6, 2026-11-27): never an account that holds, or is
+            // appointed to hold, the technical role (RoleSeparation; the database trigger is the backstop).
+            RoleSeparation::assertAllowed((int) $user->id, 'finance_board_treasurer', 'user_id');
             DB::table('finance_board_approvers')->updateOrInsert(['user_id' => $d['user_id']], ['is_active' => true, 'assigned_by' => $r->user()->id, 'updated_at' => now(), 'created_at' => now()]);
             $role = DB::table('roles')->where('code', 'finance_board_treasurer')->value('id');
             if (! $role) {

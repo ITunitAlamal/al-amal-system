@@ -7,8 +7,12 @@ import PageHeader from '../../Components/PageHeader.vue';
 import EmptyState from '../../Components/EmptyState.vue';
 import StatusBadge from '../../Components/StatusBadge.vue';
 
-const props = defineProps({ records: Object, counts: Object, filters: Object, isAdmin: Boolean, canCreate: Boolean, canCreateExternalArchive: Boolean });
+const props = defineProps({ records: Object, counts: Object, filters: Object, isAdmin: Boolean, canCreate: Boolean, canCreateExternalArchive: Boolean, canSeeDecisions: Boolean });
 const page = usePage();
+const channels = computed(() => [
+    { id: 'internal', label: 'المراسلات الداخلية', count: props.counts?.all || 0 },
+    ...(props.canCreateExternalArchive ? [{ id: 'external', label: 'المراسلات الخارجية', count: (props.counts?.external_incoming || 0) + (props.counts?.external_outgoing || 0) }] : []),
+]);
 const boxes = { inbox: 'الوارد', sent: 'الصادر', drafts: 'المسودات', needs_action: 'تنتظر إجرائي', forwarded: 'أحلتها', returned: 'أُعيدت إليّ', overdue: 'متأخرة لديّ', in_progress: 'قيد المتابعة', archive: 'المنتهية / الأرشيف', all: 'الكل' };
 const labels = { draft: 'مسودة', issued: 'مرسلة', processing: 'قيد المتابعة', processed: 'أُنجزت', closed: 'منتهية', archived: 'مؤرشفة', withdrawn: 'مسحوبة' };
 const tones = { draft: 'warning', issued: 'info', processing: 'info', processed: 'success', closed: 'success', archived: 'muted', withdrawn: 'muted' };
@@ -94,9 +98,10 @@ const emptyTitle = computed(() => {
 <template>
     <AppLayout title="المراسلات الرسمية">
         <div class="mx-auto max-w-screen-2xl space-y-5">
-            <PageHeader title="المراسلات الرسمية" description="اختر المراسلات الداخلية لمتابعة الإحالات، أو الخارجية للاطلاع على البريد المؤرشف.">
+            <PageHeader title="المراسلات الرسمية" :description="canCreateExternalArchive ? 'اختر المراسلات الداخلية لمتابعة الإحالات، أو الخارجية للاطلاع على البريد المؤرشف.' : 'تابع مراسلاتك الداخلية والإحالات الواردة والصادرة.'">
                 <Link v-if="canCreate" href="/correspondence/create" class="btn btn-primary">مراسلة جديدة</Link>
                 <Link v-if="canCreateExternalArchive" href="/correspondence/external/create" class="btn btn-secondary">تسجيل بريد خارجي</Link>
+                <Link v-if="canSeeDecisions" href="/correspondence/decisions" class="btn btn-secondary">سجل قرارات المجلس</Link>
                 <Link v-if="isAdmin" href="/correspondence/policies" class="btn btn-secondary">السياسات</Link>
             </PageHeader>
 
@@ -107,7 +112,7 @@ const emptyTitle = computed(() => {
             <section class="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4 lg:p-5">
                 <div class="flex flex-col gap-4">
                     <nav class="flex flex-wrap gap-2" aria-label="نوع المراسلات">
-                        <button v-for="channel in [{ id: 'internal', label: 'المراسلات الداخلية', count: counts?.all || 0 }, { id: 'external', label: 'المراسلات الخارجية', count: (counts?.external_incoming || 0) + (counts?.external_outgoing || 0) }]" :key="channel.id"
+                        <button v-for="channel in channels" :key="channel.id"
                             type="button" class="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-bold transition"
                             :class="filters.channel === channel.id ? 'bg-navy-800 text-white shadow-sm' : 'border border-slate-200 text-slate-700 hover:bg-slate-50'"
                             :aria-current="filters.channel === channel.id ? 'page' : undefined" @click="selectFolder(channel.id, filters.direction || 'incoming')">

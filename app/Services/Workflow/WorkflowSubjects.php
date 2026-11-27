@@ -52,11 +52,61 @@ final class WorkflowSubjects
         ShiftSwapWorkflow::SUBJECT_TYPE => ShiftSwapWorkflow::class,
     ];
 
+    /**
+     * The facts each module's conditionContext() gives transition conditions, field => type, so publishing can
+     * refuse a condition on a field the module never supplies. Keep in step with the handlers; a handler may
+     * instead declare its own conditionFields().
+     *
+     * @var array<string, array<string, string>>
+     */
+    private const CONDITION_FIELDS = [
+        LeaveWorkflow::SUBJECT_TYPE => ['requested_days' => 'number', 'leave_type' => 'text'],
+        'official_correspondence' => [],
+        'correspondence_edition' => [],
+        RentalApplicationWorkflow::SUBJECT_TYPE => [],
+        RentalContractWorkflow::SUBJECT_TYPE => [],
+        RentalTerminationWorkflow::SUBJECT_TYPE => [],
+        RentalSettlementWorkflow::SUBJECT_TYPE => [],
+        EmployeePayChangeWorkflow::SUBJECT_TYPE => [],
+        StructureChangeWorkflow::SUBJECT_TYPE => [],
+        AttendancePermissionWorkflow::SUBJECT_TYPE => ['minutes' => 'number', 'permission_type' => 'text'],
+        ShiftSwapWorkflow::SUBJECT_TYPE => ['swap_days' => 'number'],
+    ];
+
+    /**
+     * @return array<string, string>|null field => type; null when the record type's facts are not known
+     */
+    public function conditionFields(string $subjectType): ?array
+    {
+        $class = self::HANDLERS[$subjectType] ?? null;
+        if ($class !== null && method_exists($class, 'conditionFields')) {
+            return app($class)->conditionFields();
+        }
+
+        return self::CONDITION_FIELDS[$subjectType] ?? null;
+    }
+
     public function handler(string $subjectType): ?WorkflowSubject
     {
         $class = self::HANDLERS[$subjectType] ?? null;
 
         return $class ? app($class) : null;
+    }
+
+    /**
+     * People the record concerns (e.g. the employee whose pay is changed), from the handler's optional
+     * interestedUserIds(); they never hold a step of its workflow, like the requester.
+     *
+     * @return list<int>
+     */
+    public function interestedUserIds(object $instance): array
+    {
+        $class = self::HANDLERS[(string) ($instance->subject_type ?? '')] ?? null;
+        if ($class === null || ! method_exists($class, 'interestedUserIds')) {
+            return [];
+        }
+
+        return array_values(array_unique(array_filter(array_map('intval', app($class)->interestedUserIds($instance)))));
     }
 
     /**

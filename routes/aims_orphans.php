@@ -53,6 +53,7 @@ Route::middleware(['auth', ProtectOrphanResponses::class])->prefix('orphans')->n
         Route::post('/addresses/{address}/close', 'closeAddress')->whereNumber('address')->name('address.close');
         Route::post('/care/{record}/close', 'closeCare')->whereNumber('record')->name('care.close');
         Route::post('/assessments/{assessment}', 'completeAssessment')->whereNumber('assessment')->name('assessment.complete');
+        Route::post('/assessments/{assessment}/review', 'reviewAssessment')->whereNumber('assessment')->middleware('throttle:30,1')->name('assessment.review');
         Route::get('/documents/{publicId}', 'document')->name('document');
         Route::post('/documents/{publicId}/review', 'reviewDocument')->name('document.review');
     });
@@ -63,6 +64,7 @@ Route::middleware(['auth', ProtectOrphanResponses::class])->prefix('orphans')->n
         Route::post('/households/{household}/case-study', 'store')->name('store');
         Route::put('/case-studies/{study}', 'update')->name('update');
         Route::post('/case-studies/{study}/submit', 'submit')->name('submit');
+        Route::post('/case-studies/{study}/assign', 'assign')->middleware('throttle:30,1')->name('assign');
         Route::post('/case-studies/{study}/{decision}', 'decide')->whereIn('decision', ['review', 'return'])->middleware('throttle:30,1')->name('decide');
     });
 
@@ -83,6 +85,9 @@ Route::middleware(['auth', ProtectOrphanResponses::class])->prefix('orphans')->n
         Route::post('/appeals/{publicId}', 'decideAppeal')->name('appeals.decide');
         Route::get('/changes', 'changes')->name('changes');
         Route::post('/changes/{publicId}', 'decideChange')->name('changes.decide');
+        Route::get('/sensitive', 'sensitive')->name('sensitive');
+        Route::post('/sensitive/{publicId}/reveal-id', 'revealSensitiveId')->middleware('throttle:30,1,orphans-reveal')->name('sensitive.reveal');
+        Route::post('/sensitive/{publicId}', 'decideSensitive')->middleware('throttle:30,1')->name('sensitive.decide');
         Route::post('/{publicId}/account-tools', 'accountTools')->middleware('throttle:10,1,orphans-account-tools')->name('account-tools');
         Route::get('/{publicId}', 'show')->name('show');
         Route::post('/{publicId}/assign', 'assign')->name('assign');

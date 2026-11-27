@@ -133,6 +133,7 @@ class WorkflowDesignerController extends Controller
             'transitions' => DB::table('workflow_transitions')->where('workflow_version_id', $version)->orderBy('id')->get()
                 ->map(fn (object $transition): array => [...(array) $transition, 'conditions' => $transition->conditions ? json_decode((string) $transition->conditions, true) : null]),
             'problems' => $row->status === 'draft' ? $this->publishing->problems($version) : [],
+            'warnings' => $row->status === 'draft' ? $this->publishing->warnings($version) : [],
             'stepTypes' => self::STEP_TYPES,
             'assignmentTypes' => AssigneeResolver::TYPES,
             'departmentScopes' => AssigneeResolver::DEPARTMENT_SCOPES,
@@ -295,9 +296,15 @@ class WorkflowDesignerController extends Controller
             'assignment_config.inform_role_codes' => ['nullable', 'array'],
             'assignment_config.inform_role_codes.*' => ['string', Rule::exists('roles', 'code')],
             'assignment_config.subject_status' => ['nullable', Rule::in(['pending_registration'])],
+            // Supervision keys (StepAssignments) are installed by migrations; editing a step must not drop them.
+            'assignment_config.supervisor_department_id' => ['nullable', 'integer', Rule::exists('departments', 'id')],
+            'assignment_config.assignable' => ['nullable', 'boolean'],
+            'assignment_config.field_work' => ['nullable', 'boolean'],
             'assignment_config.step_code' => ['nullable', 'required_if:assignment_type,actor_of_step', Rule::exists('workflow_steps', 'code')->where('workflow_version_id', $version)],
             'assignment_config.outcome' => ['nullable', Rule::in(['completed', 'rejected'])],
             'assignment_config.delegation_scope' => ['nullable', Rule::in(array_keys(ApprovalDelegations::SCOPES))],
+            // A stage that records a stock issue or a payment; a reopened request never returns before it (WorkflowEngine::reopenTargets).
+            'assignment_config.reopen_locked' => ['nullable', 'boolean'],
             'sla_hours' => ['nullable', 'integer', 'min:1', 'max:8760'],
         ];
     }

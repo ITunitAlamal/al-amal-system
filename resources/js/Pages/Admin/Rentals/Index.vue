@@ -13,6 +13,7 @@ const p = defineProps({
     properties: Array, floors: Array, units: Array, unitEvents: Array, tenants: Array, applications: Array, contracts: Array, contractUnits: Array,
     dues: Array, totals: Array, cases: Array, settlements: Array, readings: Array, notices: Array, options: Object, maintenancePriorities: Array,
     currencies: Array, labels: Object, settings: Object, manageRegistry: Boolean, canDecide: Boolean, canManage: Boolean, isAdmin: Boolean, masterBuildings: Array,
+    maintenanceLinks: { type: Array, default: () => [] }, costBearers: { type: Object, default: () => ({}) },
 });
 
 const page = usePage();
@@ -51,6 +52,13 @@ function exportCsv() {
     window.location.href = `/admin/rentals/report.csv?type=${exportForm.type}&reason=${encodeURIComponent(exportForm.reason)}`;
 }
 const settingsForm = useForm({ renewal_alert_days: p.settings?.renewal_alert_days ?? 90, overdue_alert_days: p.settings?.overdue_alert_days ?? 0 });
+
+/* Maintenance of the units: return a unit to vacant once its request closed, and record who bears the cost */
+const costForms = {};
+const costForm = m => (costForms[m.id] ??= useForm({ cost_bearer: m.cost_bearer || '', cost_reference: m.cost_reference || '' }));
+function releaseUnit(m) {
+    if (confirm(`إعادة العين ${m.unit_code} شاغرة بعد إغلاق طلب الصيانة ${m.reference_no}؟`)) router.post(`/admin/rentals/maintenance/${m.id}/release`, {}, { preserveScroll: true });
+}
 
 /* Registry */
 const blankProperty = { kind_value_id: null, ownership_value_id: null, plot_number: '', parcel_number: '', location: '', description: '', governorate_value_id: null, locality_value_id: null, area_value_id: null, subarea_value_id: null, address_other: false, address_details: '' };
@@ -154,6 +162,27 @@ function issue(id) { if (confirm('تسجيل إصدار الإنذار وتار�
                 <tbody><tr v-for="t in totals" :key="t.currency"><td dir="ltr">{{ t.currency }}</td><td>{{ money(t.amount) }}</td><td>{{ money(t.paid) }}</td><td>{{ money(t.reduced) }}</td><td>{{ money(t.remaining) }}</td><td :class="Number(t.overdue) ? 'font-bold text-red-700' : ''">{{ money(t.overdue) }}</td></tr></tbody>
             </table>
             <EmptyState v-else title="لا توجد استحقاقات بعد" description="تتولد الاستحقاقات عند تفعيل العقد بعد اعتماده وتوقيعه." />
+        </div>
+        <div v-if="maintenanceLinks.length" class="card overflow-x-auto">
+            <h2 class="card-title mb-2">صيانة الأعيان</h2>
+            <p class="mb-3 text-xs text-slate-500">بعد إغلاق طلب الصيانة تُعاد العين «تحت الصيانة» شاغرة بنقرة. التكلفة على المستأجر تُطالَب بطلب تسوية «زيادة المستحق».</p>
+            <table class="data-table">
+                <thead><tr><th>الطلب</th><th>العين</th><th>المرحلة</th><th>من يتحمل التكلفة</th><th></th></tr></thead>
+                <tbody><tr v-for="m in maintenanceLinks" :key="m.id">
+                    <td><Link :href="m.url" class="text-blue-700 hover:underline" dir="ltr">{{ m.reference_no }}</Link></td>
+                    <td>{{ m.unit_code ? `${m.unit_code} ${m.unit_name}` : '—' }}<span v-if="m.unit_availability" class="block text-[11px] text-slate-500">{{ labels.units[m.unit_availability] }}</span></td>
+                    <td>{{ m.step || m.status }}</td>
+                    <td>
+                        <form v-if="canManage" class="flex flex-wrap gap-1" @submit.prevent="costForm(m).put(`/admin/rentals/maintenance/${m.id}/cost`, { preserveScroll: true })">
+                            <select v-model="costForm(m).cost_bearer" class="field w-28" required aria-label="من يتحمل التكلفة"><option value="">—</option><option v-for="(label, key) in costBearers" :key="key" :value="key">{{ label }}</option></select>
+                            <input v-model="costForm(m).cost_reference" class="field w-32" maxlength="150" placeholder="المرجع المحاسبي" dir="ltr">
+                            <button class="btn btn-secondary btn-sm" :disabled="costForm(m).processing">حفظ</button>
+                        </form>
+                        <span v-else>{{ costBearers[m.cost_bearer] || '—' }}</span>
+                    </td>
+                    <td><button v-if="canManage && m.releasable" type="button" class="btn btn-primary btn-sm" @click="releaseUnit(m)">إعادة العين شاغرة</button></td>
+                </tr></tbody>
+            </table>
         </div>
         <form class="card grid gap-3 md:grid-cols-4" @submit.prevent="exportCsv">
             <h2 class="card-title md:col-span-4">تصدير CSV (يُطلب السبب ويُسجل في التدقيق)</h2>

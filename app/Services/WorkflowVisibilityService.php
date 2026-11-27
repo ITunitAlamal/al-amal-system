@@ -3,9 +3,12 @@
 namespace App\Services;
 
 use App\Models\User;
+use App\Services\Configuration\CustomFieldService;
 use App\Services\Correspondence\CorrespondenceAccess;
 use App\Services\Correspondence\CorrespondenceEditions;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Workflow\ApprovalDelegations;
+use App\Services\Workflow\StepAssignments;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
@@ -93,13 +96,15 @@ class WorkflowVisibilityService
             ->whereNull('d.deleted_at')
             ->where('dur.user_id', $user->id)
             ->where('r.code', 'department_head')
+            ->whereRaw(EffectiveAssignments::sql('dur'))
             ->exists();
 
         if ($isOriginHead) {
             $level = $this->higherLevel($level, 'operational');
         }
 
-        // المكلف الحالي يستطيع رؤية بيانات المعالجة التشغيلية.
+        // المكلف الحالي يستطيع رؤية بيانات المعالجة التشغيلية؛ عدا مقدم الطلب العام حين ينتظره دوره هو
+        // (تعديل طلب مُعاد أو التحقق من الإنجاز): يبقى على الحالة العامة ويتخذ إجراءه منها.
         if (
             (int) $instance->current_assignee_id === (int) $user->id
             && in_array(
@@ -108,8 +113,15 @@ class WorkflowVisibilityService
                 true
             )
             && $instance->completed_at === null
+            && ! $this->requesterOnOwnStep($user, $instance)
         ) {
             $level = $this->higherLevel($level, 'operational');
+        }
+
+        // رئيس القسم المشرف على المرحلة الحالية يتابعها تشغيليًا ليُسندها أو يسحب إسنادها (StepAssignments).
+        if ($level !== 'operational' && $instance->status === 'in_progress'
+            && app(StepAssignments::class)->supervisorId($instance) === (int) $user->id) {
+            $level = 'operational';
         }
 
         // مشاركة صريحة في المعاملة.
@@ -158,6 +170,7 @@ class WorkflowVisibilityService
             ->select([
                 'wi.id',
                 'wi.public_id',
+                'wi.workflow_version_id',
                 'wi.subject_type',
                 'wi.subject_id',
                 'wi.department_id',
@@ -175,6 +188,7 @@ class WorkflowVisibilityService
         abort_unless($instance, 404);
 
         $requestData = null;
+        $isRequester = (int) $instance->requested_by === (int) $user->id;
 
         if ($instance->subject_type === 'aims_request') {
             $request = DB::table('aims_requests')
@@ -192,7 +206,8 @@ class WorkflowVisibilityService
                 'status' => $request->status,
             ];
 
-            if ($level !== 'public_status') {
+            // The requester reads their own text whatever their level; other public viewers get the status only.
+            if ($level !== 'public_status' || $isRequester) {
                 $requestData['description'] = $request->description;
             }
         }
@@ -222,6 +237,7 @@ class WorkflowVisibilityService
                 '=',
                 'we.workflow_transition_id'
             )
+            ->leftJoin('users as assigned', 'assigned.id', '=', 'we.assigned_to_id')
             ->where('we.workflow_instance_id', $instanceId)
             ->orderBy('we.occurred_at')
             ->orderBy('we.id')
@@ -230,41 +246,71 @@ class WorkflowVisibilityService
                 'we.workflow_transition_id',
                 'we.action',
                 'we.comment',
+                'we.metadata',
+                'we.from_step_id',
+                'we.to_step_id',
                 'we.occurred_at',
                 'origin.name as from_step_name',
+                'origin.assignment_config as from_assignment_config',
                 'destination.name as to_step_name',
+                'destination.assignment_type as to_assignment_type',
                 'actor.name as actor_name',
                 'transition.name as transition_name',
+                'assigned.name as assigned_to_name',
             ]);
 
+        $attachments = $this->attachmentsByEvent($user, $instance, $level);
         $timeline = [];
+        // What the latest move into each step recorded (e.g. the worker named when a field job was registered).
+        $openedWith = [];
 
         foreach ($events as $event) {
+            // A move between steps: a transition, or a reopening (which the stepper shows as a move too).
+            $isMove = $event->workflow_transition_id !== null || $event->action === 'reopen';
+            // Fields the action recorded with this event (CustomFieldService::actionRecord; never sensitive ones).
+            $fields = $event->workflow_transition_id !== null ? CustomFieldService::eventFields($event->metadata) : [];
+            $passFields = $event->from_step_id !== null ? ($openedWith[(int) $event->from_step_id] ?? []) : [];
+            if ($event->workflow_transition_id !== null && $event->to_step_id !== null) {
+                $openedWith[(int) $event->to_step_id] = $fields;
+            }
+
             // The requester sees every move between steps (action codes are
             // configurable), but not internal system events such as SLA flags.
-            if ($level === 'public_status' && $event->workflow_transition_id === null) {
+            if ($level === 'public_status' && ! $isMove) {
                 continue;
             }
 
+            // A move to the requester's own step is addressed to them: the reason of a return, or the completion
+            // note they are asked to verify.
+            $addressed = $isRequester && $isMove && $event->to_assignment_type === 'requester';
+
             $item = [
+                'id' => $event->id,
                 'action' => $event->action,
                 'label' => $event->transition_name,
                 'from_step' => $event->from_step_name,
                 'to_step' => $event->to_step_name,
                 'occurred_at' => $event->occurred_at,
+                'is_move' => $isMove,
+                'addressed' => $addressed,
+                // Only the files this viewer may open (see attachmentsByEvent).
+                'attachments' => $attachments[(int) $event->id] ?? [],
             ];
 
             if ($level !== 'public_status') {
-                $item['id'] = $event->id;
                 $item['actor_name'] = $event->actor_name;
                 $item['comment'] = $event->comment;
-
-                $item['attachments'] = $this->attachmentsForEvent(
-                    $user,
-                    $instanceId,
-                    $event->id,
-                    $level
-                );
+                // Assigning a step to an employee, or taking it back: who it went to.
+                $item['assigned_to_name'] = $event->workflow_transition_id === null
+                    && in_array($event->action, [StepAssignments::ACTION_ASSIGNED, StepAssignments::ACTION_WITHDRAWN], true)
+                    ? $event->assigned_to_name : null;
+                $item['fields'] = $fields;
+            } elseif ($addressed) {
+                $item['comment'] = $event->comment;
+                // The outcome of a field job the requester is asked to verify: who did it (named when the job was
+                // registered) and when it was actually finished. Other recorded fields, such as voucher numbers, are
+                // for the people who handle the request.
+                $item['fields'] = $this->isFieldWork($event->from_assignment_config) ? [...$passFields, ...$fields] : [];
             }
 
             $timeline[] = $item;
@@ -272,6 +318,7 @@ class WorkflowVisibilityService
 
         return [
             'access_level' => $level,
+            'viewer_is_requester' => $isRequester,
             'instance' => [
                 'public_id' => $instance->public_id,
                 'status' => $instance->status,
@@ -288,79 +335,147 @@ class WorkflowVisibilityService
         ];
     }
 
+    /** A step that waits for a field job to be documented ("field_work" in its assignment_config). */
+    private function isFieldWork(mixed $assignmentConfig): bool
+    {
+        $config = is_string($assignmentConfig) && $assignmentConfig !== '' ? json_decode($assignmentConfig, true) : $assignmentConfig;
+
+        return is_array($config) && ! empty($config['field_work']);
+    }
+
     public function canViewAttachment(
         User $user,
         int $instanceId,
         int $attachmentId
     ): bool {
-        $level = $this->accessLevel($user, $instanceId);
+        $instance = DB::table('workflow_instances')->where('id', $instanceId)->first();
+        $publicId = DB::table('workflow_event_attachments')->where('id', $attachmentId)->value('public_id');
+        $file = $instance && $publicId ? $this->attachment($instance, (string) $publicId) : null;
 
-        if ($level === null || $level === 'public_status') {
-            return false;
-        }
-
-        $attachment = DB::table(
-            'workflow_event_attachments as a'
-        )
-            ->join(
-                'workflow_events as e',
-                'e.id',
-                '=',
-                'a.workflow_event_id'
-            )
-            ->where('a.id', $attachmentId)
-            ->where('e.workflow_instance_id', $instanceId)
-            ->first(['a.visibility_class']);
-
-        if (! $attachment) {
-            return false;
-        }
-
-        return $this->allowsAttachmentClass(
-            $level,
-            $attachment->visibility_class
-        );
+        return $file !== null && $this->mayOpenAttachment($user, $instance, $this->accessLevel($user, $instanceId), $file);
     }
 
-    private function attachmentsForEvent(
-        User $user,
-        int $instanceId,
-        int $eventId,
-        string $level
-    ): array {
-        $attachments = DB::table(
-            'workflow_event_attachments'
-        )
-            ->where('workflow_event_id', $eventId)
-            ->orderBy('id')
-            ->get([
-                'id',
-                'public_id',
-                'original_filename',
-                'file_size',
-                'mime_type',
-                'visibility_class',
-                'document_type',
-                'created_at',
-            ]);
+    /**
+     * One file attached to an event of this request, with where it is stored; null when it is not on this request.
+     * Says nothing about who may open it: ask mayOpenAttachment().
+     */
+    public function attachment(object $instance, string $publicId): ?object
+    {
+        return $this->attachmentRows((int) $instance->id)->where('a.public_id', $publicId)->first();
+    }
 
-        return $attachments
-            ->filter(
-                fn ($attachment) => $this->allowsAttachmentClass(
-                    $level,
-                    $attachment->visibility_class
-                )
-            )
-            ->map(fn ($attachment) => [
-                'public_id' => $attachment->public_id,
-                'filename' => $attachment->original_filename,
-                'file_size' => $attachment->file_size,
-                'mime_type' => $attachment->mime_type,
-                'document_type' => $attachment->document_type,
-                'created_at' => $attachment->created_at,
-            ])
-            ->values()
-            ->all();
+    /**
+     * Whether this viewer may open a file attached to the request (a row from attachment()). The one rule for
+     * the list on the request page and for every download:
+     * - an operational or full view opens every attachment its level allows by class (generic requests store
+     *   theirs as "internal", so all of them);
+     * - the requester's public view opens the files they uploaded themselves, and the files that came with a
+     *   move to their own step (the completion evidence to verify, or what was sent back with a return);
+     * - any other public view opens only the viewer's own uploads;
+     * - on a confidential workflow, only the full view opens attachments. Nobody holds that view on a confidential
+     *   request, which is why such requests accept no files (RequestAttachments::offeredOn()).
+     *
+     * @param  ?string  $level  the viewer's access level on the request (accessLevel())
+     */
+    public function mayOpenAttachment(User $user, object $instance, ?string $level, object $file): bool
+    {
+        return $this->opensAttachment($user, $instance, $level, $file, $this->isConfidential((int) $instance->workflow_version_id));
+    }
+
+    private function opensAttachment(User $user, object $instance, ?string $level, object $file, bool $confidential): bool
+    {
+        if ($level === null) {
+            return false;
+        }
+        if ($confidential) {
+            return $level === 'full_authorized';
+        }
+        if ($level !== 'public_status') {
+            return $this->allowsAttachmentClass($level, (string) $file->visibility_class);
+        }
+        if (! in_array($file->visibility_class, ['general', 'internal'], true)) {
+            return false;
+        }
+        if ((int) $file->uploaded_by === (int) $user->id) {
+            return true;
+        }
+
+        return (int) $instance->requested_by === (int) $user->id
+            && $file->workflow_transition_id !== null
+            && $file->to_assignment_type === 'requester';
+    }
+
+    /**
+     * The attachments of a request this viewer may open, grouped by the event they were sent with (one query).
+     * A public viewer is not told who uploaded a file, except their own.
+     *
+     * @return array<int, list<array<string, mixed>>> keyed by workflow_events.id
+     */
+    public function attachmentsByEvent(User $user, object $instance, ?string $level): array
+    {
+        $result = [];
+        $files = $this->attachmentRows((int) $instance->id)->orderBy('a.id')->get();
+        $confidential = $files->isNotEmpty() && $this->isConfidential((int) $instance->workflow_version_id);
+        foreach ($files as $file) {
+            if (! $this->opensAttachment($user, $instance, $level, $file, $confidential)) {
+                continue;
+            }
+            $mine = (int) $file->uploaded_by === (int) $user->id;
+            $result[(int) $file->workflow_event_id][] = [
+                'public_id' => $file->public_id,
+                'filename' => $file->original_filename,
+                'file_size' => (int) $file->file_size,
+                'mime_type' => $file->mime_type,
+                'document_type' => $file->document_type,
+                'created_at' => $file->created_at,
+                'mine' => $mine,
+                'uploaded_by_name' => $level !== 'public_status' || $mine ? $file->uploader_name : null,
+                'url' => route('workflows.attachments.download', ['publicId' => $instance->public_id, 'attachment' => $file->public_id], false),
+            ];
+        }
+
+        return $result;
+    }
+
+    private function attachmentRows(int $instanceId): Builder
+    {
+        return DB::table('workflow_event_attachments as a')
+            ->join('workflow_events as e', 'e.id', '=', 'a.workflow_event_id')
+            ->leftJoin('workflow_steps as destination', 'destination.id', '=', 'e.to_step_id')
+            ->leftJoin('users as uploader', 'uploader.id', '=', 'a.uploaded_by')
+            ->where('e.workflow_instance_id', $instanceId)
+            ->select([
+                'a.id', 'a.public_id', 'a.workflow_event_id', 'a.uploaded_by', 'a.original_filename', 'a.storage_disk', 'a.storage_path',
+                'a.mime_type', 'a.file_size', 'a.visibility_class', 'a.document_type', 'a.created_at',
+                'e.workflow_transition_id', 'destination.assignment_type as to_assignment_type', 'uploader.name as uploader_name',
+            ]);
+    }
+
+    private function isConfidential(int $versionId): bool
+    {
+        return (bool) DB::table('workflow_versions as v')->join('workflow_definitions as d', 'd.id', '=', 'v.workflow_definition_id')
+            ->where('v.id', $versionId)->value('d.is_confidential');
+    }
+
+    /**
+     * A generic request waiting at a step that belongs to its requester (editing a returned request, or verifying
+     * what was done), seen by that requester. Holding such a step is not handling the request, so it gives no
+     * operational view. A requester who acted on a step of another holder of this request (a structural holder
+     * of that step) is an insider and is left as before.
+     */
+    private function requesterOnOwnStep(User $user, object $instance): bool
+    {
+        if ($instance->subject_type !== 'aims_request' || (int) $instance->requested_by !== (int) $user->id) {
+            return false;
+        }
+        if (DB::table('workflow_steps')->where('id', $instance->current_step_id)->value('assignment_type') !== 'requester') {
+            return false;
+        }
+
+        return ! DB::table('workflow_events as e')->join('workflow_steps as s', 's.id', '=', 'e.from_step_id')
+            ->where('e.workflow_instance_id', $instance->id)->where('e.actor_id', $user->id)
+            ->whereNotNull('e.workflow_transition_id')->where('s.assignment_type', '<>', 'requester')
+            ->exists();
     }
 
     private function allowsAttachmentClass(

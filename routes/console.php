@@ -1,5 +1,6 @@
 <?php
 
+use App\Services\Configuration\SchedulerHeartbeat;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Schedule;
@@ -43,12 +44,19 @@ Schedule::command('personal-tasks:remind')->everyFiveMinutes()->withoutOverlappi
 
 // Rentals: expire contracts past their end, renewal-window and overdue alerts (each sent once).
 Schedule::command('rentals:alerts')->dailyAt('06:30')->withoutOverlapping(30);
+Schedule::command('hr:document-alerts')->dailyAt('06:50')->withoutOverlapping(30);
 
 // «الاستيراد الذكي»: continues large import batches (staging analysis or approved execution) in resumable chunks.
 Schedule::command('orphans:import-process')->everyMinute()->withoutOverlapping(10)->runInBackground();
+
+// Sponsorships: planned dues kept twelve months ahead (eligibility gate applies); one daily notice to the head about overdue referred dues.
+Schedule::command('orphans:sponsorship-dues')->dailyAt('06:40')->withoutOverlapping(30);
 
 // «سجل النظام»: seal new audit rows into the hash chain every minute; recompute the whole chain daily.
 Schedule::command('audit:seal')->everyMinute()->withoutOverlapping(10);
 Schedule::command('audit:seal --verify')->dailyAt('03:15')->withoutOverlapping(60);
 // Dated finance grants and SoD exceptions end by themselves after their end date.
 Schedule::command('finance:expire-access')->hourly()->withoutOverlapping(30);
+
+// The last result of every command above, for «جاهزية الإعدادات» (SystemReadiness: scheduled commands failing). Keep last.
+SchedulerHeartbeat::watch(Schedule::events());

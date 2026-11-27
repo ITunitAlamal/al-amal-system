@@ -3,13 +3,29 @@
 namespace App\Services\Correspondence;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
+/**
+ * Who sees and handles official correspondence. A record is seen through the access rows its actions gave
+ * (correspondence_access), by the Secretariat for its external archive, and by the system administrator for
+ * technical oversight of ordinary («داخلي») records only: confidential and restricted records stay closed to the
+ * technical role (owner decision 3, 2026-11-27) unless the executive director issued an exceptional, time-bound
+ * grant for that one record (ConfidentialGrants). A grant opens the record for reading, limited to the actions its
+ * issuer sees himself; it never counts when the
+ * system decides who may hold, receive or be routed the record ($exceptional = false).
+ */
 final class CorrespondenceAccess
 {
     private ?Collection $assignments = null;
+
+    /** @var list<int>|null */
+    private ?array $ordinary = null;
+
+    private ?bool $grantsInstalled = null;
 
     private ?Collection $departments = null;
 
@@ -75,24 +91,51 @@ final class CorrespondenceAccess
         return $letter->status === 'closed' && ! $letter->workflow_instance_id
             && (int) $letter->author_id !== (int) $user->id
             && $this->role($user, 'executive_director')
-            && $this->visible($user)->where('c.id', $letter->id)->exists();
+            && $this->visible($user, false)->where('c.id', $letter->id)->exists();
     }
 
     public function canReassign(User $user, object $letter, ?object $task): bool
     {
         if (! $task || $task->status !== 'open' || $letter->workflow_instance_id
             || ! in_array($letter->status, ['issued', 'processing'], true)
-            || ! $this->actionVisible($user, (int) $task->action_id)) {
+            || ! $this->actionVisible($user, (int) $task->action_id, false)) {
             return false;
         }
         $owner = User::find($task->assigned_to);
         $handoffActor = User::find(DB::table('correspondence_actions')->where('id', $task->action_id)->value('actor_id'));
 
-        return $owner && $this->actionVisible($owner, (int) $task->action_id)
+        return $owner && $this->actionVisible($owner, (int) $task->action_id, false)
             && ($this->role($user, 'executive_director')
                 || ($this->head($user, (int) $task->department_id)
                     && $handoffActor && ! $this->role($handoffActor, 'executive_director')
                     && ! $this->role(User::findOrFail($letter->author_id), 'executive_director')));
+    }
+
+    /**
+     * The department a referral («إحالة») of this record is sent from, when the user may show the record to someone
+     * who cannot see it yet (CorrespondenceRegistry::refer): a Secretariat member for incoming external mail the
+     * Secretariat archived, or the head now executing a Board decision (stage «execute»), who hands work to people in
+     * the department. Null otherwise.
+     */
+    public function referralSource(User $user, object $letter): ?int
+    {
+        if ($letter->channel === 'external') {
+            $department = $this->externalArchiveDepartmentId();
+
+            return $letter->direction === 'incoming' && $department !== null && (int) $letter->department_id === $department
+                && $this->member($user, $department) ? $department : null;
+        }
+        if (! $letter->workflow_instance_id || in_array($letter->status, ['draft', 'closed', 'archived', 'withdrawn'], true)) {
+            return null;
+        }
+        $step = DB::table('workflow_instances as i')->join('workflow_steps as s', 's.id', '=', 'i.current_step_id')
+            ->where('i.id', $letter->workflow_instance_id)->where('i.subject_type', 'official_correspondence')
+            ->where('i.subject_id', $letter->id)->where('i.status', 'in_progress')->value('s.code');
+        $task = $step === 'execute' ? DB::table('correspondence_tasks')->where('correspondence_id', $letter->id)->first() : null;
+
+        return $task && $task->status === 'open' && (int) $task->assigned_to === (int) $user->id
+            && $this->actionVisible($user, (int) $task->action_id, false) && $this->head($user, (int) $task->department_id)
+            ? (int) $task->department_id : null;
     }
 
     public function member(User $user, int $department): bool
@@ -170,7 +213,10 @@ final class CorrespondenceAccess
             return false;
         }
         if ($typeCode === 'board_transmission') {
-            return ($this->role($sender, 'board_secretary') && $targetSecretariat) || ($secretariat && $targetExecutive)
+            // The board secretary issues a decision to the Secretariat only; at closure they may return it to the
+            // executive director for follow-up (BOARD_CORRESPONDENCE «return_followup»).
+            return ($this->role($sender, 'board_secretary') && ($targetSecretariat || (! $issuing && $targetExecutive)))
+                || ($secretariat && $targetExecutive)
                 || ($executive && ($targetHead || $targetSecretariat)) || ($head && $targetExecutive)
                 || ($secretariat && $this->role($recipient, 'board_secretary'));
         }
@@ -240,57 +286,150 @@ final class CorrespondenceAccess
         });
     }
 
-    public function visible(User $user): Builder
+    /**
+     * Classification values open to the system administrator's technical oversight: «داخلي» only. Every other
+     * level («سري», «مقيد», or one added later) is confidential.
+     *
+     * @return list<int>
+     */
+    public function ordinaryClassifications(): array
+    {
+        return $this->ordinary ??= DB::table('master_data_values as v')->join('master_data_types as t', 't.id', '=', 'v.type_id')
+            ->where('t.code', 'correspondence_classifications')->where('v.code', 'internal')
+            ->pluck('v.id')->map(fn ($id): int => (int) $id)->all();
+    }
+
+    public function isConfidential(object $letter): bool
+    {
+        return ! in_array((int) $letter->classification_value_id, $this->ordinaryClassifications(), true);
+    }
+
+    /**
+     * The user's exceptional grants in force (ConfidentialGrants): not revoked, not past their end, and issued by
+     * someone who still holds the executive director's office. Null until the grants table is installed.
+     */
+    public function grants(User $user): ?Builder
+    {
+        $this->grantsInstalled ??= Schema::hasTable('correspondence_confidential_grants');
+        if (! $this->grantsInstalled || ! $user->is_active) {
+            return null;
+        }
+
+        return DB::table('correspondence_confidential_grants as g')->where('g.user_id', $user->id)
+            ->whereNull('g.revoked_at')->where('g.ends_at', '>', now())
+            ->whereExists(DB::table('department_user_roles as issuer')->join('roles as issuer_role', 'issuer_role.id', '=', 'issuer.role_id')
+                ->join('users as issuer_user', 'issuer_user.id', '=', 'issuer.user_id')
+                ->whereColumn('issuer.user_id', 'g.issued_by')->where('issuer_role.code', 'executive_director')->where('issuer_user.is_active', true)
+                ->whereRaw(EffectiveAssignments::sql('issuer'))->selectRaw('1'));
+    }
+
+    /** The grant in force that gives this user the record, or null. */
+    public function grantFor(User $user, int $letter): ?int
+    {
+        $id = $this->grants($user)?->where('g.correspondence_id', $letter)->orderByDesc('g.id')->value('g.id');
+
+        return $id ? (int) $id : null;
+    }
+
+    /**
+     * The action ids a grant opens: what its issuer sees of the record himself, never more (a delegate cannot
+     * receive more than the delegator holds). Null when no grant in force covers the record.
+     */
+    private function grantedActions(User $user, object $letter): ?Builder
+    {
+        $issuerId = $this->grants($user)?->where('g.correspondence_id', $letter->id)->orderByDesc('g.id')->value('g.issued_by');
+        $issuer = $issuerId ? User::query()->find((int) $issuerId) : null;
+
+        return $issuer ? $this->visibleActions($issuer, $letter, false)->select('a.id') : null;
+    }
+
+    /**
+     * The grant the user reads this record through: a confidential record they would not see otherwise. The
+     * caller audits each use.
+     */
+    public function grantInUse(User $user, object $letter): ?int
+    {
+        if (! $this->isConfidential($letter)) {
+            return null;
+        }
+        $grant = $this->grantFor($user, (int) $letter->id);
+
+        return $grant !== null && ! $this->visible($user, false)->where('c.id', $letter->id)->exists() ? $grant : null;
+    }
+
+    /**
+     * The records the user may open. $exceptional = false leaves out the executive director's exceptional grants,
+     * for every check that decides holding, routing or widening the circulation of a record.
+     */
+    public function visible(User $user, bool $exceptional = true): Builder
     {
         $query = DB::table('official_correspondences as c');
         if (! $user->is_active) {
             return $query->whereRaw('1 = 0');
         }
-        if ($user->isSystemAdmin()) {
-            return $query;
-        }
 
         $department = $this->externalArchiveDepartmentId();
+        $technical = $user->isSystemAdmin();
+        $granted = $exceptional ? $this->grants($user) : null;
 
-        return $query->where(function (Builder $visible) use ($user, $department): void {
+        return $query->where(function (Builder $visible) use ($user, $department, $technical, $granted): void {
             $visible->whereExists($this->accessQuery($user)->join('correspondence_actions as permitted', 'permitted.id', '=', 'access.action_id')
                 ->whereColumn('permitted.correspondence_id', 'c.id')->selectRaw('1'));
             if ($department !== null && $this->member($user, $department)) {
                 $visible->orWhere(fn (Builder $external) => $external->where('c.channel', 'external')->where('c.department_id', $department));
             }
+            if ($technical) {
+                $visible->orWhereIn('c.classification_value_id', $this->ordinaryClassifications());
+            }
+            if ($granted !== null) {
+                $visible->orWhereIn('c.id', $granted->select('g.correspondence_id'));
+            }
         });
     }
 
-    public function actionVisible(User $user, int $action): bool
+    public function actionVisible(User $user, int $action, bool $exceptional = true): bool
     {
         if (! $user->is_active) {
             return false;
         }
-        if ($user->isSystemAdmin() || $this->accessQuery($user)->where('access.action_id', $action)->exists()) {
+        if ($this->accessQuery($user)->where('access.action_id', $action)->exists()) {
             return true;
         }
+        $letter = DB::table('correspondence_actions as a')->join('official_correspondences as c', 'c.id', '=', 'a.correspondence_id')
+            ->where('a.id', $action)->first(['c.id', 'c.channel', 'c.department_id', 'c.classification_value_id']);
+        if (! $letter) {
+            return false;
+        }
         $department = $this->externalArchiveDepartmentId();
+        if (($department !== null && $letter->channel === 'external' && (int) $letter->department_id === $department && $this->member($user, $department))
+            || ($user->isSystemAdmin() && ! $this->isConfidential($letter))) {
+            return true;
+        }
+        $granted = $exceptional ? $this->grantedActions($user, $letter) : null;
 
-        return $department !== null && $this->member($user, $department)
-            && DB::table('correspondence_actions as a')->join('official_correspondences as c', 'c.id', '=', 'a.correspondence_id')
-                ->where('a.id', $action)->where('c.channel', 'external')->where('c.department_id', $department)->exists();
+        return $granted !== null && $granted->where('a.id', $action)->exists();
     }
 
-    public function visibleActions(User $user, object $letter): Builder
+    /** The record's actions the user may read; $exceptional = false leaves out the exceptional grants. */
+    public function visibleActions(User $user, object $letter, bool $exceptional = true): Builder
     {
         $query = DB::table('correspondence_actions as a')->where('a.correspondence_id', $letter->id);
         if (! $user->is_active) {
             return $query->whereRaw('1 = 0');
         }
-        if ($user->isSystemAdmin()) {
+        if ($user->isSystemAdmin() && ! $this->isConfidential($letter)) {
             return $query;
         }
+        $granted = $exceptional ? $this->grantedActions($user, $letter) : null;
 
-        return $query->where(function (Builder $visible) use ($user, $letter): void {
+        return $query->where(function (Builder $visible) use ($user, $letter, $granted): void {
             $visible->whereIn('a.id', $this->accessQuery($user)->select('access.action_id'));
             $department = $letter->channel === 'external' ? $this->externalArchiveDepartmentId() : null;
             if ($department !== null && (int) $letter->department_id === $department && $this->member($user, $department)) {
                 $visible->orWhere('a.correspondence_id', $letter->id);
+            }
+            if ($granted !== null) {
+                $visible->orWhereIn('a.id', $granted);
             }
         });
     }
@@ -310,7 +449,7 @@ final class CorrespondenceAccess
                 ->whereIn('pending.action_id', $this->accessQuery($user)->select('access.action_id'))->selectRaw('1'));
         } elseif ($box === 'forwarded') {
             $query->whereExists(DB::table('correspondence_actions as forwarded')->whereColumn('forwarded.correspondence_id', 'c.id')
-                ->where('forwarded.actor_id', $user->id)->whereIn('forwarded.action', ['forward', 'reassign'])
+                ->where('forwarded.actor_id', $user->id)->whereIn('forwarded.action', ['forward', 'reassign', 'refer'])
                 ->whereIn('forwarded.id', $this->accessQuery($user)->select('access.action_id'))->selectRaw('1'));
         } elseif ($box === 'sent') {
             $query->where('c.status', '<>', 'draft')->where(function (Builder $sent) use ($user): void {

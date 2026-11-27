@@ -7,8 +7,10 @@ use App\Services\Attendance\AttendanceMonthlySummary;
 use App\Services\Attendance\AttendanceShiftRoster;
 use App\Services\Audit\AuditScope;
 use App\Services\Departments\DepartmentWorkspace;
+use App\Services\Finance\DepartmentBudgets;
 use App\Services\Finance\FinanceApprovalQueue;
 use App\Services\Finance\FinanceGuard;
+use App\Services\Hr\EmployeeAccess;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\Kpi\KpiScope;
 use App\Services\Organization\StructureChanges;
@@ -37,8 +39,10 @@ final class NavigationAccessRules
     /** Finance permission sets too long for one access_rule; they mirror the sections of the Finance page. */
     public const FINANCE_SETS = [
         'finance_cycle' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.procurement.director_approve', 'finance.procurement.board_approve',
-            'finance.purchase.receive', 'finance.purchase.invoice', 'finance.warehouse.manage', 'finance.stock.receive', 'finance.stock.issue', 'finance.stock.count', 'finance.stock.count.approve'],
+            'finance.purchase.receive', 'finance.purchase.invoice', 'finance.payment.record', 'finance.warehouse.manage', 'finance.stock.receive', 'finance.stock.issue', 'finance.stock.count', 'finance.stock.count.approve'],
         'finance_purchasing' => ['finance.procurement.manage', 'finance.procurement.review', 'finance.procurement.director_approve', 'finance.procurement.board_approve'],
+        'finance_payments' => ['finance.payment.draft', 'finance.payment.review', 'finance.payment.approve', 'finance.payment.execute', 'finance.payment.record'],
+        'finance_receipts' => ['finance.receipt.draft', 'finance.receipt.review', 'finance.receipt.approve', 'finance.receipt.execute'],
     ];
 
     public function __construct(
@@ -57,16 +61,20 @@ final class NavigationAccessRules
             'system_admin' => 'مدير النظام',
             'audit_viewer' => '«سجل النظام» (مدير النظام والمدير التنفيذي ورؤساء الأقسام لنطاق أقسامهم)',
             'manage_employees' => 'إدارة الموظفين والهيكل',
+            'employee_files' => 'ملفات الموظفين (إدارة الموظفين، وموظفو الموارد البشرية لإعداد التعديلات)',
             'org_structure' => 'الهيكل التنظيمي (مدير النظام ورئيس الموارد البشرية والمدير التنفيذي ورؤساء الأقسام)',
             'attendance_access' => 'الحضور (إدارة الموظفين أو المدير التنفيذي)',
             'shift_roster' => '«جدول المناوبات» (رئيس القسم المعيّن؛ ورئيس الموارد البشرية والمدير التنفيذي ومدير النظام للاطلاع)',
             'monthly_attendance' => '«دوامي الشهري» (صاحب ملف موظف، أو رئيس قسم، أو الموارد البشرية والمدير التنفيذي)',
-            'hr_dashboard' => 'لوحة الموارد البشرية والخدمات العامة (رئيس الموارد البشرية ومدير النظام والمدير التنفيذي)',
+            'hr_dashboard' => '«متابعة القسم» (رئيس قسم الموارد البشرية والخدمات العامة؛ والمدير التنفيذي ومدير النظام للاطلاع)',
             'leave_requester' => 'موظف مكتمل الملف ونشط',
             'employee_profile' => 'صاحب ملف موظف مرتبط بحسابه («ملفي الوظيفي»)',
             'finance_view' => 'الاطلاع على الحسابات',
+            'finance_department_budgets' => 'إدخال ميزانيات الأقسام (رئيس الحسابات المعيّن فقط)',
             'finance_cycle' => 'الدورة المستندية في الحسابات (المشتريات أو الاستلام أو الفواتير أو المخازن)',
             'finance_purchasing' => 'طلبات الشراء (إعدادها أو مراجعتها أو اعتمادها)',
+            'finance_payments' => 'وحدة الصرف في قسم الحسابات (حسب الصلاحيات المسندة)',
+            'finance_receipts' => 'وحدة القبض في قسم الحسابات (حسب الصلاحيات المسندة)',
             'finance_approver' => 'صندوق الاعتمادات المالية (المعتمدون الماليون)',
             'orphans_staff' => 'قسم شؤون الأيتام والكفالات (موظفو القسم ورئيسه والمدير التنفيذي ومدير النظام)',
             'orphans_campaigns' => 'الحملات الإغاثية (من يملك قدرة الحملات أو التسليم، أو تكليفًا نافذًا في حملة محددة)',
@@ -120,14 +128,16 @@ final class NavigationAccessRules
         }
 
         return match ($rule) {
-            'finance_cycle', 'finance_purchasing' => $this->anyFinance($user, self::FINANCE_SETS[$rule]),
+            'finance_cycle', 'finance_purchasing', 'finance_payments', 'finance_receipts' => $this->anyFinance($user, self::FINANCE_SETS[$rule]),
             'finance_approver' => app(FinanceApprovalQueue::class)->isApprover($user),
+            'finance_department_budgets' => app(DepartmentBudgets::class)->canManage($user),
             'kpi_view' => KpiScope::resolve($user) !== null,
             'department_workspace' => app(DepartmentWorkspace::class)->departments($user) !== [],
             'authenticated' => true,
             'system_admin' => $user->isSystemAdmin(),
             'audit_viewer' => app(AuditScope::class)->allows($user),
             'manage_employees' => $user->canManageEmployees(),
+            'employee_files' => app(EmployeeAccess::class)->canOpenFiles($user),
             'org_structure' => $user->canManageOrganization() || $this->hasRole($user, 'executive_director') || app(StructureChanges::class)->headedDepartments($user) !== [],
             'attendance_access' => $user->canManageEmployees() || $this->hasRole($user, 'executive_director'),
             'shift_roster' => app(AttendanceShiftRoster::class)->canOpen($user),
@@ -179,14 +189,15 @@ final class NavigationAccessRules
             'kpi_view' => 'ليس من الإدارة العليا ولا رئيسًا معيّنًا لقسم فعال، ولا يحمل دورًا بصلاحية kpi.view.',
             'department_workspace' => 'ليس رئيسًا معيّنًا لقسم فعال يحمل فيه دور «رئيس قسم».',
             'manage_employees' => 'إدارة الموظفين لمدير النظام ورئيس قسم الموارد البشرية المعيّن فقط.',
+            'employee_files' => 'ملفات الموظفين لمدير النظام ورئيس الموارد البشرية المعيّن، ولمن يحمل دور «موظف الموارد البشرية» في قسمها.',
             'org_structure' => 'الهيكل التنظيمي لمدير النظام ورئيس الموارد البشرية والمدير التنفيذي ورؤساء الأقسام المعيّنين.',
             'attendance_access' => 'الحضور لمدير النظام ورئيس الموارد البشرية والمدير التنفيذي.',
             'shift_roster' => 'جدول المناوبات لرئيس القسم المعيّن في الهيكل، ولرئيس الموارد البشرية والمدير التنفيذي ومدير النظام للاطلاع.',
             'monthly_attendance' => 'لا يوجد ملف موظف مرتبط بالحساب، ولا يترأس قسمًا.',
-            'hr_dashboard' => 'لوحة الموارد البشرية والخدمات العامة لرئيس الموارد البشرية المعيّن ومدير النظام والمدير التنفيذي.',
+            'hr_dashboard' => '«متابعة القسم» لرئيس قسم الموارد البشرية والخدمات العامة المعيّن، وللمدير التنفيذي ومدير النظام للاطلاع.',
             'leave_requester' => 'يتطلب ملف موظف مكتملًا ونشطًا مرتبطًا بالحساب.',
             'employee_profile' => 'لا يوجد ملف موظف مرتبط بهذا الحساب؛ تربطه الموارد البشرية من ملف الموظف.',
-            'finance_view' => $user->roleAssignments()->whereHas('role.permissions', fn ($query) => $query->where('code', 'finance.view'))->exists()
+            'finance_view' => $user->roleAssignments()->effective()->whereHas('role.permissions', fn ($query) => $query->where('code', 'finance.view'))->exists()
                 ? 'يحمل دورًا ماليًا لكن لا يوجد له تخصيص نشط في «صلاحيات الحسابات».'
                 : 'لا يحمل دورًا بصلاحية finance.view؛ يُسند الاختصاص المالي من «صلاحيات الحسابات».',
             'orphans_staff' => 'لموظفي قسم شؤون الأيتام والكفالات (بإسناد في القسم أو إحدى وحداته) ورئيسه والمدير التنفيذي ومدير النظام.',
@@ -218,7 +229,7 @@ final class NavigationAccessRules
 
     private function hasRole(User $user, string $roleCode): bool
     {
-        return $user->roleAssignments()->whereHas('role', fn ($query) => $query->where('code', $roleCode))->exists();
+        return $user->roleAssignments()->effective()->whereHas('role', fn ($query) => $query->where('code', $roleCode))->exists();
     }
 
     private function isActiveEmployee(User $user): bool

@@ -7,8 +7,10 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * Daily rentals alerts (approved document §8 and §6): contracts entering the renewal window (90 days by default,
- * set in the rentals settings), contracts past their end, and dues past their date with a balance. Each alert goes
- * once to the assets head and the rentals officers; repeated runs send nothing new.
+ * set in the rentals settings), contracts past their end, dues past their date with a balance, and maintenance
+ * requests closed while their unit is still «تحت الصيانة». Each alert goes once to the assets head and the rentals
+ * officers; the renewal window and expiry also go to the executive director for information. Repeated runs send
+ * nothing new.
  */
 final class RentalAlerts
 {
@@ -17,15 +19,19 @@ final class RentalAlerts
         private readonly RentalLedger $ledger,
         private readonly RentalsAccess $access,
         private readonly NotificationCenter $notifications,
+        private readonly RentalMaintenance $maintenance,
     ) {}
 
-    /** @return array{expired: int, renewed: int, expiring: int, overdue: int} */
+    /** @return array{expired: int, renewed: int, expiring: int, overdue: int, maintenance: int} */
     public function run(): array
     {
-        $result = $this->contracts->expire() + ['expiring' => 0, 'overdue' => 0];
+        $result = $this->contracts->expire() + ['expiring' => 0, 'overdue' => 0, 'maintenance' => 0];
         $settings = $this->settings();
         $managers = $this->access->managers();
-        if ($managers->isEmpty()) {
+        $recipients = $managers->pluck('id');
+        // The renewal window also reaches the executive director, for information (SRS 3.8.7.1).
+        $informed = $recipients->merge($this->access->executiveIds())->unique()->values();
+        if ($informed->isEmpty()) {
             return $result;
         }
         $today = now()->toDateString();
@@ -34,15 +40,18 @@ final class RentalAlerts
             ->whereNotExists(fn ($q) => $q->from('aims_rental_contracts as n')->whereColumn('n.parent_contract_id', 'c.id')->whereNotIn('n.status', ['rejected', 'cancelled']))
             ->whereNotExists(fn ($q) => $q->from('aims_rental_cases as k')->whereColumn('k.contract_id', 'c.id')->where('k.kind', 'eviction')->whereNotIn('k.status', ['rejected', 'cancelled']))
             ->get(['c.id', 'c.number', 'c.ends_on']);
-        $recipients = $managers->pluck('id');
         foreach ($expiring as $contract) {
-            $result['expiring'] += $this->notifications->notifyMany($recipients, 'rental_contract_expiring', [
+            $result['expiring'] += $this->notifications->notifyMany($informed, 'rental_contract_expiring', [
                 'title' => 'عقد الإيجار '.$contract->number.' ينتهي في '.$contract->ends_on,
                 'body' => 'راجع الالتزام والدفعات وحالة العين، وأثبت رد المستأجر: تجديد بعقد لاحق أو إنهاء وإخلاء.',
                 'url' => '/admin/rentals/records/contract/'.$contract->id,
                 'dedupe' => 'rental:expiring:'.$contract->id.':'.$contract->ends_on,
             ]);
         }
+        if ($managers->isEmpty()) {
+            return $result;
+        }
+        $result['maintenance'] = $this->maintenance->notifyClosed($recipients);
         $overdue = $this->ledger->dues()->where('d.status', 'open')
             ->where('d.due_on', '<', now()->subDays($settings->overdue_alert_days)->toDateString())->get()
             ->filter(fn (object $due): bool => (float) $due->remaining > 0);

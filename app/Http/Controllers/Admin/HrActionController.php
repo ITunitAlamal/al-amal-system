@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Services\Attendance\AttendanceAccess;
 use App\Services\Attendance\AttendanceLedger;
 use App\Services\Attendance\HrActionService;
+use App\Services\AuditService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -26,7 +27,7 @@ final class HrActionController extends Controller
     {
         abort_unless($this->access->canViewHrActions($request->user()) && $this->actions->available(), 403);
         $data = $request->validate(['employee_id' => ['nullable', 'integer'], 'status' => ['nullable', Rule::in(array_keys(HrActionService::STATUS))], 'q' => ['nullable', 'string', 'max:100']]);
-        $rows = collect($this->actions->list(isset($data['employee_id']) ? (int) $data['employee_id'] : null, false, 500));
+        $rows = collect($this->actions->list(isset($data['employee_id']) ? (int) $data['employee_id'] : null, false, 500, $request->user()));
         if (! empty($data['status'])) {
             $rows = $rows->where('status', $data['status']);
         }
@@ -37,7 +38,8 @@ final class HrActionController extends Controller
         $user = $request->user();
 
         return response()->json(['data' => $rows->values(), 'types' => $this->actions->types(),
-            'can' => ['manage' => $this->access->canManageHrActions($user), 'decide' => $this->access->canDecideHrActions($user), 'user_id' => (int) $user->id]])
+            'can' => ['manage' => $this->access->canManageHrActions($user), 'decide' => $this->access->canDecideHrActions($user),
+                'executive' => $this->access->isExecutive($user), 'user_id' => (int) $user->id]])
             ->header('Cache-Control', 'no-store, private');
     }
 
@@ -79,12 +81,32 @@ final class HrActionController extends Controller
         return back()->with('success', 'أُلغي الإجراء مع حفظ سجله.');
     }
 
+    /** The HR head asks the executive director to cancel an action that stands on the director's decision. */
+    public function requestCancel(Request $request, int $action): RedirectResponse
+    {
+        $data = $request->validate(['reason' => ['required', 'string', 'min:10', 'max:2000']]);
+        $this->actions->requestCancel($request->user(), $this->row($action), $data['reason']);
+
+        return back()->with('success', 'رُفع طلب الإلغاء إلى المدير التنفيذي، ويبقى الإجراء قائمًا حتى قراره.');
+    }
+
+    /** The executive director keeps the action and closes the cancellation request. */
+    public function declineCancel(Request $request, int $action): RedirectResponse
+    {
+        $data = $request->validate(['note' => ['required', 'string', 'min:5', 'max:2000']]);
+        $this->actions->declineCancel($request->user(), $this->row($action), $data['note']);
+
+        return back()->with('success', 'بقي الإجراء قائمًا وأُبلغ مقدم الطلب.');
+    }
+
     /** Evidence file: the register's viewers, or the employee for an issued action. */
     public function attachment(Request $request, int $action): StreamedResponse
     {
         $row = $this->row($action);
         $self = (int) DB::table('employees')->where('id', $row->employee_id)->value('user_id') === (int) $request->user()->id && $row->status === 'issued';
         abort_unless(($this->access->canViewHrActions($request->user()) || $self) && $row->attachment_path, 403);
+        app(AuditService::class)->event('hr_action.attachment.downloaded', ['subject_type' => 'employee_hr_actions', 'subject_id' => $row->id,
+            'sensitivity' => 'restricted', 'ip' => $request->ip(), 'metadata' => ['employee_id' => (int) $row->employee_id, 'own_record' => $self]]);
 
         return Storage::disk('local')->download($row->attachment_path, $row->attachment_name ?: 'evidence', ['Cache-Control' => 'no-store, private']);
     }

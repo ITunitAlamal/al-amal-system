@@ -17,6 +17,10 @@ const yes = v => v === true ? 'نعم' : v === false ? 'لا' : 'غير متوف
             <template v-if="data">
                 <p class="mt-2">النتيجة: <strong>{{ data.outcome }}</strong><span v-if="data.score !== null"> · الدرجة {{ data.score }}</span><span v-if="data.rank"> · الترتيب {{ data.rank }}</span></p>
                 <ul class="mt-2 list-disc space-y-1 ps-5"><li v-for="(r, i) in data.reasons" :key="i">{{ r }}</li></ul>
+                <section v-if="data.dimensions?.length" class="mt-3"><h3 class="font-semibold text-navy-800">المجموع حسب البعد</h3>
+                    <table class="data-table mt-1"><thead><tr><th scope="col">البعد</th><th scope="col">الوزن</th><th scope="col">النقاط</th></tr></thead>
+                        <tbody><tr v-for="d in data.dimensions" :key="d.key"><td>{{ d.label }}<span v-if="d.missing" class="block text-xs text-gold-800">فيه بيانات ناقصة</span></td>
+                            <td class="tabular-nums">{{ d.weight }}</td><td class="tabular-nums">{{ d.points }}</td></tr></tbody></table></section>
                 <section v-if="data.contributions?.length" class="mt-3"><h3 class="font-semibold text-navy-800">مساهمة كل معيار</h3>
                     <table class="data-table mt-1"><thead><tr><th scope="col">المعيار</th><th scope="col">الوزن</th><th scope="col">القيمة</th><th scope="col">النقاط</th></tr></thead>
                         <tbody><tr v-for="c in data.contributions" :key="c.key"><td>{{ c.label }}<span class="block text-xs text-slate-500">{{ c.source }}</span></td><td class="tabular-nums">{{ c.weight }}</td>

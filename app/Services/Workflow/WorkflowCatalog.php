@@ -3,6 +3,7 @@
 namespace App\Services\Workflow;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
@@ -32,9 +33,10 @@ final class WorkflowCatalog
         $context = [
             'requester_has_department_head' => $this->assignees->hasSuperiorHead((int) $user->department_id, (int) $user->id),
             'requester_is_executive' => DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->where('a.user_id', $user->id)->where('r.code', 'executive_director')->exists(),
+                ->where('a.user_id', $user->id)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists(),
         ];
         $transitions = DB::table('workflow_transitions')->where('workflow_version_id', $version->id)->where('from_step_id', $start->id)->where('is_active', true)->get();
+        $unheld = null;
         foreach ($transitions as $transition) {
             $conditions = is_string($transition->conditions) ? json_decode($transition->conditions, true) : null;
             if (is_array($conditions) && array_diff_key($conditions, WorkflowEngine::REQUESTER_CONTEXT) !== []) {
@@ -48,9 +50,12 @@ final class WorkflowCatalog
             if ($target->step_type === 'end' || $holders !== []) {
                 return null;
             }
+            $unheld ??= $target;
         }
 
-        return 'لا يوجد من يستلم طلبك في مرحلته الأولى؛ لا يعتمد أحد طلبه بنفسه، وتحدد الإدارة الجهة البديلة.';
+        // The exact designation missing (TRANSFORM §3.4: alert, never skip), roles and departments only.
+        return 'لا يوجد من يستلم طلبك في مرحلته الأولى'.($unheld ? ' «'.$unheld->name.'» (يلزم: '.$this->assignees->holderNeeded($unheld).')' : '')
+            .'؛ لا يعتمد أحد طلبه بنفسه، وتحدد الإدارة الجهة البديلة.';
     }
 
     /**

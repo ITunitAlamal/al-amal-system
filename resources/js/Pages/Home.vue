@@ -3,29 +3,28 @@ import { arabicLatinDigitsLocale, formatDate, parseDate } from '../Support/dates
 import { computed, nextTick, ref, watch } from 'vue';
 import { Deferred, Link, router } from '@inertiajs/vue3';
 import AppLayout from '../Layouts/AppLayout.vue';
-import HrServicesWorkspace from '../Components/Hr/ServicesWorkspace.vue';
+import AppIcon from '../Components/AppIcon.vue';
 import EmptyState from '../Components/EmptyState.vue';
 import RoleBoards from '../Components/Dashboard/RoleBoards.vue';
 import BoardSkeleton from '../Components/Dashboard/BoardSkeleton.vue';
+import DepartmentBudgetSummary from '../Components/Finance/DepartmentBudgetSummary.vue';
+import MyRequestsSummary from '../Components/Dashboard/MyRequestsSummary.vue';
+import WaitingTasks from '../Components/Dashboard/WaitingTasks.vue';
 
 import StatusBadge from '../Components/StatusBadge.vue';
 import StatusStepper from '../Components/StatusStepper.vue';
 import { entitlementText } from '../Support/leaveEntitlement.js';
-import { prioritizeActions, taskDeadline, uniqueShortcuts } from '../Support/homePriorities.js';
+import { taskDeadline, uniqueShortcuts } from '../Support/homePriorities.js';
 
 const props = defineProps({
-    hrWorkspace: { type: Boolean, default: false },
-    today: String,
-    filters: Object,
-    pages: Object,
-    attendanceStatuses: Object,
-    serviceFilters: Object,
-    links: Array,
-    kpis: Object,
-    actions: Object,
-    attendance: Object,
-    recentLeaves: Object,
-    services: Object,
+    // The head of the unified department on their personal services (?workspace=personal): the way back to their dashboard.
+    hrHomeUrl: { type: String, default: null },
+    // "member": a person of the unified department (HR, general services and maintenance) who is not its head; the page
+    // opens on «بانتظار إجرائي» and «طلباتي». Null leaves the page as it is.
+    departmentHome: { type: String, default: null },
+    // Whether the member's dashboard template keeps «طلباتي» (shown at the top instead of as a block).
+    memberRequests: { type: Boolean, default: false },
+    waiting: { type: Object, default: null },
     executiveWorkspace: { type: Boolean, default: false },
     home: { type: Object, required: true },
     readiness: { type: Array, default: null },
@@ -44,6 +43,7 @@ const props = defineProps({
     actionCenter: { type: Array, default: () => [] },
     shortcuts: { type: Array, default: () => [] },
     notifications: { type: Array, default: () => [] },
+    departmentBudgets: { type: Object, default: undefined },
 });
 
 const number = value => new Intl.NumberFormat(arabicLatinDigitsLocale, { maximumFractionDigits: 2 }).format(value ?? 0);
@@ -62,16 +62,21 @@ const ago = value => {
 };
 
 const personalDashboardBlockOrder = ['tasks', 'todo', 'my_requests', 'correspondence', 'leave_balances', 'calendar', 'notifications', 'activity', 'evaluation', 'profile', 'team'];
+const executiveDecisionOrder = ['tasks', 'executive', 'correspondence', 'finance'];
+const showPersonalWorkspace = ref(false);
 const dashboardLayout = computed(() => {
-    if (props.executiveWorkspace) return props.layout;
+    if (props.executiveWorkspace && !showPersonalWorkspace.value) {
+        return props.layout
+            .filter(block => executiveDecisionOrder.includes(block.key))
+            .filter(block => block.key !== 'executive' || props.home.executive?.decisions?.length)
+            .sort((first, second) => executiveDecisionOrder.indexOf(first.key) - executiveDecisionOrder.indexOf(second.key));
+    }
 
     return props.layout
         .filter(block => personalDashboardBlockOrder.includes(block.key))
         .sort((first, second) => personalDashboardBlockOrder.indexOf(first.key) - personalDashboardBlockOrder.indexOf(second.key));
 });
 const has = key => dashboardLayout.value.some(block => block.key === key);
-const priorityActions = computed(() => prioritizeActions(props.actionCenter));
-const quietActions = computed(() => props.actionCenter.filter(item => Number(item.value) === 0));
 const headerLinks = computed(() => [
     ...(has('correspondence') ? [{ code: 'home-correspondence', label: 'مراسلاتي', url: '/correspondence' }] : []),
     ...(has('tasks') ? [{ code: 'home-tasks', label: props.executiveWorkspace ? 'الاعتمادات والمهام المحالة إليّ' : 'مهامي الرسمية', url: '/tasks' }] : []),
@@ -87,8 +92,14 @@ const refreshing = ref(false);
 const refreshError = ref('');
 watch(() => props.home, () => { receivedAt.value = new Date(); });
 const receivedTime = computed(() => new Intl.DateTimeFormat(arabicLatinDigitsLocale, { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(receivedAt.value));
-const visibleTasks = computed(() => taskView.value === 'overdue'
-    ? props.home.tasks.filter(task => taskDeadline(task)?.tone === 'danger') : props.home.tasks);
+const visibleTasks = computed(() => {
+    const tasks = taskView.value === 'overdue'
+        ? props.home.tasks.filter(task => taskDeadline(task)?.tone === 'danger') : [...props.home.tasks];
+    if (props.executiveWorkspace) {
+        tasks.sort((first, second) => Number(taskDeadline(second)?.tone === 'danger') - Number(taskDeadline(first)?.tone === 'danger'));
+    }
+    return tasks;
+});
 // One continuous grid for every user: executive work first, then the personal blocks, then role blocks, each in its
 // resolved order. A block with nothing to show takes no place, so no empty slot is left between cards.
 const sectionRank = { executive: 0, base: 1, role: 2 };
@@ -101,8 +112,8 @@ const rendersContent = block => ({
 const cards = computed(() => dashboardLayout.value
     .map((block, index) => ({ block, index }))
     .filter(({ block }) => rendersContent(block))
-    .sort((first, second) => (sectionRank[first.block.section || 'base'] ?? 1) - (sectionRank[second.block.section || 'base'] ?? 1) || first.index - second.index)
-    .map(({ block }) => ({ ...block, wide: props.executiveWorkspace && block.size === 'full' })));
+    .sort((first, second) => props.executiveWorkspace ? first.index - second.index : (sectionRank[first.block.section || 'base'] ?? 1) - (sectionRank[second.block.section || 'base'] ?? 1) || first.index - second.index)
+    .map(({ block }) => ({ ...block, wide: props.executiveWorkspace && ['tasks', 'executive'].includes(block.key) })));
 // With one or two narrow cards the grid uses only that many columns, so no column stays empty beside them.
 const narrowCards = computed(() => cards.value.filter(card => !card.wide).length);
 
@@ -130,6 +141,7 @@ function observeCards(grid) {
 }
 const vMasonry = {
     mounted(grid) {
+        if (props.executiveWorkspace) return;
         if (typeof ResizeObserver === 'undefined') return; // plain grid rows: still no overlap
         grid._masonry = { observer: new ResizeObserver(entries => entries.forEach(entry => placeCard(grid, entry.target))), seen: new WeakSet() };
         grid.classList.add('is-masonry');
@@ -139,7 +151,6 @@ const vMasonry = {
     unmounted: grid => grid._masonry?.observer.disconnect(),
 };
 
-const toneClass = { danger: 'border-red-200 bg-red-50 text-red-800', warning: 'border-gold-200 bg-gold-50 text-gold-900', info: 'border-blue-200 bg-blue-50 text-blue-900', muted: 'border-slate-200 bg-white text-slate-700' };
 const openGaps = computed(() => (props.readiness ?? []).filter(check => !check.ok).length);
 
 const stats = computed(() => [
@@ -170,7 +181,7 @@ function refreshSummary() {
     refreshError.value = '';
     let succeeded = false;
     router.reload({
-        only: ['home', 'actionCenter'],
+        only: ['home', 'actionCenter', 'departmentBudgets', ...(has('correspondence') ? ['correspondence'] : []), ...(props.departmentHome ? ['waiting'] : [])],
         onSuccess: () => { succeeded = true; },
         onFinish: () => {
             refreshing.value = false;
@@ -222,54 +233,49 @@ const goToStart = () => document.getElementById('start-options')?.scrollIntoView
 </script>
 
 <template>
-    <AppLayout :title="executiveWorkspace ? 'لوحة المدير التنفيذي' : 'مساحتي'">
+    <AppLayout :title="hrHomeUrl ? 'خدماتي الشخصية' : executiveWorkspace ? 'لوحة المدير التنفيذي' : 'مساحتي'">
         <div class="space-y-3">
-            <HrServicesWorkspace v-if="hrWorkspace" endpoint="/ui-preview"
-                :today="today" :filters="filters" :pages="pages" :attendance-statuses="attendanceStatuses"
-                :service-filters="serviceFilters" :links="links" :kpis="kpis" :actions="actions"
-                :attendance="attendance" :recent-leaves="recentLeaves" :services="services" />
-            <Deferred data="boards">
+            <div v-if="hrHomeUrl" class="flex flex-wrap items-center justify-between gap-3">
+                <p class="text-sm text-slate-600">طلباتك ومهامك الشخصية وخدمات ملفك الوظيفي</p>
+                <Link :href="hrHomeUrl" class="btn btn-secondary btn-sm">العودة إلى لوحة القسم</Link>
+            </div>
+            <template v-if="departmentHome && waiting">
+                <header class="flex flex-wrap items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <h1 class="text-xl font-bold text-navy-800">مساحتي</h1>
+                        <p v-if="home.departmentName" class="text-sm text-slate-600">{{ home.departmentName }}</p>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                        <button v-if="has('start_options') && home.startOptions.length" type="button" class="btn btn-primary btn-sm" @click="goToStart"><AppIcon name="plus" :size="16" /> طلب جديد</button>
+                        <Link v-else href="/requests" class="btn btn-primary btn-sm"><AppIcon name="plus" :size="16" /> طلب جديد</Link>
+                        <button type="button" class="btn btn-secondary btn-sm" :disabled="refreshing || todoBusy" @click="refreshSummary"><AppIcon name="refresh" :size="16" /> {{ refreshing ? 'جارٍ التحديث…' : 'تحديث' }}</button>
+                    </div>
+                </header>
+                <WaitingTasks :waiting="waiting" />
+                <MyRequestsSummary v-if="memberRequests" :requests="home.myRequests" :stats="home.stats" open />
+            </template>
+            <Deferred v-if="!executiveWorkspace" data="departmentBudgets">
+                <template #fallback><div class="card h-28 motion-safe:animate-pulse bg-slate-50" role="status" aria-label="جارٍ تحميل ميزانية القسم"></div></template>
+                <template #rescue><p class="alert-error" role="alert">تعذر تحميل ميزانية القسم. <button type="button" class="underline" @click="router.reload({ only: ['departmentBudgets'] })">أعد المحاولة</button></p></template>
+                <DepartmentBudgetSummary :summary="departmentBudgets" />
+            </Deferred>
+            <Deferred v-if="!executiveWorkspace" data="boards">
                 <template #fallback><BoardSkeleton /></template>
                 <RoleBoards :boards="boards || []" storage-key="aims.home.board" />
             </Deferred>
-            <section v-if="executiveWorkspace && (actionCenter.length || leadingShortcuts.length || has('start_options') || has('todo'))" class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3" aria-label="إجراءات سريعة وملخص التحديث">
-                <p class="text-xs text-slate-500">آخر تحديث <bdi>{{ receivedTime }}</bdi></p>
-                <nav aria-label="إجراءات سريعة" class="flex flex-wrap items-center gap-2">
-                    <button v-if="has('start_options') && home.startOptions.length" type="button" class="btn btn-primary btn-sm" @click="goToStart">+ طلب جديد</button>
-                    <button v-if="has('todo')" type="button" class="btn btn-secondary btn-sm" @click="focusTodo">+ مهمة شخصية</button>
-                    <Link v-for="shortcut in headerLinks" :key="shortcut.code" :href="shortcut.url" class="btn btn-secondary btn-sm">{{ shortcut.label }}</Link>
-                    <Link v-for="shortcut in leadingShortcuts" :key="shortcut.code" :href="shortcut.url" class="btn btn-secondary btn-sm">{{ shortcut.label }}</Link>
-                    <button type="button" :disabled="refreshing || todoBusy" class="btn btn-secondary btn-sm" @click="refreshSummary">{{ refreshing ? 'جارٍ التحديث…' : 'تحديث الملخص' }}</button>
-                </nav>
-            </section>
-            <p v-if="refreshError" role="alert" class="alert-error">{{ refreshError }}</p>
-
-            <h1 class="text-lg font-bold text-navy-800">{{ executiveWorkspace ? 'ملخص الأعمال' : 'ملخص أعمالي' }}</h1>
-            <section v-if="executiveWorkspace && priorityActions.length" aria-labelledby="home-action-center">
-                <div class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-                    <div>
-                        <h2 id="home-action-center" class="text-base font-bold text-navy-800">يحتاج إجرائي الآن</h2>
-                        <p class="text-xs text-slate-600">الأعمال المتأخرة أولًا، ثم بقية ما ينتظر إجراءك.</p>
-                    </div>
-                    <p class="text-xs text-slate-500">قد تظهر المراسلة ضمن المهام الرسمية أيضًا؛ الأعداد ليست مجموعًا مستقلًا.</p>
+            <header class="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-4">
+                <div>
+                    <h2 v-if="departmentHome && waiting" class="text-lg font-bold text-navy-800">بطاقاتي</h2>
+                    <h1 v-else class="text-xl font-bold text-navy-800">{{ executiveWorkspace ? (showPersonalWorkspace ? 'خدماتي الشخصية' : 'مكتب المدير التنفيذي') : 'ملخص أعمالي' }}</h1>
+                    <p v-if="executiveWorkspace" class="mt-1 text-sm text-slate-600">{{ showPersonalWorkspace ? 'طلباتك وملفك ومتابعاتك الشخصية.' : 'القرارات التي تنتظر إجراءك، والمتأخر منها أولًا.' }}</p>
+                    <p v-if="executiveWorkspace" class="mt-2 text-xs text-slate-500">آخر تحديث <bdi>{{ receivedTime }}</bdi></p>
                 </div>
-                <ul class="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                    <li v-for="item in priorityActions" :key="item.key">
-                        <Link :href="item.url" class="flex h-full flex-col rounded-xl border p-2.5 transition hover:shadow-sm focus-visible:ring-2 focus-visible:ring-navy-400" :class="toneClass[item.value ? item.tone : 'muted']">
-                            <span class="text-xs font-semibold leading-4">{{ item.label }}</span>
-                            <strong class="mt-1 font-display text-xl">{{ number(item.value) }}</strong>
-                            <span v-if="item.detail" class="text-[10px] leading-4 opacity-80">{{ item.detail }}</span>
-                        </Link>
-                    </li>
-                </ul>
-                <details v-if="quietActions.length" class="mt-3 rounded-xl border border-slate-200 bg-white p-3">
-                    <summary class="cursor-pointer rounded text-sm font-semibold text-slate-700">قوائم بلا إجراءات معلّقة ({{ number(quietActions.length) }})</summary>
-                    <div class="mt-3 flex flex-wrap gap-2">
-                        <Link v-for="item in quietActions" :key="item.key" :href="item.url" class="btn btn-secondary btn-sm">{{ item.label }} · {{ number(item.value) }}</Link>
-                    </div>
-                </details>
-            </section>
-
+                <nav v-if="executiveWorkspace" aria-label="عرض لوحة المدير التنفيذي" class="flex flex-wrap gap-2">
+                    <button type="button" class="btn btn-secondary btn-sm" :aria-pressed="showPersonalWorkspace" @click="showPersonalWorkspace = !showPersonalWorkspace">{{ showPersonalWorkspace ? 'العودة إلى القرارات' : 'خدماتي الشخصية' }}</button>
+                    <button type="button" :disabled="refreshing || todoBusy" class="btn btn-secondary btn-sm" @click="refreshSummary">{{ refreshing ? 'جارٍ التحديث…' : 'تحديث' }}</button>
+                </nav>
+            </header>
+            <p v-if="refreshError" role="alert" class="alert-error">{{ refreshError }}</p>
             <section v-if="cards.length" aria-label="بطاقات اللوحة">
                 <div v-masonry class="dashboard-cards" :class="{ 'dashboard-cards-executive': executiveWorkspace, 'dashboard-cards-single': narrowCards <= 1, 'dashboard-cards-pair': narrowCards === 2 }">
                     <div v-for="block in cards" :key="block.key" class="dashboard-card" :class="{ 'dashboard-card-wide': block.wide }">
@@ -343,7 +349,7 @@ const goToStart = () => document.getElementById('start-options')?.scrollIntoView
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <StatusBadge v-if="remaining(task)" :label="remaining(task).label" :tone="remaining(task).tone" />
-                                        <Link :href="task.url" class="btn btn-primary btn-sm">فتح واتخاذ إجراء</Link>
+                                        <Link :href="task.url" class="btn btn-primary btn-sm">اتخاذ إجراء</Link>
                                     </div>
                                 </li>
                             </ul>
@@ -351,10 +357,10 @@ const goToStart = () => document.getElementById('start-options')?.scrollIntoView
                         </section>
 
                         <Deferred v-else-if="block.key === 'todo' && todo !== null" data="todo">
-                            <template #fallback><section class="card h-full animate-pulse" role="status" aria-label="جارٍ تحميل مهامي الشخصية"><div class="h-5 w-40 rounded bg-slate-100"></div><div class="mt-4 h-24 rounded bg-slate-50"></div></section></template>
+                            <template #fallback><section class="card h-full animate-pulse" role="status" aria-label="جارٍ تحميل قائمتي الشخصية"><div class="h-5 w-40 rounded bg-slate-100"></div><div class="mt-4 h-24 rounded bg-slate-50"></div></section></template>
                             <section class="card h-full" aria-labelledby="home-todo-title">
                                 <div class="mb-3 flex items-center justify-between gap-2">
-                                    <h3 id="home-todo-title" class="card-title">قائمة مهامي الشخصية</h3>
+                                    <h3 id="home-todo-title" class="card-title">قائمتي الشخصية</h3>
                                     <Link href="/my/todo" class="text-xs font-semibold text-blue-700 hover:underline">كل مهامي</Link>
                                 </div>
                                 <p class="mb-3 text-xs text-slate-500">مفتوحة {{ number(todo?.open) }} · تستحق اليوم {{ number(todo?.today) }}<span v-if="todo?.overdue" class="font-semibold text-red-700"> · متأخرة {{ number(todo.overdue) }}</span></p>
@@ -593,16 +599,11 @@ const goToStart = () => document.getElementById('start-options')?.scrollIntoView
                         </section>
 
                         <section v-else-if="block.key === 'executive' && home.executive" class="card h-full">
-                            <h3 class="card-title mb-3">مؤشرات الجمعية</h3>
-                            <div class="grid grid-cols-3 gap-2 text-center">
-                                <div class="rounded-xl bg-blue-50 p-3"><p class="font-display text-2xl font-bold text-blue-800">{{ number(home.executive.inProgress) }}</p><p class="text-[11px] text-blue-800">قيد المعالجة</p></div>
-                                <div class="rounded-xl p-3" :class="home.executive.overdue ? 'bg-red-50' : 'bg-slate-50'"><p class="font-display text-2xl font-bold" :class="home.executive.overdue ? 'text-red-700' : 'text-slate-400'">{{ number(home.executive.overdue) }}</p><p class="text-[11px] text-slate-600">متأخرة</p></div>
-                                <div class="rounded-xl bg-emerald-50 p-3"><p class="font-display text-2xl font-bold text-emerald-700">{{ number(home.executive.completedThisMonth) }}</p><p class="text-[11px] text-emerald-800">أُنجزت هذا الشهر</p></div>
-                            </div>
+                            <h3 class="card-title mb-3">قرارات السياسات المعلّقة</h3>
                             <ul v-if="home.executive.decisions.length" class="mt-3 space-y-2">
                                 <li v-for="decision in home.executive.decisions" :key="decision.url"><Link :href="decision.url" class="alert-warning flex items-center justify-between gap-2 text-sm hover:opacity-90"><span>{{ decision.label }}</span><span aria-hidden="true">←</span></Link></li>
                             </ul>
-                            <p v-else class="mt-3 text-xs text-slate-500">لا توجد قرارات سياسات بانتظارك. طلبات الاعتماد تظهر في «يحتاج إجرائي الآن».</p>
+                            <p v-else class="mt-3 text-xs text-slate-500">لا توجد قرارات سياسات بانتظارك.</p>
                         </section>
 
                         <section v-else-if="block.key === 'team' && home.team" class="card h-full">
@@ -718,6 +719,17 @@ const goToStart = () => document.getElementById('start-options')?.scrollIntoView
                 </div>
             </section>
 
+            <details v-if="executiveWorkspace" class="rounded-xl border border-slate-200 bg-white p-4">
+                <summary class="cursor-pointer rounded text-sm font-semibold text-navy-800 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-blue-600">ميزانيات الأقسام والتفاصيل المالية</summary>
+                <div class="mt-4">
+                    <Deferred data="departmentBudgets">
+                        <template #fallback><div class="h-24 animate-pulse rounded-xl bg-slate-50" role="status" aria-label="جارٍ تحميل الميزانيات"></div></template>
+                        <template #rescue><p class="alert-error" role="alert">تعذر تحميل الميزانيات. <button type="button" class="underline" @click="router.reload({ only: ['departmentBudgets'] })">أعد المحاولة</button></p></template>
+                        <DepartmentBudgetSummary :summary="departmentBudgets" />
+                        <p v-if="!departmentBudgets?.items?.length" class="text-sm text-slate-500">لا توجد ميزانيات أقسام متاحة للعرض.</p>
+                    </Deferred>
+                </div>
+            </details>
         </div>
     </AppLayout>
 </template>

@@ -86,6 +86,7 @@ const iconPaths = { ...menuIconPaths, ...navigationIconPaths };
 function iconFor(item) {
     return navigationIcon(item, menuIconPaths);
 }
+// «مهامي» shows one number everywhere: workCounters.tasks is the count of the list on /tasks (TransactionTracker::taskCount).
 function pendingCount(item) {
     const key = { my_tasks: 'tasks', official_correspondence: 'correspondence' }[item.code];
     const count = key ? Number(page.props.workCounters?.[key]) : 0;
@@ -360,7 +361,7 @@ watch(() => page.props.flash?.success, value => {
                 <div class="flex shrink-0 items-center gap-1 sm:gap-2">
                     <QuickSearch />
                     <Link v-if="page.props.workCounters" href="/tasks" class="relative hidden rounded-lg px-2 py-1.5 text-xs font-semibold text-navy-700 hover:bg-navy-50 sm:inline-flex sm:items-center sm:gap-1"
-                        :aria-label="`مهامي الرسمية: ${page.props.workCounters.tasks} بانتظار إجرائي`">
+                        :aria-label="`مهامي: ${page.props.workCounters.tasks} بانتظار إجرائي`">
                         مهامي<span class="rounded-full px-1.5 text-[11px]" :class="page.props.workCounters.tasks ? 'bg-gold-500 text-white' : 'bg-slate-100 text-slate-500'">{{ page.props.workCounters.tasks }}</span>
                     </Link>
                     <ConnectionStatus />

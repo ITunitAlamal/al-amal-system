@@ -60,7 +60,7 @@
                             <label for="employee_number" class="field-label">الرقم الوظيفي</label>
                             <div class="employee-login-input-wrap">
                                 <svg class="employee-login-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="15" rx="3"/><path d="M8 3v4M16 3v4M15 12h3M15 16h3"/><circle cx="8.5" cy="12" r="2"/><path d="M5.5 17a3 3 0 0 1 6 0"/></svg>
-                                <input type="text" id="employee_number" name="employee_number" value="{{ old('employee_number') }}" class="field employee-login-input" dir="ltr" inputmode="text" placeholder="أدخل الرقم الوظيفي" required autofocus autocomplete="username"
+                                <input type="text" id="employee_number" name="employee_number" value="{{ old('employee_number') }}" class="field employee-login-input" dir="ltr" inputmode="text" placeholder="أدخل الرقم الوظيفي" required autocomplete="username"
                                     @error('employee_number') aria-invalid="true" aria-describedby="employee_number_error" @enderror>
                             </div>
                             @error('employee_number')

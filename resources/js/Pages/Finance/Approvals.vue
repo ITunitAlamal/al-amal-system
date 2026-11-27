@@ -5,7 +5,7 @@ import AppLayout from '../../Layouts/AppLayout.vue';
 import EmptyState from '../../Components/EmptyState.vue';
 import PageHeader from '../../Components/PageHeader.vue';
 
-const props = defineProps({ queue: Array, board: Boolean });
+const props = defineProps({ queue: Array, board: Boolean, cancellable: { type: Array, default: () => [] } });
 const items = ref(props.queue || []);
 const busy = ref(false);
 const message = ref('');
@@ -46,6 +46,27 @@ async function decline(item, decision) {
         busy.value = false;
     }
 }
+
+// The executive director cancels an approved purchase that will not be delivered (or its undelivered remainder), with a reason.
+const open = ref(props.cancellable || []);
+const reasons = ref({});
+async function cancel(item) {
+    const reason = (reasons.value[item.id] || '').trim();
+    if (busy.value || reason.length < 10) { error.value = 'اكتب سبب الإلغاء (10 أحرف على الأقل).'; return; }
+    if (!window.confirm(item.partial ? 'تأكيد إلغاء المتبقي غير المورَّد من أمر الشراء؟' : 'تأكيد إلغاء طلب الشراء المعتمد؟')) return;
+    busy.value = true;
+    message.value = '';
+    error.value = '';
+    try {
+        await axios.post(`/finance/purchases/${item.id}/cancel`, { reason });
+        open.value = open.value.filter(entry => entry.id !== item.id);
+        message.value = item.partial ? 'أُلغي المتبقي؛ يُفوتر الأمر ويُغلق على ما ورد فعلًا.' : 'أُلغي طلب الشراء ووُثّق السبب.';
+    } catch (exception) {
+        error.value = Object.values(exception.response?.data?.errors || {}).flat().join(' — ') || exception.response?.data?.message || 'تعذر الإلغاء';
+    } finally {
+        busy.value = false;
+    }
+}
 </script>
 
 <template>
@@ -77,6 +98,19 @@ async function decline(item, decision) {
                             <label class="min-w-56 flex-1"><span class="field-label">سبب الرفض أو الإعادة</span><input v-model="notes[item.url]" class="field" maxlength="2000" /></label>
                             <button type="button" :disabled="busy" class="btn btn-secondary btn-sm" @click="decline(item, 'return')">إعادة للمشتريات</button>
                             <button type="button" :disabled="busy" class="btn btn-danger btn-sm" @click="decline(item, 'reject')">رفض</button>
+                        </div>
+                    </li>
+                </ul>
+            </section>
+            <section v-if="open.length" class="card space-y-3">
+                <h2 class="card-title">مشتريات معتمدة لم يكتمل توريدها</h2>
+                <p class="text-sm text-slate-600">إن تعذر التوريد يُلغى الطلب وأمره الصادر، أو يُلغى المتبقي من أمر استُلم جزء منه، مع ذكر السبب.</p>
+                <ul class="divide-y divide-slate-100">
+                    <li v-for="item in open" :key="item.id" class="space-y-2 py-3">
+                        <p class="font-semibold text-navy-800">طلب الشراء {{ item.number }} <span class="text-sm font-normal text-slate-600">— {{ item.amount }} {{ item.currency }} — {{ item.order ? (item.partial ? 'أمر ' + item.order + ': استلام جزئي' : 'أمر ' + item.order + ': لم يُستلم شيء') : 'لم يصدر أمر شراء' }}</span></p>
+                        <div class="flex flex-wrap items-end gap-2">
+                            <label class="min-w-56 flex-1"><span class="field-label">سبب الإلغاء</span><input v-model="reasons[item.id]" class="field" maxlength="2000" /></label>
+                            <button type="button" :disabled="busy" class="btn btn-danger btn-sm" @click="cancel(item)">{{ item.partial ? 'إلغاء المتبقي' : 'إلغاء الطلب' }}</button>
                         </div>
                     </li>
                 </ul>
