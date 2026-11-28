@@ -13,10 +13,44 @@ use Illuminate\Support\Facades\Schema;
  * and the reports, so a chart slice and the filtered list count the same rows.
  *
  * Counting rule: one row per orphan file (orphans.id) or per guardian (orphan_guardians.id). Joins that could fan
- * out (addresses, links) are 1:1 by construction (one open current address per person) or wrapped in EXISTS.
+ * out are 1:1 by construction (the residence join below picks one address and one membership) or wrapped in EXISTS.
  */
 final class RegistryQueries
 {
+    /**
+     * The residence rule (as Registry::completeness): the person's own current address, else the current address of
+     * the household the person currently lives in. Joins that one address row as `$alias`; `{$alias}_hm` is the
+     * membership used (null when the person has an own address). With several open memberships it is the earliest one
+     * whose household has a current address, else the earliest one, so a second membership never doubles a row and
+     * the result agrees with completeness (an address on ANY current household counts). Shared by the registry, the
+     * dashboard, the reports and the campaign nomination facts.
+     */
+    public static function joinResidence(Builder $query, string $personColumn, string $alias = 'a'): Builder
+    {
+        [$own, $hm, $hx, $hh] = [$alias.'_own', $alias.'_hm', $alias.'_hx', $alias.'_hh'];
+        // true when the membership's household has no current address (false sorts first in the row comparison).
+        $homeless = fn (string $m, string $r): string => "not exists (select 1 from registry_addresses $r where $r.household_id = $m.household_id and $r.kind = 'current' and $r.ends_on is null)";
+
+        return $query
+            ->leftJoin("registry_addresses as $own", fn ($j) => $j->on("$own.person_id", '=', $personColumn)->where("$own.kind", 'current')->whereNull("$own.ends_on"))
+            ->leftJoin("household_members as $hm", fn ($j) => $j->on("$hm.person_id", '=', $personColumn)->whereNull("$own.id")->whereNull("$hm.ends_on")
+                // No better open membership: one whose household has an address, or the same standing and an earlier id.
+                // The id test first keeps the address lookups to people who really have two memberships.
+                ->whereRaw("not exists (select 1 from household_members $hx where $hx.person_id = $hm.person_id and $hx.ends_on is null and $hx.id <> $hm.id"
+                    .' and ('.$homeless($hx, $alias.'_hxa').", $hx.id) < (".$homeless($hm, $alias.'_hma').", $hm.id))"))
+            ->leftJoin("registry_addresses as $hh", fn ($j) => $j->on("$hh.household_id", '=', "$hm.household_id")->where("$hh.kind", 'current')->whereNull("$hh.ends_on"))
+            ->leftJoin("registry_addresses as $alias", "$alias.id", '=', DB::raw("coalesce($own.id, $hh.id)"));
+    }
+
+    /** Open displacement of the person, or of the household chosen by joinResidence() (same alias). */
+    public static function displacedSql(string $personColumn, string $alias = 'a'): string
+    {
+        // Two EXISTS (not one OR) so each side is a point lookup on its (owner, kind) index.
+        $open = fn (string $owner, string $column): string => "exists (select 1 from registry_addresses $owner where $owner.$column and $owner.kind = 'displacement' and $owner.ends_on is null)";
+
+        return '('.$open($alias.'_dp', "person_id = $personColumn").' or '.$open($alias.'_dh', "household_id = {$alias}_hm.household_id").')';
+    }
+
     public const ORPHAN_STATUS = ['draft' => 'مسودة', 'provisional' => 'معتمد مبدئيًا', 'active' => 'معتمد', 'suspended' => 'موقوف', 'archived' => 'مؤرشف', 'ended' => 'منتهٍ'];
 
     public const ISSUES = [
@@ -72,8 +106,7 @@ final class RegistryQueries
     /** Base orphan query with every filter applied; used for the list, counts and exports. */
     public function orphanQuery(array $filters): Builder
     {
-        $query = DB::table('orphans as o')->join('persons as p', 'p.id', '=', 'o.person_id')
-            ->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.person_id', '=', 'p.id')->where('a.kind', 'current')->whereNull('a.ends_on'))
+        $query = self::joinResidence(DB::table('orphans as o')->join('persons as p', 'p.id', '=', 'o.person_id'), 'p.id')
             ->leftJoin('master_data_values as gv', 'gv.id', '=', 'a.governorate_value_id')
             ->leftJoin('master_data_values as lv', 'lv.id', '=', 'a.locality_value_id')
             ->leftJoin('master_data_values as cv', 'cv.id', '=', 'o.orphan_class_value_id');
@@ -105,8 +138,7 @@ final class RegistryQueries
             default => null,
         };
         if (($filters['displaced'] ?? '') !== '') {
-            $exists = fn ($q) => $q->from('registry_addresses as d')->whereColumn('d.person_id', 'p.id')->where('d.kind', 'displacement')->whereNull('d.ends_on');
-            $filters['displaced'] === 'yes' ? $query->whereExists($exists) : $query->whereNotExists($exists);
+            $query->whereRaw(($filters['displaced'] === 'yes' ? '' : 'not ').self::displacedSql('p.id'));
         }
         if (! empty($filters['education'])) {
             $latest = '(select e.status_value_id from education_records e where e.orphan_id = o.id order by e.id desc limit 1)';
@@ -130,8 +162,7 @@ final class RegistryQueries
 
     public function guardianQuery(array $filters): Builder
     {
-        $query = DB::table('orphan_guardians as gg')->join('persons as p', 'p.id', '=', 'gg.person_id')
-            ->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.person_id', '=', 'p.id')->where('a.kind', 'current')->whereNull('a.ends_on'))
+        $query = self::joinResidence(DB::table('orphan_guardians as gg')->join('persons as p', 'p.id', '=', 'gg.person_id'), 'p.id')
             ->leftJoin('master_data_values as gv', 'gv.id', '=', 'a.governorate_value_id')
             ->leftJoin('master_data_values as lv', 'lv.id', '=', 'a.locality_value_id');
         $this->applyPerson($query, $filters, 'gg.reference_no');

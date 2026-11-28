@@ -3,6 +3,8 @@
 namespace App\Services\Configuration;
 
 use App\Models\User;
+use App\Services\Organization\Authority;
+use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 
 /** Presentation only: receives the already authorized menu and never creates a destination. */
@@ -69,16 +71,12 @@ final class NavigationPriorities
     public function contexts(User $user, array $menu): array
     {
         $assignments = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->leftJoin('departments as d', 'd.id', '=', 'a.department_id')
-            ->where('a.user_id', $user->id)
-            ->where(fn ($query) => $query->whereNull('a.department_id')->orWhere(fn ($department) => $department->where('d.is_active', true)->whereNull('d.deleted_at')))
-            ->where(fn ($query) => $query->whereNull('a.starts_on')->orWhere('a.starts_on', '<=', today()->toDateString()))
-            ->where(fn ($query) => $query->whereNull('a.ends_on')->orWhere('a.ends_on', '>=', today()->toDateString()))
+            ->where('a.user_id', $user->id)->whereRaw(EffectiveAssignments::sql('a'))
             ->orderBy('a.id')->get(['a.department_id', 'r.code']);
         if ($assignments->contains(fn (object $row): bool => $row->code === 'system_admin' && $row->department_id === null)) {
             return ['administrator'];
         }
-        if ($assignments->contains('code', 'executive_director')) {
+        if (app(Authority::class)->isExecutive($user)) {
             return ['executive'];
         }
 
@@ -91,8 +89,7 @@ final class NavigationPriorities
                 $seen[$id] = true;
                 $profile = self::DEPARTMENTS[$department->code ?? ''] ?? null;
                 if ($profile !== null) {
-                    $head = (int) ($department->head_user_id ?? 0) === (int) $user->id
-                        && $assignments->contains(fn (object $row): bool => $row->code === 'department_head' && (int) $row->department_id === (int) $id);
+                    $head = app(Authority::class)->isHeadOf($user, (int) $id);
                     $contexts[] = $profile === 'hr_staff' && $head ? 'hr_head' : $profile;
                     break;
                 }

@@ -5,7 +5,7 @@ namespace App\Services\Attendance;
 use App\Models\Employee;
 use App\Models\User;
 use App\Services\Hr\EmployeeAccess;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 
@@ -50,21 +50,15 @@ final class AttendanceAccess
     /** The appointed HR head: structure head of HR holding the «رئيس قسم» role there (as User::isHrDepartmentHead). */
     public function hrHeadId(): ?int
     {
-        $id = DB::table('departments as d')->join('users as u', 'u.id', '=', 'd.head_user_id')
-            ->join('department_user_roles as a', fn ($join) => $join->on('a.user_id', '=', 'u.id')->on('a.department_id', '=', 'd.id'))
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('d.code', 'HR')->where('d.is_active', true)->where('u.is_active', true)->where('r.code', 'department_head')
-            ->whereRaw(EffectiveAssignments::sql('a'))->value('u.id');
+        $department = DB::table('departments')->where('code', 'HR')->where('is_active', true)->whereNull('deleted_at')->value('id');
 
-        return $id === null ? null : (int) $id;
+        return $department === null ? null : app(Authority::class)->headId((int) $department);
     }
 
-    /** @return list<int> active holders of an effective executive_director assignment */
+    /** @return list<int> the executive director in office (Organization\Authority) */
     public function executiveIds(): array
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))
-            ->distinct()->pluck('a.user_id')->map(fn ($id): int => (int) $id)->all();
+        return app(Authority::class)->executiveIds();
     }
 
     /** Whether the user decides manual punch corrections at all (the rows are narrowed by correctionsToDecide). */

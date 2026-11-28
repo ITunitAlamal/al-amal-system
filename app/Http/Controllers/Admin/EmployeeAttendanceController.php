@@ -149,8 +149,9 @@ final class EmployeeAttendanceController extends Controller
 
     private function authorizedEmployee(Request $request, int $employee): Employee
     {
-        $record = Employee::query()->findOrFail($employee);
-        abort_unless($request->user() && $this->access->canView($request->user(), $record) && ($this->access->sections($request->user(), $record)['attendance'] ?? false), 403);
+        // One 403 for a missing and a forbidden id (AC-07), so employee ids cannot be mapped.
+        $record = Employee::query()->find($employee);
+        abort_unless($record && $request->user() && $this->access->canView($request->user(), $record) && ($this->access->sections($request->user(), $record)['attendance'] ?? false), 403);
 
         return $record;
     }

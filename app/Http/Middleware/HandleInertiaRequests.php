@@ -2,8 +2,10 @@
 
 namespace App\Http\Middleware;
 
+use App\Services\Audit\AuditScope;
 use App\Services\Configuration\NavigationBuilder;
 use App\Services\Correspondence\CorrespondenceAccess;
+use App\Services\Hr\EmployeeAccess;
 use App\Services\Notifications\NotificationCenter;
 use App\Services\Portal\PortalNotifier;
 use App\Services\Progress\TransactionTracker;
@@ -59,23 +61,20 @@ class HandleInertiaRequests extends Middleware
                     ]
                     : null,
 
-                'permissions' => fn () => $request->user()
-                    ? [
-                        'is_system_admin' => $request->user()->isSystemAdmin(),
-
-                        'can_manage_organization' => $request->user()->canManageOrganization(),
-
-                        'can_manage_employees' => $request->user()->canManageEmployees(),
-
-                        'can_manage_financial_settings' => $request->user()->isSystemAdmin(),
-
-                        'can_view_audit_logs' => $request->user()->isSystemAdmin(),
-                    ]
+                // Display hints only; every page and action decides on the server. Each flag is the module's own
+                // access rule (AC-12), never a role guess: the audit log follows AuditScope (system admin, executive
+                // director, appointed heads). Finance pages get their flags from FinanceGuard::uiPermissions.
+                'permissions' => fn () => ($user = $request->user('web'))
+                    ? $user->withSystemAdminSnapshot(fn (): array => [
+                        'is_system_admin' => $user->isSystemAdmin(),
+                        'can_manage_organization' => $user->canManageOrganization(),
+                        'can_manage_employees' => app(EmployeeAccess::class)->canManage($user),
+                        'can_view_audit_logs' => app(AuditScope::class)->allows($user),
+                    ])
                     : [
                         'is_system_admin' => false,
                         'can_manage_organization' => false,
                         'can_manage_employees' => false,
-                        'can_manage_financial_settings' => false,
                         'can_view_audit_logs' => false,
                     ],
             ],

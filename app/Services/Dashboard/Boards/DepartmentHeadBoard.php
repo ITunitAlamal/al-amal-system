@@ -3,12 +3,13 @@
 namespace App\Services\Dashboard\Boards;
 
 use App\Models\User;
+use App\Services\Organization\Authority;
 use App\Services\WorkflowVisibilityService;
 use Illuminate\Support\Facades\DB;
 
 /**
- * رئيس القسم — which requests of my department are stuck or late. Counts follow the organization (departments.head_user_id
- * and its units); confidential workflows (complaints) are never counted for the head.
+ * رئيس القسم — which requests of my department are stuck or late. Counts follow the organization (the departments the
+ * user validly heads, Organization\Authority, and their units); confidential workflows (complaints) are never counted for the head.
  */
 final class DepartmentHeadBoard
 {
@@ -23,8 +24,9 @@ final class DepartmentHeadBoard
     public static function departments(User $user, array $covered = []): array
     {
         $skip = array_keys(array_filter(self::SPECIALIZED, fn (string $kind): bool => in_array($kind, $covered, true)));
+        $headed = app(Authority::class)->headedDepartmentIds($user);
 
-        return DB::table('departments')->where('head_user_id', $user->id)->where('is_active', true)->whereNull('deleted_at')
+        return $headed === [] ? [] : DB::table('departments')->whereIn('id', $headed)
             ->whereNotIn('code', $skip ?: [''])->orderBy('name')->get(['id', 'code', 'name'])->all();
     }
 

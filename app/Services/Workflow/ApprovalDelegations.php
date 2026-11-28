@@ -5,6 +5,7 @@ namespace App\Services\Workflow;
 use App\Models\User;
 use App\Services\AuditService;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -47,27 +48,17 @@ final class ApprovalDelegations
             ->where('d.starts_on', '<=', $today)
             ->where(fn ($query) => $query->whereNull('d.ends_on')->orWhere('d.ends_on', '>=', $today))
             ->where('delegate.is_active', true)
-            ->whereExists(fn ($query) => $query->selectRaw('1')
-                ->from('department_user_roles as a')
-                ->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->join('users as issuer', 'issuer.id', '=', 'a.user_id')
-                ->whereColumn('a.user_id', 'd.delegator_user_id')
-                ->where('r.code', 'executive_director')
-                ->whereRaw(EffectiveAssignments::sql('a'))
-                ->where('issuer.is_active', true))
+            // Its issuer is still the executive director in office (Organization\Authority).
+            ->whereIn('d.delegator_user_id', app(Authority::class)->executiveIds())
             ->value('d.delegate_user_id');
 
         return $delegateId === null ? null : (int) $delegateId;
     }
 
+    /** The executive director in office (Organization\Authority). */
     public function isExecutive(User $user): bool
     {
-        return $user->is_active && DB::table('department_user_roles as a')
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $user->id)
-            ->where('r.code', 'executive_director')
-            ->whereRaw(EffectiveAssignments::sql('a'))
-            ->exists();
+        return app(Authority::class)->isExecutive($user);
     }
 
     /**
@@ -154,14 +145,16 @@ final class ApprovalDelegations
     }
 
     /**
-     * Closes delegations that are no longer in force (period ended, delegate deactivated, or issuer no longer
-     * the executive director) and returns their open requests. Run by the scheduled workflow check.
+     * Closes delegations that are no longer in force (period ended, delegate deactivated, another executive
+     * director in office, or, while the seat is vacant, the issuer lost his role or account) and returns their
+     * open requests. Run by the scheduled workflow check.
      *
      * @return int number of delegations closed
      */
     public function closeLapsed(?string $scope = null): int
     {
         $today = now()->toDateString();
+        $executiveIds = app(Authority::class)->executiveIds();
         $lapsed = DB::table('approval_delegations as d')
             ->join('users as delegate', 'delegate.id', '=', 'd.delegate_user_id')
             ->where('d.status', 'active')
@@ -169,14 +162,18 @@ final class ApprovalDelegations
             ->where(fn ($query) => $query
                 ->where('d.ends_on', '<', $today)
                 ->orWhere('delegate.is_active', false)
-                ->orWhereNotExists(fn ($issuer) => $issuer->selectRaw('1')
+                // Another executive director is in office (handover): the outgoing one's delegations lapse.
+                ->when($executiveIds !== [], fn ($issuer) => $issuer->orWhereNotIn('d.delegator_user_id', $executiveIds))
+                // The seat is vacant: activeDelegate() already suspends the delegate, so lapse permanently only
+                // when the issuer lost his own executive director role or his account, not on a seat gap alone.
+                ->when($executiveIds === [], fn ($issuer) => $issuer->orWhereNotExists(fn ($role) => $role->selectRaw('1')
                     ->from('department_user_roles as a')
                     ->join('roles as r', 'r.id', '=', 'a.role_id')
                     ->join('users as u', 'u.id', '=', 'a.user_id')
                     ->whereColumn('a.user_id', 'd.delegator_user_id')
                     ->where('r.code', 'executive_director')
                     ->whereRaw(EffectiveAssignments::sql('a'))
-                    ->where('u.is_active', true)))
+                    ->where('u.is_active', true))))
             ->pluck('d.id');
 
         foreach ($lapsed as $id) {

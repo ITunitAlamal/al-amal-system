@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Models\User;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
@@ -46,50 +46,32 @@ final class LeaveApproverResolver
         if (! $employee) {
             return null;
         }
-        $headId = $employee->department_id
-            ? DB::table('departments')->where('id', $employee->department_id)->value('head_user_id')
-            : null;
-        $isHead = $headId && (int) $headId === (int) $leave->requested_by;
-        if ($employee->department_id && ! $isHead) {
-            // The head counts only with an effective department_head appointment there; otherwise no approver (never the ED).
-            $head = DB::table('departments as d')
-                ->join('users as u', 'u.id', '=', 'd.head_user_id')
-                ->join('department_user_roles as a', fn ($join) => $join->on('a.user_id', '=', 'u.id')->on('a.department_id', '=', 'd.id'))
-                ->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->where('d.id', $employee->department_id)->where('u.is_active', true)->where('r.code', 'department_head')
-                ->whereRaw(EffectiveAssignments::sql('a'))->value('u.id');
-
-            if ($head === null && $headId && $this->isExecutive((int) $headId)) {
+        $departmentId = $employee->department_id ? (int) $employee->department_id : null;
+        // The head counts only with an effective department_head appointment there (Organization\Authority).
+        $head = app(Authority::class)->headId($departmentId);
+        if ($departmentId !== null && $head !== (int) $leave->requested_by) {
+            $seat = DB::table('departments')->where('id', $departmentId)->value('head_user_id');
+            if ($head === null && $seat && $this->isExecutive((int) $seat)) {
                 return $this->executiveId(); // the executive office: its head is the executive director
             }
 
-            return $head === null ? null : (int) $head;
+            // Otherwise no approver when the department has no valid head (never the ED).
+            return $head;
         }
 
         return $this->executiveId();
     }
 
+    /** The executive director in office (Organization\Authority). */
     public function isExecutive(int $userId): bool
     {
-        return DB::table('department_user_roles as a')
-            ->join('roles as role', 'role.id', '=', 'a.role_id')
-            ->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('a.user_id', $userId)->where('role.code', 'executive_director')
-            ->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->exists();
+        return app(Authority::class)->isExecutive($userId);
     }
 
+    /** The one executive director in office, or null (Organization\Authority). */
     public function executiveId(): ?int
     {
-        $ids = DB::table('department_user_roles as a')
-            ->join('roles as role', 'role.id', '=', 'a.role_id')
-            ->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('role.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))
-            ->distinct()->pluck('a.user_id');
-        if ($ids->count() !== 1) {
-            return null;
-        }
-
-        return (int) $ids->first();
+        return app(Authority::class)->executiveId();
     }
 
     /**

@@ -233,7 +233,9 @@ final class WorkflowEngine
                     app(AimsRequestReferences::class)->assert($instance, $definitionCode, $values);
                 }
                 // A cancelled or sent-back pass stops being the request's current state (before this action saves its own).
-                $this->clearRewoundPass($instance, $transition, $definitionCode, $actor->id);
+                if (in_array($transition->action_code, self::REWINDING_ACTIONS, true)) {
+                    $this->clearRewoundPass($instance, (int) $transition->to_step_id, $definitionCode, $actor->id, (string) $transition->action_code);
+                }
                 $this->fields->save(CustomFieldEntities::AIMS_REQUEST, (int) $instance->subject_id, $definitions, $values, $actor->id);
                 // A copy kept with the event, so each pass keeps its own worker, time or document number.
                 $recorded = $this->fields->actionRecord($definitions, $values, (string) $transition->action_code);
@@ -257,26 +259,38 @@ final class WorkflowEngine
      * events: the worker of the field job, its completion time, a document number) is no longer current: the
      * stored values are cleared, so the page, the dashboards, conditions and indicators stop reading them. The
      * events keep every value, and an audit row names the cleared fields; nothing recorded is rewritten.
+     *
+     * A reopening («إعادة فتح») rewinds the same way to the stage it returns to, except that what the locked stages
+     * recorded (a stock issue, a payment, a receipt: $keptStepIds) stays current, since a reopening never repeats them.
+     *
+     * @param  array<int, string>  $keptStepIds  step id => step code of stages whose recorded fields are kept
      */
-    private function clearRewoundPass(object $instance, object $transition, string $definitionCode, int $actorId): void
+    private function clearRewoundPass(object $instance, int $targetStepId, string $definitionCode, int $actorId, string $action, array $keptStepIds = []): void
     {
-        if (! in_array($transition->action_code, self::REWINDING_ACTIONS, true)) {
-            return;
-        }
         $lastLeft = DB::table('workflow_events')->where('workflow_instance_id', $instance->id)
-            ->where('from_step_id', $transition->to_step_id)->whereNotNull('workflow_transition_id')->max('id');
+            ->where('from_step_id', $targetStepId)->whereNotNull('workflow_transition_id')->max('id');
         if ($lastLeft === null) {
             return; // the target was never left before: nothing is being undone
         }
         $events = DB::table('workflow_events')->where('workflow_instance_id', $instance->id)->where('id', '>=', $lastLeft)
-            ->whereNotNull('workflow_transition_id')->whereNotNull('metadata')->orderBy('id')->get(['id', 'metadata']);
+            ->whereNotNull('workflow_transition_id')->whereNotNull('metadata')->orderBy('id')->get(['id', 'from_step_id', 'metadata']);
         $codes = [];
         $eventIds = [];
         foreach ($events as $event) {
+            if (isset($keptStepIds[(int) $event->from_step_id])) {
+                continue;
+            }
             foreach (CustomFieldService::eventFields($event->metadata) as $field) {
                 $codes[$field['code']] = true;
                 $eventIds[(int) $event->id] = true;
             }
+        }
+        if ($keptStepIds !== [] && $codes !== []) {
+            // A field attached to a locked stage is never cleared, even when a later action recorded the same code.
+            $kept = DB::table('custom_field_definitions')->where('entity_type', CustomFieldEntities::AIMS_REQUEST)
+                ->whereIn('scope_key', array_values(array_unique(['', $definitionCode])))
+                ->whereIn('step_code', array_values(array_unique($keptStepIds)))->pluck('code')->all();
+            $codes = array_diff_key($codes, array_flip($kept));
         }
         $cleared = $this->fields->clearValues(CustomFieldEntities::AIMS_REQUEST, (int) $instance->subject_id, $definitionCode, array_keys($codes), $actorId);
         if ($cleared !== []) {
@@ -284,7 +298,7 @@ final class WorkflowEngine
             app(AuditService::class)->event('workflow.fields.cleared', [
                 'subject_type' => 'aims_requests', 'subject_id' => (string) $instance->subject_id, 'subject_ref' => $instance->reference_no,
                 'actor_id' => $actorId,
-                'metadata' => ['fields' => $cleared, 'action' => $transition->action_code, 'recorded_in_events' => array_keys($eventIds), 'workflow_instance_id' => (int) $instance->id],
+                'metadata' => ['fields' => $cleared, 'action' => $action, 'recorded_in_events' => array_keys($eventIds), 'workflow_instance_id' => (int) $instance->id],
             ]);
         }
     }
@@ -378,7 +392,8 @@ final class WorkflowEngine
     /**
      * The executive director reopens a completed request when a gap is found after closing (ED requirements
      * doc §5 «إعادة فتح»; SRS §3.1.2.3): the reason, the authority and the stage it returns to are recorded.
-     * Module records (e.g. an approved leave) are corrected by their own reversal procedures instead.
+     * The fields recorded since the request last left that stage are cleared as for a return (clearRewoundPass),
+     * except those of the locked stages. Module records (e.g. an approved leave) are corrected by their own reversal procedures instead.
      */
     public function reopen(int $instanceId, User $actor, int $stepId, string $reason): void
     {
@@ -403,6 +418,10 @@ final class WorkflowEngine
             if ($candidates === []) {
                 throw ValidationException::withMessages(['step_id' => "لا يوجد مستخدم مؤهل لتنفيذ مرحلة «{$target->name}»."]);
             }
+            // What the passes after the reopened stage recorded is no longer current (as for a return); the locked
+            // stages' records (issue, payment, receipt) stay, since the reopening never returns before them.
+            $versionSteps = DB::table('workflow_steps')->where('workflow_version_id', $instance->workflow_version_id)->get(['id', 'code', 'assignment_config']);
+            $this->clearRewoundPass($instance, (int) $target->id, $this->definitionCode((int) $instance->workflow_version_id), $actor->id, 'reopen', $this->lockedSteps($versionSteps));
 
             $now = now();
             $requesterId = (int) $instance->requested_by;
@@ -440,9 +459,8 @@ final class WorkflowEngine
     public function reopenTargets(object $instance): array
     {
         $steps = DB::table('workflow_steps')->where('workflow_version_id', $instance->workflow_version_id)
-            ->whereIn('step_type', ['start', 'task', 'decision'])->orderBy('sort_order')->get(['id', 'name', 'assignment_config']);
-        $locked = $steps->filter(fn (object $step): bool => ($this->assignees->config($step)['reopen_locked'] ?? false) === true)
-            ->pluck('id')->map(fn ($id): int => (int) $id)->all();
+            ->whereIn('step_type', ['start', 'task', 'decision'])->orderBy('sort_order')->get(['id', 'code', 'name', 'assignment_config']);
+        $locked = array_keys($this->lockedSteps($steps));
         $reachedAfter = null;
         if ($locked !== []) {
             $events = DB::table('workflow_events')->where('workflow_instance_id', $instance->id)
@@ -460,6 +478,24 @@ final class WorkflowEngine
 
         return $steps->filter(fn (object $step): bool => $reachedAfter === null || isset($reachedAfter[(int) $step->id]))
             ->map(fn (object $step): object => (object) ['id' => (int) $step->id, 'name' => $step->name])->values()->all();
+    }
+
+    /**
+     * The stages marked "reopen_locked" among the given steps of one version.
+     *
+     * @param  iterable<object>  $steps  rows with id, code and assignment_config
+     * @return array<int, string> step id => step code
+     */
+    private function lockedSteps(iterable $steps): array
+    {
+        $locked = [];
+        foreach ($steps as $step) {
+            if (($this->assignees->config($step)['reopen_locked'] ?? false) === true) {
+                $locked[(int) $step->id] = (string) $step->code;
+            }
+        }
+
+        return $locked;
     }
 
     /**

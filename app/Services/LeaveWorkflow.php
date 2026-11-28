@@ -6,7 +6,7 @@ namespace App\Services;
 
 use App\Models\Employee;
 use App\Models\User;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use App\Services\Workflow\AssigneeResolver;
 use App\Services\Workflow\WorkflowEngine;
 use App\Services\Workflow\WorkflowSubject;
@@ -17,7 +17,7 @@ use Illuminate\Validation\ValidationException;
  * Leave requests on the workflow engine (leave approval mode "workflow", owner decisions of 2026-10-22).
  *
  * The leave settings name three workflows: employees, department heads, and the executive director. A department
- * head is whoever heads an active department in the organization (departments.head_user_id), the HR head
+ * head is whoever validly heads an active department (departments.head_user_id with the «رئيس قسم» role there), the HR head
  * included, so one person heading several departments is covered. The executive director's own leave is
  * approved by a decision of the board of directors, recorded by the board secretary (owner decision 2026-10-22);
  * nobody approves their own leave.
@@ -40,16 +40,16 @@ final class LeaveWorkflow implements WorkflowSubject
         private readonly AssigneeResolver $assignees,
     ) {}
 
+    /** Validly heads at least one department: the seat with the «رئيس قسم» role there (Organization\Authority). */
     public function isHead(User $user): bool
     {
-        return DB::table('departments')->where('head_user_id', $user->id)
-            ->where('is_active', true)->whereNull('deleted_at')->exists();
+        return app(Authority::class)->isHead($user);
     }
 
+    /** The executive director in office (Organization\Authority). */
     public function isExecutive(User $user): bool
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $user->id)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists();
+        return app(Authority::class)->isExecutive($user);
     }
 
     /**

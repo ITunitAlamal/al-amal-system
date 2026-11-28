@@ -13,6 +13,7 @@ use App\Services\Finance\FinanceGuard;
 use App\Services\Hr\EmployeeAccess;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\Kpi\KpiScope;
+use App\Services\Organization\Authority;
 use App\Services\Organization\StructureChanges;
 use App\Services\Orphans\OrphanAccess;
 use Illuminate\Support\Facades\DB;
@@ -138,8 +139,8 @@ final class NavigationAccessRules
             'audit_viewer' => app(AuditScope::class)->allows($user),
             'manage_employees' => $user->canManageEmployees(),
             'employee_files' => app(EmployeeAccess::class)->canOpenFiles($user),
-            'org_structure' => $user->canManageOrganization() || $this->hasRole($user, 'executive_director') || app(StructureChanges::class)->headedDepartments($user) !== [],
-            'attendance_access' => $user->canManageEmployees() || $this->hasRole($user, 'executive_director'),
+            'org_structure' => $user->canManageOrganization() || app(Authority::class)->isExecutive($user) || app(StructureChanges::class)->headedDepartments($user) !== [],
+            'attendance_access' => $user->canManageEmployees() || app(Authority::class)->isExecutive($user),
             'shift_roster' => app(AttendanceShiftRoster::class)->canOpen($user),
             'monthly_attendance' => app(AttendanceMonthlySummary::class)->scope($user) !== [],
             'hr_dashboard' => HrServicesDashboard::canView($user),
@@ -149,7 +150,7 @@ final class NavigationAccessRules
             'orphans_staff' => app(OrphanAccess::class)->canView($user),
             'orphans_campaigns' => app(OrphanAccess::class)->canOpenCampaigns($user),
             'orphans_settings' => app(OrphanAccess::class)->canManageSettings($user),
-            'approval_delegations' => $user->isSystemAdmin() || $this->hasRole($user, 'executive_director')
+            'approval_delegations' => $user->isSystemAdmin() || app(Authority::class)->isExecutive($user)
                 || DB::table('approval_delegations')->where('delegate_user_id', $user->id)->where('status', 'active')->exists(),
             default => false,
         };
@@ -225,11 +226,6 @@ final class NavigationAccessRules
         }
 
         return false;
-    }
-
-    private function hasRole(User $user, string $roleCode): bool
-    {
-        return $user->roleAssignments()->effective()->whereHas('role', fn ($query) => $query->where('code', $roleCode))->exists();
     }
 
     private function isActiveEmployee(User $user): bool

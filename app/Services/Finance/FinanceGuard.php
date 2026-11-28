@@ -3,7 +3,7 @@
 namespace App\Services\Finance;
 
 use App\Models\User;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -126,33 +126,10 @@ final class FinanceGuard
      */
     public const HEAD_PERMISSIONS = ['finance.view', 'finance.monitor', 'finance.reports.view', 'finance.report.export', 'finance.staff.assign'];
 
-    /** @var array<int, bool> */
-    private array $heads = [];
-
+    /** The appointed head of «الحسابات»: the structure seat with the «رئيس قسم» role held there (Organization\Authority). */
     public function isAppointedHead(?User $user): bool
     {
-        if (! $user) {
-            return false;
-        }
-
-        return $this->heads[$user->id] ??= $this->holdsStructuralSeat($user, 'id', $this->departmentId(), 'department_head');
-    }
-
-    /**
-     * head_user_id of the department plus an effective assignment of the matching role in that department, as
-     * User::headedDepartmentId and OrphanAccess::isDesignatedExecutive require. head_user_id alone is not enough.
-     */
-    private function holdsStructuralSeat(User $user, string $column, int|string|null $value, string $role): bool
-    {
-        if ($value === null) {
-            return false;
-        }
-
-        return DB::table('departments as d')->where("d.$column", $value)->where('d.head_user_id', $user->id)->whereNull('d.deleted_at')
-            ->whereExists(fn ($q) => $q->selectRaw('1')->from('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->whereColumn('a.department_id', 'd.id')->whereColumn('a.user_id', 'd.head_user_id')->where('r.code', $role)
-                ->whereRaw(EffectiveAssignments::sql('a')))
-            ->exists();
+        return $user !== null && app(Authority::class)->isHeadOf($user, $this->departmentId());
     }
 
     /**
@@ -162,31 +139,21 @@ final class FinanceGuard
      */
     public const EXECUTIVE_PERMISSIONS = ['finance.procurement.director_approve', 'finance.payroll.authorize'];
 
-    /** @var array<int, bool> */
-    private array $executives = [];
-
+    /** The executive director in office: the EXEC seat with an effective executive_director assignment there (Organization\Authority). */
     public function isExecutiveDirector(?User $user): bool
     {
-        if (! $user) {
-            return false;
-        }
-
-        return $this->executives[$user->id] ??= $this->holdsStructuralSeat($user, 'code', 'EXEC', 'executive_director');
+        return app(Authority::class)->isExecutive($user);
     }
 
     /**
-     * The one definition of the executive director in Accounts, as a list: the active users isExecutiveDirector()
-     * accepts (appointed head of EXEC with an effective executive_director assignment there). A user who keeps the
-     * role after a new appointment, or holds it as acting without the seat, is not one.
+     * The executive director in office as a list (Organization\Authority::executiveIds). A user who keeps the role
+     * after a new appointment, or holds it as acting without the seat, is not one.
      *
      * @return list<int>
      */
     public function executiveDirectorIds(): array
     {
-        $candidates = DB::table('departments')->where('code', 'EXEC')->whereNull('deleted_at')->whereNotNull('head_user_id')->pluck('head_user_id');
-
-        return User::whereIn('id', $candidates)->where('is_active', true)->get()
-            ->filter(fn (User $user): bool => $this->isExecutiveDirector($user))->map(fn (User $user): int => (int) $user->id)->values()->all();
+        return app(Authority::class)->executiveIds();
     }
 
     private ?int $departmentId = null;

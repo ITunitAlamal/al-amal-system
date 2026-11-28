@@ -3,6 +3,7 @@
 namespace App\Services\Orphans;
 
 use App\Models\User;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 
@@ -57,24 +58,20 @@ final class OrphanAccess
         });
     }
 
-    /** Holds an effective executive_director assignment (read access to decision material). */
+    /** The executive director in office (Organization\Authority): read access to decision material. */
     public function isExecutive(?User $user): bool
     {
-        return $this->remember($user, 'executive', fn (User $u): bool => DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $u->id)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists());
+        return $this->remember($user, 'executive', fn (User $u): bool => app(Authority::class)->isExecutive($u));
     }
 
     /**
-     * The original, officially designated executive director: the appointed head of EXEC who also holds an effective
-     * executive_director assignment in EXEC. No delegation, acting role or technical role passes this check.
+     * The officially designated executive director (campaign list decisions): the appointed head of EXEC who also
+     * holds an effective executive_director assignment in EXEC. No delegation, acting role or technical role passes
+     * this check. The one definition (Organization\Authority) is this seat rule, so it equals isExecutive().
      */
     public function isDesignatedExecutive(?User $user): bool
     {
-        return $this->remember($user, 'designated_executive', fn (User $u): bool => DB::table('departments as d')
-            ->join('department_user_roles as a', fn ($j) => $j->on('a.user_id', '=', 'd.head_user_id')->on('a.department_id', '=', 'd.id'))
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('d.code', 'EXEC')->whereNull('d.deleted_at')->where('d.head_user_id', $u->id)->where('r.code', 'executive_director')
-            ->whereRaw(EffectiveAssignments::sql('a'))->exists());
+        return $this->isExecutive($user);
     }
 
     /**
@@ -101,15 +98,14 @@ final class OrphanAccess
             if (! $department) {
                 return false;
             }
-            $today = today()->toDateString();
-            $roles = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-                ->where('a.user_id', $u->id)->where('a.department_id', $department)->whereRaw(EffectiveAssignments::sql('a'))->get(['r.code', 'a.starts_on', 'a.ends_on']);
-            $appointed = (int) DB::table('departments')->where('id', $department)->value('head_user_id') === (int) $u->id
-                && $roles->contains(fn ($row): bool => $row->code === 'department_head');
-            $acting = $roles->contains(fn ($row): bool => $row->code === 'acting_department_head' && $row->starts_on && $row->ends_on
-                && $row->starts_on <= $today && $row->ends_on >= $today);
+            if (app(Authority::class)->isHeadOf($u, (int) $department)) {
+                return true;
+            }
 
-            return $appointed || $acting;
+            // A dated acting head counts here until the owner decides the acting rule organization-wide (RBAC-02).
+            return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
+                ->where('a.user_id', $u->id)->where('a.department_id', $department)->where('r.code', 'acting_department_head')
+                ->whereNotNull('a.starts_on')->whereNotNull('a.ends_on')->whereRaw(EffectiveAssignments::sql('a'))->exists();
         });
     }
 
@@ -121,9 +117,8 @@ final class OrphanAccess
                 return false;
             }
 
-            return in_array((int) $u->department_id, $tree, true) || DB::table('department_user_roles')->where('user_id', $u->id)->whereIn('department_id', $tree)
-                ->where(fn ($q) => $q->whereNull('starts_on')->orWhere('starts_on', '<=', today()->toDateString()))
-                ->where(fn ($q) => $q->whereNull('ends_on')->orWhere('ends_on', '>=', today()->toDateString()))->exists();
+            return in_array((int) $u->department_id, $tree, true)
+                || EffectiveAssignments::apply(DB::table('department_user_roles')->where('user_id', $u->id)->whereIn('department_id', $tree))->exists();
         });
     }
 
@@ -230,9 +225,10 @@ final class OrphanAccess
         if ($tree === []) {
             return [];
         }
-        $ids = DB::table('department_user_roles')->whereIn('department_id', $tree)->pluck('user_id')
+        // Role rows count only while effective (EffectiveAssignments), as in every other authority check.
+        $ids = EffectiveAssignments::apply(DB::table('department_user_roles')->whereIn('department_id', $tree))->pluck('user_id')
             ->merge(DB::table('users')->whereIn('department_id', $tree)->pluck('id'))
-            ->push(DB::table('departments')->where('id', $this->departmentId())->value('head_user_id'))->filter()->unique();
+            ->merge($this->headUserIds())->filter()->unique();
 
         return DB::table('users')->whereIn('id', $ids)->where('is_active', true)->orderBy('name')->get(['id', 'name'])
             ->map(fn ($u): array => ['id' => (int) $u->id, 'name' => $u->name])->all();
@@ -252,14 +248,10 @@ final class OrphanAccess
         return User::query()->whereIn('id', $candidates)->get()->filter(fn (User $u): bool => $this->isHead($u))->map(fn (User $u): int => (int) $u->id)->values()->all();
     }
 
-    /** The designated executive director (campaign list decisions), within effective dates. @return list<int> */
+    /** The designated executive director (campaign list decisions): Organization\Authority::executiveIds. @return list<int> */
     public function executiveUserIds(): array
     {
-        return DB::table('departments as d')->join('users as u', 'u.id', '=', 'd.head_user_id')
-            ->join('department_user_roles as a', fn ($j) => $j->on('a.user_id', '=', 'd.head_user_id')->on('a.department_id', '=', 'd.id'))
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('d.code', 'EXEC')->whereNull('d.deleted_at')->where('r.code', 'executive_director')->where('u.is_active', true)
-            ->whereRaw(EffectiveAssignments::sql('a'))->pluck('u.id')->map(fn ($id) => (int) $id)->unique()->values()->all();
+        return app(Authority::class)->executiveIds();
     }
 
     /** Logs a read of a protected record (who, what, when), never its content. */

@@ -3,15 +3,16 @@
 namespace App\Services\Kpi;
 
 use App\Models\User;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use App\Services\Organization\ScopedDelegations;
 use Illuminate\Support\Facades\DB;
 
 /**
  * Who the viewer answers for, resolved from the live organization on every request (never cached):
- * - institution-wide: the system administrator, the executive director, or a role holding kpi.view
- *   assigned without a department;
- * - otherwise the departments they head (departments.head_user_id) or hold a kpi.view role in,
+ * - institution-wide: the system administrator, the executive director in office (Organization\Authority), or a
+ *   role holding kpi.view assigned without a department;
+ * - otherwise the departments they validly head (Organization\Authority) or hold a kpi.view role in,
  *   with their active sub-units.
  * Approval delegations grant decisions, not data access, so they add nothing here.
  */
@@ -49,7 +50,7 @@ final class KpiScope
 
         $administrator = $assignments->contains(fn (object $a): bool => $a->code === 'system_admin' && $a->department_id === null);
         $institutional = $administrator
-            || $assignments->contains(fn (object $a): bool => $a->code === 'executive_director')
+            || app(Authority::class)->isExecutive($user)
             || $assignments->contains(fn (object $a): bool => $a->department_id === null && in_array($a->code, $kpiRoles, true));
 
         $tree = DB::table('departments')->where('is_active', true)->whereNull('deleted_at')->pluck('parent_id', 'id')
@@ -58,8 +59,7 @@ final class KpiScope
         if ($institutional) {
             $departments = array_keys($tree);
         } else {
-            $direct = DB::table('departments')->where('head_user_id', $user->id)->where('is_active', true)->whereNull('deleted_at')
-                ->pluck('id')->map(fn ($id): int => (int) $id)->all();
+            $direct = app(Authority::class)->headedDepartmentIds($user);
             foreach ($assignments as $assignment) {
                 if ($assignment->department_id !== null && in_array($assignment->code, $kpiRoles, true)) {
                     $direct[] = (int) $assignment->department_id;

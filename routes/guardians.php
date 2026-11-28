@@ -18,6 +18,8 @@ Route::middleware(ProtectOrphanResponses::class)->prefix('guardian')->name('guar
     Route::post('/login', [Portal::class, 'login'])->middleware('throttle:5,1,guardian-login')->name('login.store');
     Route::get('/register', [Portal::class, 'form'])->name('register');
     Route::post('/register', [Portal::class, 'register'])->middleware('throttle:5,1,guardian-register')->name('register.store');
+    Route::post('/register/verify', [Portal::class, 'verifySignup'])->middleware('throttle:10,10,guardian-signup-verify')->name('register.verify');
+    Route::post('/register/restart', [Portal::class, 'restartSignup'])->name('register.restart');
     Route::get('/forgot-password', [Portal::class, 'forgotForm'])->name('password.forgot');
     Route::post('/forgot-password', [Portal::class, 'forgotSend'])->middleware('throttle:3,10,guardian-forgot')->name('password.send');
     Route::post('/reset-password', [Portal::class, 'resetPassword'])->middleware('throttle:6,10,guardian-reset')->name('password.reset');

@@ -8,7 +8,7 @@ use App\Services\Configuration\NavigationBuilder;
 use App\Services\Finance\FinanceApprovalQueue;
 use App\Services\Finance\FinanceGuard;
 use App\Services\Hr\HrServicesDashboard;
-use App\Services\LeaveApproverResolver;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use App\Services\Rentals\RentalsDashboard;
 use Illuminate\Support\Facades\DB;
@@ -39,11 +39,11 @@ final class DashboardLayoutResolver
      */
     public function templatesFor(User $user): array
     {
-        $roles = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->where('a.user_id', $user->id)
-            ->whereRaw(EffectiveAssignments::sql('a'))->distinct()->pluck('r.code')->all();
+        // The same role codes as the menu: the executive director and department head codes follow Organization\Authority.
+        $roles = app(NavigationBuilder::class)->roleCodes($user);
         $own = collect([$user->department_id])
             ->merge(EffectiveAssignments::apply(DB::table('department_user_roles')->where('user_id', $user->id)->whereNotNull('department_id'))->pluck('department_id'))
-            ->merge(DB::table('departments')->where('head_user_id', $user->id)->whereNull('deleted_at')->pluck('id'))
+            ->merge(app(Authority::class)->headedDepartmentIds($user))
             ->filter()->map(fn ($id): int => (int) $id)->unique()->values()->all();
         $parents = DB::table('departments')->whereNull('deleted_at')->pluck('parent_id', 'id')->all();
         $ancestors = [];
@@ -218,9 +218,8 @@ final class DashboardLayoutResolver
         return match ($key) {
             'readiness' => $user->isSystemAdmin() ? null : 'مخصص لمدير النظام.',
             'kpis' => 'مؤشرات الأداء متاحة من القائمة الجانبية فقط.',
-            'executive' => app(LeaveApproverResolver::class)->isExecutive((int) $user->id) ? null : 'ليس صاحب دور المدير التنفيذي.',
-            'team' => DB::table('departments')->where('head_user_id', $user->id)->where('is_active', true)->whereNull('deleted_at')->exists()
-                ? null : 'ليس رئيسًا معيّنًا لقسم فعال.',
+            'executive' => app(Authority::class)->isExecutive($user) ? null : 'ليس المدير التنفيذي المعيّن.',
+            'team' => app(Authority::class)->isHead($user) ? null : 'ليس رئيسًا معيّنًا لقسم فعال بدور رئيس قسم فيه.',
             'finance' => app(FinanceApprovalQueue::class)->isApprover($user) || app(FinanceGuard::class)->allows($user, 'finance.view')
                 ? null : 'لا يملك صلاحية في وحدة الحسابات (دور مالي مع تخصيص من «صلاحيات الحسابات»).',
             // The leave request is always listed (with the reason when it cannot be made), so every staff member sees the block.

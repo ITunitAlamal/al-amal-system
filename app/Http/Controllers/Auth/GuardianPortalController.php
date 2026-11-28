@@ -15,6 +15,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\Rules\Password;
@@ -28,6 +29,9 @@ use Inertia\Response;
  */
 final class GuardianPortalController extends Controller
 {
+    /** Session key of a sign-up waiting for its phone code. */
+    private const SIGNUP = 'guardian.signup';
+
     public function __construct(private readonly PortalApplications $applications, private readonly FamilyRegistrations $registrations) {}
 
     /** Public welcome page of the portal (portal host «/» lands here for guests). */
@@ -46,8 +50,12 @@ final class GuardianPortalController extends Controller
             return redirect()->route('guardian.home');
         }
 
-        return Inertia::render('Guardians/Auth', ['registering' => $request->routeIs('guardian.register'),
-            'urls' => ['login' => route('guardian.login'), 'register' => route('guardian.register'), 'forgot' => route('guardian.password.forgot')]]);
+        $registering = $request->routeIs('guardian.register');
+        $pending = $registering ? $this->pendingSignup($request) : null;
+
+        return Inertia::render('Guardians/Auth', ['registering' => $registering, 'signup' => $pending ? ['phone' => $pending['phone']] : null,
+            'urls' => ['login' => route('guardian.login'), 'register' => route('guardian.register'), 'forgot' => route('guardian.password.forgot'),
+                'verify' => route('guardian.register.verify'), 'restart' => route('guardian.register.restart')]]);
     }
 
     /** «نسيت كلمة المرور»: the same answer whether or not an account matches (no enumeration). */
@@ -114,7 +122,13 @@ final class GuardianPortalController extends Controller
         return redirect()->route('guardian.home')->with('success', 'تم تغيير كلمة المرور.');
     }
 
-    public function register(Request $request): RedirectResponse
+    /**
+     * Public sign-up. With SMS enabled (AC-11) the answer to the form never depends on whether an account exists: a code
+     * goes to the submitted Palestinian mobile (within the sending caps), and the existing-account check runs only after
+     * its holder enters it. A send that is capped or fails is reported as such. The form data waits in the session,
+     * encrypted, with the password already hashed. Without SMS the account is opened at once.
+     */
+    public function register(Request $request, GuardianOtp $otp): RedirectResponse
     {
         $data = $request->validate([
             'first_name' => 'required|string|max:100', 'father_name' => 'required|string|max:100', 'grandfather_name' => 'nullable|string|max:100', 'family_name' => 'required|string|max:100',
@@ -127,22 +141,97 @@ final class GuardianPortalController extends Controller
             throw ValidationException::withMessages(['national_id' => 'رقم الهوية الفلسطينية يتكون من 9 أرقام صحيحة.']);
         }
         $phone = Identity::clean($data['phone']);
-        $hash = Identity::hash($clean);
-        if (Guardian::query()->where('national_id_hash', $hash)->orWhere('phone', $phone)->exists()) {
-            throw ValidationException::withMessages(['national_id' => 'تعذر إنشاء الحساب بهذه البيانات؛ استخدم حسابك الموجود أو راجع القسم.']);
+        // Decided before any account lookup: a refusal here says nothing about an existing ID or phone.
+        $sent = $otp->signupCode($phone, $request->ip());
+        if ($sent['status'] === 'phone') {
+            throw ValidationException::withMessages(['phone' => 'أدخل رقم جوال فلسطيني: 10 أرقام تبدأ بـ 05، أو بالصيغة الدولية 970.']);
+        }
+        if (in_array($sent['status'], ['limited', 'failed'], true)) {
+            throw ValidationException::withMessages(['phone' => 'تعذر إرسال رمز التأكيد الآن. حاول لاحقًا، أو راجع القسم لإنشاء الحساب.']);
+        }
+        $profile = ['name' => implode(' ', array_filter([$data['first_name'], $data['father_name'], $data['grandfather_name'] ?? null, $data['family_name']])),
+            'national_id' => $clean, 'phone' => $phone, 'password' => Hash::make($data['password']), 'sms_consent' => ! empty($data['sms_consent']),
+            'name_parts' => collect($data)->only(['first_name', 'father_name', 'grandfather_name', 'family_name'])->all()];
+        if ($sent['status'] === 'off') {
+            return $this->openAccount($request, $profile, false);
+        }
+        $request->session()->put(self::SIGNUP, ['payload' => Crypt::encryptString((string) json_encode($profile)), 'code' => $sent['hash'], 'phone' => $phone,
+            'expires_at' => now()->addMinutes((int) config('portal.otp_minutes', 10))->getTimestamp(), 'attempts' => 0]);
+
+        return redirect()->route('guardian.register')->with('success', 'أُرسلت رسالة برمز التأكيد إلى رقم الجوال المدخل، وتصل عادة خلال دقائق. أدخل الرمز لإكمال إنشاء الحساب.');
+    }
+
+    /** Second step of the sign-up: the phone's holder enters the code; only then is the account checked and opened. */
+    public function verifySignup(Request $request, GuardianOtp $otp): RedirectResponse
+    {
+        $data = $request->validate(['code' => 'required|string|max:10'], [], ['code' => 'الرمز']);
+        $pending = $this->pendingSignup($request);
+        if ($pending === null || $pending['attempts'] >= (int) config('portal.otp_attempts', 5)) {
+            $request->session()->forget(self::SIGNUP);
+
+            throw ValidationException::withMessages(['code' => 'انتهت صلاحية الرمز أو استُنفدت المحاولات. أعد تعبئة نموذج التسجيل.']);
+        }
+        if (! $otp->matchesSignupCode($pending['code'], $data['code'])) {
+            $request->session()->put(self::SIGNUP.'.attempts', $pending['attempts'] + 1);
+
+            throw ValidationException::withMessages(['code' => 'الرمز غير صحيح أو انتهت صلاحيته.']);
+        }
+        $request->session()->forget(self::SIGNUP);
+
+        return $this->openAccount($request, (array) json_decode(Crypt::decryptString($pending['payload']), true), true);
+    }
+
+    public function restartSignup(Request $request): RedirectResponse
+    {
+        $request->session()->forget(self::SIGNUP);
+
+        return redirect()->route('guardian.register');
+    }
+
+    /** A sign-up waiting for its code, or null when there is none or its code has expired. */
+    private function pendingSignup(Request $request): ?array
+    {
+        $pending = $request->session()->get(self::SIGNUP);
+
+        return is_array($pending) && (int) ($pending['expires_at'] ?? 0) >= now()->getTimestamp() ? $pending : null;
+    }
+
+    /** Opens the account and signs it in. One answer for an ID or a phone already in use, whichever it is. */
+    private function openAccount(Request $request, array $profile, bool $phoneVerified): RedirectResponse
+    {
+        $refused = 'تعذر إنشاء الحساب بهذه البيانات. إن كان لديك حساب فسجّل الدخول أو استعد كلمة المرور، أو راجع القسم.';
+        $hash = Identity::hash($profile['national_id']);
+        if (Guardian::query()->where('national_id_hash', $hash)->orWhere('phone', $profile['phone'])->exists()) {
+            throw ValidationException::withMessages(['national_id' => $refused]);
         }
         try {
-            $account = Guardian::create(['name' => implode(' ', array_filter([$data['first_name'], $data['father_name'], $data['grandfather_name'] ?? null, $data['family_name']])),
-                'national_id' => $clean, 'national_id_hash' => $hash, 'phone' => $phone, 'password' => $data['password']]);
-            $account->forceFill(['sms_consent_at' => ! empty($data['sms_consent']) ? now() : null, 'last_login_at' => now()])->save();
+            $account = Guardian::create(['name' => $profile['name'], 'national_id' => $profile['national_id'], 'national_id_hash' => $hash, 'phone' => $profile['phone'], 'password' => $profile['password']]);
+            $account->forceFill(['sms_consent_at' => $profile['sms_consent'] ? now() : null, 'last_login_at' => now(),
+                ...($phoneVerified ? ['phone_verified_at' => now(), 'phone_verification_method' => 'sms', 'phone_verified_by' => null] : [])])->save();
         } catch (UniqueConstraintViolationException) {
-            throw ValidationException::withMessages(['national_id' => 'تعذر إنشاء الحساب بهذه البيانات؛ استخدم حسابك الموجود أو راجع القسم.']);
+            throw ValidationException::withMessages(['national_id' => $refused]);
         }
-        $request->session()->put('guardian.name_parts', collect($data)->only(['first_name', 'father_name', 'grandfather_name', 'family_name'])->all());
+        $request->session()->put('guardian.name_parts', $profile['name_parts']);
+        $this->endStaffSession($request);
         Auth::guard('guardian')->login($account);
         $request->session()->regenerate();
 
         return redirect()->route('guardian.home')->with('success', 'تم إنشاء حسابك. قدّم الآن طلب تسجيل الأطفال الذين ترعاهم؛ يراجع القسم الحساب وكل طفل على حدة.');
+    }
+
+    /**
+     * One session never holds a staff and a beneficiary sign-in together (AC-04): a staff session open in the same
+     * browser ends here, recorded as the staff member's sign-out. Guard and origin are written explicitly (the trigger
+     * keeps them): this request's context is the portal's, the row is a staff one.
+     */
+    private function endStaffSession(Request $request): void
+    {
+        if ($staffId = Auth::guard('web')->id()) {
+            DB::table('audit_logs')->insert(['actor_id' => (int) $staffId, 'action' => 'auth.logout', 'subject_type' => 'users', 'subject_id' => (string) $staffId,
+                'guard' => 'web', 'origin' => 'staff', 'reason_code' => 'portal_sign_in', 'metadata' => '{}', 'ip_address' => $request->ip(),
+                'created_at' => now(), 'updated_at' => now()]);
+            Auth::guard('web')->logout();
+        }
     }
 
     public function login(Request $request): RedirectResponse
@@ -153,15 +242,7 @@ final class GuardianPortalController extends Controller
 
             throw ValidationException::withMessages(['phone' => 'رقم الجوال أو كلمة المرور غير صحيحة، أو الحساب موقوف.']);
         }
-        // One session never holds a staff and a beneficiary sign-in together (AC-04): a staff session open in the
-        // same browser ends here, recorded as the staff member's sign-out. Guard and origin are written explicitly
-        // (the trigger keeps them): this request's context is the portal's, the row is a staff one.
-        if ($staffId = Auth::guard('web')->id()) {
-            DB::table('audit_logs')->insert(['actor_id' => (int) $staffId, 'action' => 'auth.logout', 'subject_type' => 'users', 'subject_id' => (string) $staffId,
-                'guard' => 'web', 'origin' => 'staff', 'reason_code' => 'portal_sign_in', 'metadata' => '{}', 'ip_address' => $request->ip(),
-                'created_at' => now(), 'updated_at' => now()]);
-            Auth::guard('web')->logout();
-        }
+        $this->endStaffSession($request);
         $request->session()->regenerate();
         $account = Auth::guard('guardian')->user();
         $account->forceFill(['last_login_at' => now()])->save();

@@ -5,7 +5,7 @@ namespace App\Services\Attendance;
 use App\Models\Employee;
 use App\Models\User;
 use App\Services\Notifications\NotificationCenter;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Http\UploadedFile;
@@ -502,12 +502,10 @@ final class HrActionService
         return array_values(array_unique(array_diff(array_filter([...$this->executiveIds(), $hrHead]), [$authorId, $target])));
     }
 
-    /** @return list<int> active users holding an effective executive director's assignment */
+    /** @return list<int> the executive director in office (Organization\Authority) */
     private function executiveIds(): array
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))
-            ->pluck('a.user_id')->map(fn ($id): int => (int) $id)->unique()->values()->all();
+        return app(Authority::class)->executiveIds();
     }
 
     /**

@@ -6,7 +6,7 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Services\Attendance\AttendanceDailyService;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use App\Support\Attendance\ScheduleSettings;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -25,14 +25,7 @@ final class AttendanceScheduleManageController extends Controller
     /** The executive director only: the technical administrator takes no business decision (2026-10-22 centralization). */
     private function canApprove(Request $r): bool
     {
-        return $r->user()?->is_active && $this->executive((int) $r->user()->id);
-    }
-
-    private function executive(int $id): bool
-    {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->join('users as u', 'u.id', '=', 'a.user_id')->where('a.user_id', $id)
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->exists();
+        return (bool) $r->user()?->is_active && app(Authority::class)->isExecutive($r->user());
     }
 
     private function audit(Request $r, int $id, string $action, array $details): void

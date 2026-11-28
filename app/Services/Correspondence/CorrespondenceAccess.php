@@ -3,6 +3,7 @@
 namespace App\Services\Correspondence;
 
 use App\Models\User;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
@@ -44,10 +45,10 @@ final class CorrespondenceAccess
 
     public function assignments(): Collection
     {
+        // Effective assignments only: within their dates and in an active, non-archived department (EffectiveAssignments).
         return $this->assignments ??= DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
             ->join('users as u', 'u.id', '=', 'a.user_id')->where('u.is_active', true)
-            ->where(fn ($q) => $q->whereNull('a.starts_on')->orWhere('a.starts_on', '<=', today()->toDateString()))
-            ->where(fn ($q) => $q->whereNull('a.ends_on')->orWhere('a.ends_on', '>=', today()->toDateString()))
+            ->whereRaw(EffectiveAssignments::sql('a'))
             ->get(['a.*', 'r.code', 'u.department_id as home_department']);
     }
 
@@ -59,6 +60,10 @@ final class CorrespondenceAccess
     public function role(User $user, string $role, ?int $department = null): bool
     {
         if (! $user->is_active) {
+            return false;
+        }
+        // The executive director's role counts only for the executive director in office (Organization\Authority).
+        if ($role === Authority::EXECUTIVE_ROLE && ! app(Authority::class)->isExecutive($user)) {
             return false;
         }
 
@@ -147,7 +152,8 @@ final class CorrespondenceAccess
 
     public function head(User $user, int $department): bool
     {
-        return ((int) $this->departments()->get($department)?->head_user_id === (int) $user->id && $this->role($user, 'department_head', $department))
+        // The appointed head (Organization\Authority), or a dated acting head until the owner decides that rule (RBAC-02).
+        return app(Authority::class)->isHeadOf($user, $department)
             || $this->assignments()->contains(fn ($row): bool => (int) $row->user_id === (int) $user->id && (int) $row->department_id === $department
                 && $row->code === 'acting_department_head' && $row->starts_on !== null && $row->ends_on !== null);
     }
@@ -317,10 +323,7 @@ final class CorrespondenceAccess
 
         return DB::table('correspondence_confidential_grants as g')->where('g.user_id', $user->id)
             ->whereNull('g.revoked_at')->where('g.ends_at', '>', now())
-            ->whereExists(DB::table('department_user_roles as issuer')->join('roles as issuer_role', 'issuer_role.id', '=', 'issuer.role_id')
-                ->join('users as issuer_user', 'issuer_user.id', '=', 'issuer.user_id')
-                ->whereColumn('issuer.user_id', 'g.issued_by')->where('issuer_role.code', 'executive_director')->where('issuer_user.is_active', true)
-                ->whereRaw(EffectiveAssignments::sql('issuer'))->selectRaw('1'));
+            ->whereIn('g.issued_by', app(Authority::class)->executiveIds());
     }
 
     /** The grant in force that gives this user the record, or null. */

@@ -16,6 +16,7 @@ class AuditActionCatalog
         'auth.login_failed' => 'محاولة دخول فاشلة', 'auth.lockout' => 'إيقاف مؤقت لمحاولات الدخول', 'auth.password_changed' => 'تغيير كلمة المرور',
         'portal.auth.login' => 'دخول وصي إلى البوابة', 'portal.auth.logout' => 'خروج وصي من البوابة', 'portal.auth.login_failed' => 'محاولة دخول فاشلة إلى البوابة',
         'portal.auth.lockout' => 'إيقاف مؤقت لمحاولات دخول البوابة', 'portal.auth.password_changed' => 'تغيير كلمة مرور حساب البوابة',
+        'portal.signup.code_sent' => 'إرسال رمز تسجيل حساب في البوابة برسالة نصية',
         'access.denied' => 'رفض وصول (لا صلاحية)', 'orphans.campaign.list.decision_denied' => 'محاولة اعتماد/رفض كشف حملة دون صلاحية المدير التنفيذي',
         'audit.exported' => 'تصدير سجل النظام', 'audit.chain.broken' => 'انقطاع سلسلة ختم السجل',
         'workflow.task.approve' => 'اعتماد في مسار عمل', 'workflow.task.reject' => 'رفض في مسار عمل', 'workflow.task.return' => 'إعادة للتعديل في مسار عمل',

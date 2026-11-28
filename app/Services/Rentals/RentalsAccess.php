@@ -4,7 +4,7 @@ namespace App\Services\Rentals;
 
 use App\Models\User;
 use App\Services\Finance\FinanceGuard;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use App\Services\WorkflowVisibilityService;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -68,15 +68,13 @@ final class RentalsAccess
     }
 
     /**
-     * The executive director(s) in office (an effective executive_director assignment on an active account), told of
-     * contracts entering the renewal window or ending, for information only (SRS 3.8.7.1: «والإدارة التنفيذية»).
+     * The executive director in office (Organization\Authority), told of contracts entering the renewal window or
+     * ending, for information only (SRS 3.8.7.1: «والإدارة التنفيذية»).
      *
      * @return list<int>
      */
     public function executiveIds(): array
     {
-        return DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('r.code', 'executive_director')->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))
-            ->distinct()->pluck('a.user_id')->map(fn ($id): int => (int) $id)->all();
+        return app(Authority::class)->executiveIds();
     }
 }

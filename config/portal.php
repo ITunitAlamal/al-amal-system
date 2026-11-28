@@ -11,4 +11,7 @@ return [
     'session_cookie' => env('PORTAL_SESSION_COOKIE', 'aims_portal_session'),
     'otp_minutes' => 10,
     'otp_attempts' => 5,
+    // Optional caps on sign-up codes sent by SMS (AC-11), set by the owner; empty or 0 leaves a cap off.
+    'signup_sms_per_ip_hour' => env('PORTAL_SIGNUP_SMS_PER_IP_HOUR'),
+    'signup_sms_per_day' => env('PORTAL_SIGNUP_SMS_PER_DAY'),
 ];

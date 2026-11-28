@@ -9,7 +9,7 @@ use App\Services\Attendance\AttendanceLedger;
 use App\Services\Attendance\AttendancePermissionService;
 use App\Services\Attendance\HrActionService;
 use App\Services\AuditService;
-use App\Services\Organization\EffectiveAssignments;
+use App\Services\Organization\Authority;
 use App\Support\Attendance\AttendanceLedgerXlsx;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
@@ -151,20 +151,11 @@ final class AttendanceEmployeeLedgerController extends Controller
     private function authorizeViewer(Request $request): void
     {
         $user = $request->user();
-        abort_unless($user && $user->is_active && ($user->isSystemAdmin() || $user->isHrDepartmentHead() || self::isExecutive((int) $user->id)), 403);
+        abort_unless($user && $user->is_active && ($user->isSystemAdmin() || $user->isHrDepartmentHead() || app(Authority::class)->isExecutive($user)), 403);
     }
 
     private function canSeeDirections(User $user): bool
     {
-        return $user->isSystemAdmin() || $user->isHrDepartmentHead() || self::isExecutive((int) $user->id);
-    }
-
-    public static function isExecutive(int $id): bool
-    {
-        return DB::table('department_user_roles as a')
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->join('users as u', 'u.id', '=', 'a.user_id')
-            ->where('a.user_id', $id)->where('r.code', 'executive_director')
-            ->where('u.is_active', true)->whereRaw(EffectiveAssignments::sql('a'))->exists();
+        return $user->isSystemAdmin() || $user->isHrDepartmentHead() || app(Authority::class)->isExecutive($user);
     }
 }

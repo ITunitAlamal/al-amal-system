@@ -4,6 +4,7 @@ namespace App\Services\Hr;
 
 use App\Models\Employee;
 use App\Models\User;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 
@@ -92,9 +93,10 @@ final class EmployeeAccess
         return $user->is_active && $user->isHrDepartmentHead();
     }
 
+    /** The executive director in office (Organization\Authority). */
     public function isExecutive(User $user): bool
     {
-        return $user->is_active && $user->roleAssignments()->effective()->whereHas('role', fn ($query) => $query->where('code', 'executive_director'))->exists();
+        return app(Authority::class)->isExecutive($user);
     }
 
     /** The Head of Accounts: the appointed head of FIN holding the «رئيس قسم» role there. */
@@ -112,13 +114,12 @@ final class EmployeeAccess
         return $head !== null && $this->isAccountsHead($head) ? (int) $head->id : null;
     }
 
-    /** Whether the employee's own account holds an effective executive_director assignment (owner decision 1, 2026-11-27). */
+    /** Whether the employee's own account is the executive director in office (owner decision 1, 2026-11-27; Organization\Authority). */
     public function employeeIsExecutive(int $employeeId): bool
     {
         $userId = DB::table('employees')->where('id', $employeeId)->value('user_id');
 
-        return $userId !== null && DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('a.user_id', $userId)->where('r.code', 'executive_director')->whereRaw(EffectiveAssignments::sql('a'))->exists();
+        return $userId !== null && app(Authority::class)->isExecutive((int) $userId);
     }
 
     public function isSelf(User $user, Employee $employee): bool
@@ -129,15 +130,7 @@ final class EmployeeAccess
     /** The appointed head of the employee's current department (structure head with the head role there). */
     public function leadsDepartmentOf(User $user, Employee $employee): bool
     {
-        if (! $user->is_active || ! $employee->department_id) {
-            return false;
-        }
-
-        return DB::table('departments as d')
-            ->join('department_user_roles as a', fn ($join) => $join->on('a.department_id', '=', 'd.id')->where('a.user_id', $user->id))
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('d.id', $employee->department_id)->where('d.is_active', true)->where('d.head_user_id', $user->id)
-            ->where('r.code', 'department_head')->whereRaw(EffectiveAssignments::sql('a'))->exists();
+        return $employee->department_id !== null && app(Authority::class)->isHeadOf($user, (int) $employee->department_id);
     }
 
     public function canView(User $user, Employee $employee): bool

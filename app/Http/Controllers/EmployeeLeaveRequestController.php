@@ -12,6 +12,7 @@ use App\Services\LeaveDecisionService;
 use App\Services\LeaveSubmissionRules;
 use App\Services\LeaveWorkflow;
 use App\Services\Notifications\NotificationCenter;
+use App\Services\Organization\Authority;
 use App\Services\Progress\LeaveProgress;
 use App\Services\Workflow\StepAssignments;
 use App\Services\Workflow\WorkflowEngine;
@@ -74,11 +75,13 @@ final class EmployeeLeaveRequestController extends Controller
             || ($leave->workflow_instance_id && $this->visibility->accessLevel($r->user(), (int) $leave->workflow_instance_id) !== null);
     }
 
+    /** The valid head of the employee's department (Organization\Authority); head_user_id alone is not enough. */
     private function managerOf(Request $r, int $employeeId): bool
     {
-        return DB::table('employees as e')->join('departments as d', 'd.id', '=', 'e.department_id')
-            ->where('e.id', $employeeId)->where('d.head_user_id', $r->user()->id)
-            ->whereNull('e.deleted_at')->exists();
+        $headed = app(Authority::class)->headedDepartmentIds($r->user());
+
+        return $headed !== [] && DB::table('employees')->where('id', $employeeId)->whereIn('department_id', $headed)
+            ->whereNull('deleted_at')->exists();
     }
 
     private function isExecutive(int $userId): bool
@@ -111,11 +114,10 @@ final class EmployeeLeaveRequestController extends Controller
             ->select(['l.id', 'l.employee_id', 'l.leave_type_value_id', 'l.requested_by', 'l.start_date', 'l.end_date', 'l.requested_days', 'l.status', 'l.created_at',
                 'l.submitted_at', 'l.workflow_instance_id', 'wi.reference_no', 'e.employee_number', 'e.first_name_ar', 'e.family_name_ar', 't.name_ar as leave_type_name']);
         if (! $managed) {
-            $query->where(function ($q) use ($r) {
-                $q->where('l.requested_by', $r->user()->id)->orWhereExists(function ($s) use ($r) {
-                    $s->selectRaw('1')->from('departments as d')
-                        ->whereColumn('d.id', 'e.department_id')->where('d.head_user_id', $r->user()->id);
-                })->orWhereExists(function ($s) use ($r) {
+            $headed = app(Authority::class)->headedDepartmentIds($r->user());
+            $query->where(function ($q) use ($r, $headed) {
+                // The requester, the valid head of the employee's department (Organization\Authority), …
+                $q->where('l.requested_by', $r->user()->id)->orWhereIn('e.department_id', $headed)->orWhereExists(function ($s) use ($r) {
                     // Anyone the request's workflow reached (current holder, earlier reviewers).
                     $s->selectRaw('1')->from('workflow_participants as p')
                         ->whereColumn('p.workflow_instance_id', 'l.workflow_instance_id')

@@ -11,14 +11,16 @@ use App\Http\Controllers\Orphans\RegistryController as Registry;
 use App\Http\Controllers\Orphans\ReportsController as Reports;
 use App\Http\Controllers\Orphans\ReviewsController as Reviews;
 use App\Http\Controllers\Orphans\SettingsController as Settings;
+use App\Http\Middleware\EnsureOrphansAccess;
 use App\Http\Middleware\ProtectOrphanResponses;
 use Illuminate\Support\Facades\Route;
 
 /*
  * «شؤون الأيتام والكفالات» (AIMS 2.0). Six menu entries; every action authorizes in the controller/service
- * (OrphanAccess), never by a hidden button. Responses carry no-store headers (sensitive child data).
+ * (OrphanAccess), never by a hidden button. Responses carry no-store headers (sensitive child data). The group gate
+ * refuses staff with no access to the area before any record lookup or validation (AC-07).
  */
-Route::middleware(['auth', ProtectOrphanResponses::class])->prefix('orphans')->name('orphans.')->group(function (): void {
+Route::middleware(['auth', ProtectOrphanResponses::class, EnsureOrphansAccess::class])->prefix('orphans')->name('orphans.')->group(function (): void {
     Route::get('/', HomeController::class)->name('home');
 
     Route::prefix('registry')->name('registry.')->controller(Registry::class)->group(function (): void {

@@ -57,6 +57,8 @@ final class ApprovalDelegationController extends Controller
 
     public function store(Request $request): RedirectResponse
     {
+        // Authorize before validating: the rules check that the delegate account exists (AC-07).
+        $this->assertExecutive($request, 'إصدار التفويض الإداري من صلاحية المدير التنفيذي فقط.');
         $data = $request->validate([
             'scope_code' => ['required', Rule::in(array_keys(ApprovalDelegations::SCOPES))],
             'delegate_user_id' => ['required', 'integer', Rule::exists('users', 'id')],
@@ -72,9 +74,16 @@ final class ApprovalDelegationController extends Controller
 
     public function revoke(Request $request, int $delegation): RedirectResponse
     {
+        $this->assertExecutive($request, 'إلغاء التفويض الإداري من صلاحية المدير التنفيذي فقط.');
         $data = $request->validate(['reason' => ['required', 'string', 'min:5', 'max:2000']]);
         $returned = $this->delegations->revoke($request->user(), $delegation, $data['reason'], $request->ip());
 
         return back()->with('success', 'أُلغي التفويض.'.($returned ? ' أُعيدت '.$returned.' معاملة مفتوحة إلى صاحب الصلاحية الأصلي.' : ''));
+    }
+
+    /** Same rule as ApprovalDelegations::issue/revoke, which repeat it inside the service. */
+    private function assertExecutive(Request $request, string $message): void
+    {
+        abort_unless($this->delegations->isExecutive($request->user()), 403, $message);
     }
 }

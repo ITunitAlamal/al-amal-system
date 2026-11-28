@@ -4,6 +4,8 @@ namespace App\Services\Configuration;
 
 use App\Models\User;
 use App\Services\Dashboard\DashboardLayoutResolver;
+use App\Services\Organization\Authority;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Workflow\WorkflowCatalog;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -86,18 +88,22 @@ final class NavigationBuilder
     }
 
     /**
-     * Role codes the user holds today, plus «department_head» for a head appointed in the structure.
+     * Role codes the user holds today (EffectiveAssignments). The two structural roles follow the structure
+     * (Organization\Authority): «executive_director» only for the executive director in office, «department_head»
+     * only for a user who validly heads a department.
      *
      * @return list<string>
      */
     public function roleCodes(User $user): array
     {
-        $codes = DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')->where('a.user_id', $user->id)
-            ->where(fn ($query) => $query->whereNull('a.starts_on')->orWhere('a.starts_on', '<=', today()->toDateString()))
-            ->where(fn ($query) => $query->whereNull('a.ends_on')->orWhere('a.ends_on', '>=', today()->toDateString()))
-            ->pluck('r.code')->all();
-        if (DB::table('departments')->where('head_user_id', $user->id)->where('is_active', true)->whereNull('deleted_at')->exists()) {
-            $codes[] = 'department_head';
+        $authority = app(Authority::class);
+        $codes = array_diff(EffectiveAssignments::apply(DB::table('department_user_roles as a')->join('roles as r', 'r.id', '=', 'a.role_id')
+            ->where('a.user_id', $user->id), 'a')->pluck('r.code')->all(), [Authority::EXECUTIVE_ROLE, Authority::HEAD_ROLE]);
+        if ($authority->isExecutive($user)) {
+            $codes[] = Authority::EXECUTIVE_ROLE;
+        }
+        if ($authority->isHead($user)) {
+            $codes[] = Authority::HEAD_ROLE;
         }
 
         return array_values(array_unique($codes));

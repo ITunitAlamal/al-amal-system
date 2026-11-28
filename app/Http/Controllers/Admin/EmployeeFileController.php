@@ -19,10 +19,14 @@ class EmployeeFileController extends Controller
 {
     public function __construct(private readonly EmployeeFiles $files, private readonly EmployeeAccess $access) {}
 
+    /**
+     * A missing employee and one the viewer may not see get the same 403 (AC-07), so ids cannot be probed for
+     * existence; the refusal is still recorded in «سجل النظام».
+     */
     private function employee(Request $request, int $employee): Employee
     {
-        $record = Employee::query()->findOrFail($employee);
-        abort_unless($request->user() && $this->access->canView($request->user(), $record), 403);
+        $record = Employee::query()->find($employee);
+        abort_unless($record && $request->user() && $this->access->canView($request->user(), $record), 403);
 
         return $record;
     }

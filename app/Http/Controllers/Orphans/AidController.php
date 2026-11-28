@@ -74,8 +74,12 @@ final class AidController extends Controller
         ]);
     }
 
+    // Every action authorizes first (AC-07): its validation checks that sponsors, orphans and households exist, so a
+    // viewer without the capability must be refused before it runs. Aid repeats each check inside its transaction.
+
     public function storeSponsor(Request $request): RedirectResponse
     {
+        $this->access->assert($request->user(), 'sponsorships');
         $data = $request->validate(['kind' => ['required', Rule::in(['individual', 'institution'])], 'name' => 'required|string|max:300', 'contact_name' => 'nullable|string|max:200',
             'phone' => 'nullable|string|max:20', 'email' => 'nullable|email|max:150', 'country' => 'nullable|string|max:100', 'notes' => 'nullable|string|max:2000', 'id' => 'nullable|integer|exists:sponsors,id',
             'status' => ['nullable', Rule::in(['active', 'inactive'])]], [], ['name' => 'اسم الكافل']);
@@ -86,6 +90,7 @@ final class AidController extends Controller
 
     public function storeSponsorship(Request $request): RedirectResponse
     {
+        $this->access->assert($request->user(), 'sponsorships');
         $data = $request->validate(['sponsor_id' => 'required|integer|exists:sponsors,id', 'program_value_id' => 'nullable|integer|exists:master_data_values,id',
             'coverage' => ['required', Rule::in(array_keys(Aid::COVERAGE))], 'amount' => 'required|numeric|min:0.01|max:999999999', 'currency' => 'required|string|exists:currencies,code',
             'period_months' => 'required|integer|min:1|max:12', 'frequency_value_id' => 'nullable|integer|exists:master_data_values,id', 'starts_on' => 'required|date',
@@ -102,6 +107,8 @@ final class AidController extends Controller
 
     public function sponsorshipAction(Request $request, string $publicId): RedirectResponse
     {
+        // Every action here needs the capability (a status change also needs the head, who holds every capability).
+        $this->access->assert($request->user(), 'sponsorships');
         $s = DB::table('sponsorships')->where('public_id', $publicId)->firstOrFail();
         $data = $request->validate(['action' => ['required', Rule::in(['status', 'schedule', 'refer', 'add_orphan', 'add_household', 'end_line'])],
             'status' => ['required_if:action,status', 'nullable', Rule::in(array_keys(Aid::TRANSITIONS))], 'expected_status' => ['required_if:action,status', 'nullable', Rule::in(array_keys(Aid::TRANSITIONS))],
@@ -131,6 +138,7 @@ final class AidController extends Controller
 
     public function storeAssistance(Request $request): RedirectResponse
     {
+        $this->access->assert($request->user(), 'sponsorships');
         $data = $request->validate(['unit' => ['required', Rule::in(['orphan', 'household'])], 'orphan_public_id' => 'required_if:unit,orphan|nullable|string|exists:orphans,public_id',
             'household_reference' => 'required_if:unit,household|nullable|string|exists:households,reference_no', 'type_value_id' => 'nullable|integer|exists:master_data_values,id',
             'description' => 'required|string|max:2000', 'quantity' => 'nullable|numeric|min:0', 'amount' => 'nullable|numeric|min:0', 'currency' => 'nullable|string|exists:currencies,code']);
@@ -143,6 +151,7 @@ final class AidController extends Controller
 
     public function decideAssistance(Request $request, string $publicId): RedirectResponse
     {
+        $this->access->assertDecide($request->user(), 'اعتماد طلبات المساعدة لرئيس القسم.');
         $row = DB::table('assistance_requests')->where('public_id', $publicId)->firstOrFail();
         $data = $request->validate(['decision' => ['required', Rule::in(['approved', 'rejected', 'cancelled'])], 'note' => 'nullable|string|max:2000']);
         $this->aid->decideAssistance($row, $data['decision'], $data['note'] ?? null, $request->user());
@@ -152,6 +161,7 @@ final class AidController extends Controller
 
     public function storeBenefit(Request $request): RedirectResponse
     {
+        abort_unless($this->access->allows($request->user(), 'sponsorships') || $this->access->allows($request->user(), 'delivery'), 403, 'تسجيل الاستفادة يحتاج قدرة الكفالات أو التسليم.');
         $data = $request->validate(['unit' => ['required', Rule::in(['orphan', 'household'])], 'orphan_public_id' => 'nullable|string|exists:orphans,public_id',
             'household_reference' => 'nullable|string|exists:households,reference_no', 'source' => ['required', Rule::in(['sponsorship', 'assistance', 'other'])],
             'sponsorship_public_id' => 'nullable|string|exists:sponsorships,public_id', 'assistance_public_id' => 'nullable|string|exists:assistance_requests,public_id',
@@ -170,6 +180,7 @@ final class AidController extends Controller
 
     public function reverseBenefit(Request $request, string $publicId): RedirectResponse
     {
+        $this->access->assertDecide($request->user(), 'عكس استفادة مؤكدة لرئيس القسم.');
         $row = DB::table('benefit_records')->where('public_id', $publicId)->firstOrFail();
         $data = $request->validate(['reason' => 'required|string|max:500'], [], ['reason' => 'سبب التصحيح']);
         $this->aid->reverseBenefit($row, $data['reason'], $request->user());

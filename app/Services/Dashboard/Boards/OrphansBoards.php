@@ -3,6 +3,7 @@
 namespace App\Services\Dashboard\Boards;
 
 use App\Models\User;
+use App\Services\Organization\EffectiveAssignments;
 use App\Services\Orphans\Aid;
 use App\Services\Orphans\Campaigns\Campaigns;
 use App\Services\Orphans\Dashboard as OrphansDashboard;
@@ -30,10 +31,8 @@ final class OrphansBoards
         if ($this->access->isHead($user)) {
             $kinds[] = 'head';
         } elseif ($this->access->isStaff($user)) {
-            $today = today()->toDateString();
             $codes = DB::table('department_user_roles as a')->join('departments as d', 'd.id', '=', 'a.department_id')->where('a.user_id', $user->id)
-                ->where(fn ($q) => $q->whereNull('a.starts_on')->orWhere('a.starts_on', '<=', $today))->where(fn ($q) => $q->whereNull('a.ends_on')->orWhere('a.ends_on', '>=', $today))
-                ->whereIn('d.code', array_keys(self::UNITS))->pluck('d.code')->all();
+                ->whereRaw(EffectiveAssignments::sql('a'))->whereIn('d.code', array_keys(self::UNITS))->pluck('d.code')->all();
             $kinds = array_values(array_unique(array_map(fn (string $code): string => self::UNITS[$code], $codes))) ?: ['records'];
         }
         // Campaign members (PR staff included) operate only the campaigns assigned to them.

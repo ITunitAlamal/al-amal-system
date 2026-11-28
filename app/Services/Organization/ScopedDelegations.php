@@ -280,9 +280,10 @@ final class ScopedDelegations
         return ['permissions' => $permissions, 'scopes' => $scopes];
     }
 
+    /** The executive director in office (Authority). */
     public function isExecutive(User $user): bool
     {
-        return $user->is_active && $user->roleAssignments()->effective()->whereHas('role', fn ($q) => $q->where('code', 'executive_director'))->exists();
+        return app(Authority::class)->isExecutive($user);
     }
 
     /** @return list<object> */

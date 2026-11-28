@@ -207,10 +207,17 @@ final class OrganizationStructure
 
     /**
      * Applies one change (validated again inside the transaction) and marks its ledger row applied.
+     *
+     * The decider and the executor are kept apart: $deciderId is the person whose recorded decision this is (the
+     * executive director deciding through the workflow), or null when the decision was taken outside the system
+     * (owner or Board) and only its authority and reference are recorded. $executedBy is whoever carried it out when
+     * that is someone else (an operator running org:structure-decisions); it is stored in the ledger details and in
+     * the audit row, never as the decider.
      */
-    public function apply(object $change, int $actorId, string $authority, ?string $ip = null): void
+    public function apply(object $change, ?int $deciderId, string $authority, ?string $ip = null, ?int $executedBy = null): void
     {
-        DB::transaction(function () use ($change, $actorId, $authority, $ip): void {
+        $actorId = $executedBy ?? $deciderId;
+        DB::transaction(function () use ($change, $deciderId, $actorId, $executedBy, $authority, $ip): void {
             $change = DB::table('department_structure_changes')->where('id', $change->id)->lockForUpdate()->first();
             if ($change->status === 'applied') {
                 return;
@@ -239,10 +246,16 @@ final class OrganizationStructure
                 DB::table('departments')->where('id', $id)->update([...$values, 'updated_at' => now()]);
             }
             $after = (array) DB::table('departments')->where('id', $id)->first();
+            $ledgerDetails = json_decode((string) $change->details, true) ?: [];
+            if ($executedBy !== null) {
+                $ledgerDetails['executed_by'] = $executedBy;
+            }
             DB::table('department_structure_changes')->where('id', $change->id)->update(['department_id' => $id, 'before_state' => $before === null ? null : json_encode($before, JSON_UNESCAPED_UNICODE),
-                'after_state' => json_encode($after, JSON_UNESCAPED_UNICODE), 'status' => 'applied', 'authority' => $authority, 'decided_by' => $actorId,
+                'after_state' => json_encode($after, JSON_UNESCAPED_UNICODE), 'status' => 'applied', 'authority' => $authority, 'decided_by' => $deciderId,
+                'details' => $ledgerDetails === [] ? null : json_encode($ledgerDetails, JSON_UNESCAPED_UNICODE),
                 'decided_at' => now(), 'applied_at' => now(), 'updated_at' => now()]);
-            $this->audit->recordRow('organization.structure.applied', 'departments', $id, $before, ['change_id' => $change->id, 'change' => $change->change_type, 'authority' => $authority, 'after' => $after], $actorId, $ip);
+            $this->audit->recordRow('organization.structure.applied', 'departments', $id, $before, ['change_id' => $change->id, 'change' => $change->change_type, 'authority' => $authority,
+                'decided_by' => $deciderId, 'executed_by' => $executedBy, 'after' => $after], $actorId, $ip);
         });
     }
 

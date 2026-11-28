@@ -112,12 +112,9 @@ final class HrServicesDashboard
         if ($ids === []) {
             return false;
         }
-        $today = today()->toDateString();
 
         return in_array((int) $user->department_id, $ids, true)
-            || DB::table('department_user_roles')->where('user_id', $user->id)->whereIn('department_id', $ids)
-                ->where(fn (Builder $q) => $q->whereNull('starts_on')->orWhere('starts_on', '<=', $today))
-                ->where(fn (Builder $q) => $q->whereNull('ends_on')->orWhere('ends_on', '>=', $today))->exists();
+            || EffectiveAssignments::apply(DB::table('department_user_roles')->where('user_id', $user->id)->whereIn('department_id', $ids))->exists();
     }
 
     /**

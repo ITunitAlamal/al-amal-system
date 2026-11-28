@@ -6,6 +6,7 @@ use App\Models\User;
 use App\Services\Correspondence\CorrespondenceAccess;
 use App\Services\Finance\FinanceGuard;
 use App\Services\Finance\FinancePermissionCatalog;
+use App\Services\Organization\Authority;
 use App\Services\Organization\EffectiveAssignments;
 use Illuminate\Support\Facades\DB;
 
@@ -503,25 +504,29 @@ final class AssigneeResolver
 
     private function validHead(int $departmentId): ?int
     {
-        $headId = DB::table('departments as d')
-            ->join('users as u', 'u.id', '=', 'd.head_user_id')
-            ->join('department_user_roles as a', fn ($join) => $join->on('a.user_id', '=', 'u.id')->on('a.department_id', '=', 'd.id'))
-            ->join('roles as r', 'r.id', '=', 'a.role_id')
-            ->where('d.id', $departmentId)
-            ->where('d.is_active', true)
-            ->whereNull('d.deleted_at')
-            ->where('u.is_active', true)
-            ->where('r.code', 'department_head')
-            ->whereRaw(EffectiveAssignments::sql('a'))
-            ->value('u.id');
+        return app(Authority::class)->headId($departmentId);
+    }
 
-        return $headId === null ? null : (int) $headId;
+    /**
+     * Holders of the step's role. The two structural roles are held through the structure, not the role row alone
+     * (Organization\Authority): an executive_director step goes only to the executive director in office, and a
+     * department_head step only to a holder who validly heads the department of that assignment.
+     *
+     * @return list<int>
+     */
+    private function roleHolders(object $step, object $instance): array
+    {
+        $holders = $this->assignedRoleHolders($step, $instance);
+
+        return $step->assigned_role_code === Authority::EXECUTIVE_ROLE
+            ? array_values(array_intersect($holders, app(Authority::class)->executiveIds()))
+            : $holders;
     }
 
     /**
      * @return list<int>
      */
-    private function roleHolders(object $step, object $instance): array
+    private function assignedRoleHolders(object $step, object $instance): array
     {
         if (! $step->assigned_role_code) {
             return [];
@@ -557,7 +562,7 @@ final class AssigneeResolver
             })->pluck('user_id')->map(fn ($id): int => (int) $id)->unique()->sort()->values()->all();
         }
 
-        return $this->withFinanceAuthority((string) $step->assigned_role_code, DB::table('department_user_roles as a')
+        $rows = DB::table('department_user_roles as a')
             ->join('roles as r', 'r.id', '=', 'a.role_id')
             ->join('users as u', 'u.id', '=', 'a.user_id')
             ->where('r.code', $step->assigned_role_code)
@@ -568,9 +573,14 @@ final class AssigneeResolver
             ))
             ->distinct()
             ->orderBy('u.id')
-            ->pluck('u.id')
-            ->map(fn ($id): int => (int) $id)
-            ->all());
+            ->get(['u.id', 'a.department_id']);
+        if ($step->assigned_role_code === Authority::HEAD_ROLE) {
+            $authority = app(Authority::class);
+            $rows = $rows->filter(fn (object $row): bool => $row->department_id !== null && $authority->isHeadOf((int) $row->id, (int) $row->department_id));
+        }
+
+        return $this->withFinanceAuthority((string) $step->assigned_role_code,
+            $rows->pluck('id')->map(fn ($id): int => (int) $id)->unique()->values()->all());
     }
 
     /**

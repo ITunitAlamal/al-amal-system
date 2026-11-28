@@ -3,6 +3,7 @@
 namespace App\Services\Orphans\Campaigns;
 
 use App\Models\User;
+use App\Services\Orphans\RegistryQueries;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -408,13 +409,14 @@ final class NominationEngine
         $lastBenefit = "(select max(b.delivered_on) from benefit_records b where b.orphan_id = o.id and b.kind = 'delivery' and not exists (select 1 from benefit_records r where r.reverses_id = b.id))";
         $rows = [];
         if ($campaign->beneficiary_unit === 'orphan') {
-            $query = DB::table('orphans as o')->join('persons as p', 'p.id', '=', 'o.person_id')
-                ->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.person_id', '=', 'p.id')->where('a.kind', 'current')->whereNull('a.ends_on'))
+            // Residence: the child's own current address, else the current household's (RegistryQueries::joinResidence).
+            $displaced = RegistryQueries::displacedSql('p.id');
+            $query = RegistryQueries::joinResidence(DB::table('orphans as o')->join('persons as p', 'p.id', '=', 'o.person_id'), 'p.id')
                 ->whereNotIn('o.status', self::EXCLUDED_FILE_STATUSES)
                 ->selectRaw("o.id, o.status, o.registered_on, o.orphan_class_value_id, p.sex, p.date_of_birth, a.governorate_value_id, a.locality_value_id,
                     a.tenure_value_id, a.shelter_type_value_id, a.building_condition_value_id,
                     (select e.status_value_id from education_records e where e.orphan_id = o.id and e.status_value_id is not null order by e.id desc limit 1) as education_status,
-                    exists (select 1 from registry_addresses d where d.person_id = p.id and d.kind = 'displacement' and d.ends_on is null) as displaced,
+                    $displaced as displaced,
                     exists (select 1 from orphan_guardianships g where g.orphan_id = o.id and g.status = 'approved' and (g.starts_on is null or g.starts_on <= '$today') and (g.ends_on is null or g.ends_on >= '$today')) as approved_guardian,
                     (select g.guardian_id from orphan_guardianships g where g.orphan_id = o.id and g.status = 'approved' order by g.is_primary desc, g.id limit 1) as guardian_id,
                     $sponsored as sponsored, $lastBenefit as last_benefit,
@@ -435,11 +437,11 @@ final class NominationEngine
                 $rows['h:'.$r->id] = (array) $r;
             }
         } else {
-            $query = DB::table('orphan_guardians as gg')->join('persons as p', 'p.id', '=', 'gg.person_id')
-                ->leftJoin('registry_addresses as a', fn ($j) => $j->on('a.person_id', '=', 'p.id')->where('a.kind', 'current')->whereNull('a.ends_on'))->where('gg.status', 'active')
+            $displaced = RegistryQueries::displacedSql('p.id');
+            $query = RegistryQueries::joinResidence(DB::table('orphan_guardians as gg')->join('persons as p', 'p.id', '=', 'gg.person_id'), 'p.id')->where('gg.status', 'active')
                 ->whereExists(fn ($q) => $q->from('orphan_guardianships as g')->whereColumn('g.guardian_id', 'gg.id')->where('g.status', 'approved'))
                 ->selectRaw("gg.id, gg.person_id, a.governorate_value_id, a.locality_value_id, a.tenure_value_id, a.shelter_type_value_id, a.building_condition_value_id, (select count(*) from orphan_guardianships g where g.guardian_id = gg.id and g.status = 'approved') as children,
-                    exists (select 1 from registry_addresses d where d.person_id = p.id and d.kind = 'displacement' and d.ends_on is null) as displaced");
+                    $displaced as displaced");
             foreach ($query->cursor() as $r) {
                 $rows['g:'.$r->id] = (array) $r;
             }

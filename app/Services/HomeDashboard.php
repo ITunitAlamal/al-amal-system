@@ -11,6 +11,7 @@ use App\Services\Configuration\NavigationAccessRules;
 use App\Services\Departments\DepartmentWorkspace;
 use App\Services\Finance\FinanceApprovalQueue;
 use App\Services\Finance\FinanceGuard;
+use App\Services\Organization\Authority;
 use App\Services\Progress\TransactionTracker;
 use App\Services\Workflow\WorkflowCatalog;
 use Illuminate\Support\Carbon;
@@ -80,14 +81,14 @@ final class HomeDashboard
     }
 
     /**
-     * For department heads: their departments as recorded in the organization (departments.head_user_id).
+     * For department heads: the departments they validly head (Organization\Authority: the seat with the head role there).
      *
      * @return array<string, mixed>|null
      */
     private function teamPanel(User $user): ?array
     {
-        $departments = DB::table('departments')->where('head_user_id', $user->id)->where('is_active', true)->whereNull('deleted_at')
-            ->orderBy('name')->get(['id', 'name']);
+        $headed = app(Authority::class)->headedDepartmentIds($user);
+        $departments = $headed === [] ? collect() : DB::table('departments')->whereIn('id', $headed)->orderBy('name')->get(['id', 'name']);
         if ($departments->isEmpty()) {
             return null;
         }
