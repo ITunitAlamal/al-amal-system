@@ -497,21 +497,31 @@ final class Campaigns
     }
 
     /**
-     * Records one delivery outcome against the APPROVED version. The idempotency key makes a retry or a repeated
-     * sync return the first result; a row lock on the entry prevents two concurrent deliveries of the same unit.
-     * A confirmed delivery creates exactly one benefit record (unique index), booked on the actual beneficiary.
+     * Records one delivery outcome against the APPROVED version. The idempotency key is bound to the request's data
+     * (request_hash): a retry or a repeated sync with the same data returns the first result, the same key with other
+     * data is refused (409). Holders of one key are serialised, so concurrent retries also get the first result. A
+     * row lock on the entry prevents two concurrent deliveries of the same unit. A confirmed delivery creates exactly
+     * one benefit record (unique index), booked on the actual beneficiary.
      *
      * @return array{status: string, delivery_id: int}
      */
     public function deliver(object $campaign, int $entryId, array $data, User $actor, ?int $deviceId = null): array
     {
         abort_unless($this->canDeliver($actor, $campaign), 403, 'تسجيل التسليم لموظفي التسليم المكلفين بهذه الحملة.');
-        if ($existing = DB::table('campaign_deliveries')->where('idempotency_key', $data['idempotency_key'])->first()) {
-            return ['status' => 'duplicate', 'delivery_id' => (int) $existing->id];
-        }
-        abort_unless(in_array($campaign->status, ['approved', 'distributing', 'reconciling'], true), 409, 'الحملة غير مفتوحة للتسليم.');
+        $hash = hash('sha256', json_encode([(int) $campaign->id, $entryId, (string) $data['kind'], trim((string) ($data['recipient_name'] ?? '')),
+            (string) ($data['recipient_relation'] ?? ''), (int) ($data['failure_reason_value_id'] ?? 0)], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
 
-        return DB::transaction(function () use ($campaign, $entryId, $data, $actor, $deviceId): array {
+        return DB::transaction(function () use ($campaign, $entryId, $data, $actor, $deviceId, $hash): array {
+            DB::select('select pg_advisory_xact_lock(hashtext(?))', ['campaign-delivery:'.$data['idempotency_key']]);
+            if ($existing = DB::table('campaign_deliveries')->where('idempotency_key', $data['idempotency_key'])->first()) {
+                // Rows from before request_hash existed are compared on the columns that define the delivery.
+                $same = $existing->request_hash !== null ? hash_equals($existing->request_hash, $hash)
+                    : (int) $existing->campaign_id === (int) $campaign->id && (int) $existing->list_entry_id === $entryId && $existing->kind === $data['kind'];
+                abort_unless($same, 409, 'مفتاح هذا التسليم استُخدم من قبل لتسجيل ببيانات أخرى؛ لم يُسجَّل شيء. أعد فتح نموذج التسليم وسجّل من جديد.');
+
+                return ['status' => 'duplicate', 'delivery_id' => (int) $existing->id];
+            }
+            abort_unless(in_array($campaign->status, ['approved', 'distributing', 'reconciling'], true), 409, 'الحملة غير مفتوحة للتسليم.');
             $entry = DB::table('campaign_list_entries as e')->join('campaign_lists as l', 'l.id', '=', 'e.list_id')->where('e.id', $entryId)->where('l.campaign_id', $campaign->id)
                 ->where('l.status', 'approved')->lockForUpdate()->first(['e.*']);
             abort_unless($entry && $entry->kind === 'primary', 422, 'المستفيد غير مدرج في الكشف الأساسي المعتمد.');
@@ -526,7 +536,7 @@ final class Campaigns
                 }
             }
             $id = DB::table('campaign_deliveries')->insertGetId(['public_id' => (string) Str::ulid(), 'campaign_id' => $campaign->id, 'list_entry_id' => $entry->id, 'unit_key' => $entry->unit_key,
-                'idempotency_key' => $data['idempotency_key'], 'kind' => $data['kind'], 'quantity' => $data['kind'] === 'delivered' ? $entry->quantity : 0, 'recipient_name' => $data['recipient_name'] ?? null,
+                'idempotency_key' => $data['idempotency_key'], 'request_hash' => $hash, 'kind' => $data['kind'], 'quantity' => $data['kind'] === 'delivered' ? $entry->quantity : 0, 'recipient_name' => $data['recipient_name'] ?? null,
                 'recipient_relation' => $data['recipient_relation'] ?? null, 'proxy_note' => $data['proxy_note'] ?? null, 'identity_checked' => (bool) ($data['identity_checked'] ?? false),
                 'failure_reason_value_id' => $data['failure_reason_value_id'] ?? null, 'note' => $data['note'] ?? null, 'recorded_by' => $actor->id, 'device_id' => $deviceId,
                 'occurred_at' => $data['occurred_at'] ?? now(), 'signature_path' => $data['signature_path'] ?? null, 'created_at' => now()]);

@@ -16,6 +16,7 @@ use App\Services\Orphans\Identity;
 use App\Services\Orphans\OrphanAccess;
 use App\Services\Orphans\Persons;
 use App\Services\Orphans\Registry;
+use App\Support\SafeErrorMessage;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -214,7 +215,8 @@ final class ImportPipeline
                 (SELECT 1 FROM import_staged_rows t WHERE t.batch_id = s.batch_id AND t.row_no = s.row_no + 1)', [$batch->id])->gap
             : $first;
         $state = ['status' => $batch->status, 'cursor' => (int) $batch->cursor, 'rows_processed' => (int) $batch->rows_processed, 'staged' => $staged, 'max_row' => DB::table('import_staged_rows')->where('batch_id', $batch->id)->max('row_no'),
-            'issues' => DB::table('import_row_issues')->where('batch_id', $batch->id)->count(), 'error' => mb_substr((string) $batch->error, 0, 300)];
+            // Only the safe form of the error reaches the append-only audit row (older values may hold raw SQL with personal data).
+            'issues' => DB::table('import_row_issues')->where('batch_id', $batch->id)->count(), 'error' => mb_substr((string) SafeErrorMessage::text($batch->error), 0, 300)];
         DB::table('import_batches')->where('id', $batch->id)->update(['status' => 'analyzing', 'cursor' => $gap - 1, 'rows_processed' => $staged, 'error' => null, 'updated_at' => now()]);
         $this->audit->recordRow('orphans.import.resumed', 'import_batches', $batch->id, $state, ['cursor' => $gap - 1], $actor->id, request()?->ip());
 
@@ -235,13 +237,20 @@ final class ImportPipeline
         try {
             $batch = DB::table('import_batches')->find($batch->id); // fresh state, read under the lock
 
-            return match ($batch->status) {
+            $result = match ($batch->status) {
                 'analyzing' => $this->analyzeChunk($batch, $maxRows, $seconds),
                 'executing' => $this->executeChunk($batch, $maxRows, $seconds),
                 default => false,
             };
+            if ($batch->status === 'executing' && $batch->error !== null) {
+                // An execution step that fails stays «executing» with its error; a later step that succeeds clears it.
+                DB::table('import_batches')->where('id', $batch->id)->update(['error' => null, 'updated_at' => now()]);
+            }
+
+            return $result;
         } catch (\Throwable $e) {
-            DB::table('import_batches')->where('id', $batch->id)->update(['status' => $batch->status === 'executing' ? 'executing' : 'failed', 'error' => mb_substr($e->getMessage(), 0, 1000), 'updated_at' => now()]);
+            // Never the raw message: a database error carries the row's bound values (OB-01).
+            DB::table('import_batches')->where('id', $batch->id)->update(['status' => $batch->status === 'executing' ? 'executing' : 'failed', 'error' => mb_substr(SafeErrorMessage::from($e), 0, 1000), 'updated_at' => now()]);
             report($e);
 
             return false;
@@ -444,6 +453,12 @@ final class ImportPipeline
             $matches['guardian'] = ['person' => $g->public_id, 'name' => $g->full_name];
             if ($n['guardian_full_name'] !== '' && ArabicText::key($g->full_name) !== $n['guardian_name_key']) {
                 $add('guardian_name_differs', 'conflict', 'guardian_full_name', 'اسم الوصي يختلف عن الشخص المسجل بالرقم نفسه («'.$g->full_name.'»).');
+            }
+        }
+        // A father/mother identity number that points at the wrong person is a conflict, never an automatic link (DB-01).
+        foreach (['father', 'mother'] as $who) {
+            if ($conflict = $this->parentIdentityConflict($n, $who)) {
+                $add('identity_other_role', 'conflict', $who.'_id', $conflict);
             }
         }
         if (($n['health_status'] ?? '') !== '' || ($n['health_note'] ?? '') !== '') {
@@ -765,19 +780,24 @@ final class ImportPipeline
     public function approve(object $batch, User $actor, ?array $rowIds = null): void
     {
         $this->access->assertDecision($actor, 'import');
-        abort_unless(in_array($batch->status, self::REVIEWABLE, true), 409, 'الدفعة ليست في مرحلة المراجعة.');
-        $scope = null;
-        if ($rowIds) {
-            $families = DB::table('import_staged_rows')->where('batch_id', $batch->id)->whereIn('id', $rowIds)->whereNotNull('family_key')->pluck('family_key')->all();
-            $scope = DB::table('import_staged_rows')->where('batch_id', $batch->id)->where(fn ($q) => $q->whereIn('id', $rowIds)->orWhereIn('family_key', $families))->pluck('id')->all();
-            abort_if($scope === [], 422, 'لم يُحدد أي صف من هذه الدفعة.');
-        }
-        $retried = DB::table('import_execution_events')->where('batch_id', $batch->id)->whereIn('outcome', ['failed', 'held_for_review'])
-            ->when($scope, fn ($q) => $q->whereIn('row_id', $scope))->delete();
-        DB::table('import_batches')->where('id', $batch->id)->update(['status' => 'executing', 'approved_by' => $actor->id, 'approved_at' => now(), 'cursor' => 0,
-            'commit_scope' => $scope ? json_encode(['rows' => $scope]) : null, 'updated_at' => now()]);
-        $this->audit->recordRow('orphans.import.provisional_commit', 'import_batches', $batch->id, null,
-            ['preview' => $this->summary($batch->id)['preview'], 'scoped_rows' => $scope ? count($scope) : null, 'retried' => $retried], $actor->id, request()?->ip());
+        // The approval is claimed on the locked batch row: a second approval (another decider or a double click) finds
+        // it «executing» and is refused, so it never rewrites the scope or cursor of a running execution (CO-10).
+        DB::transaction(function () use ($batch, $actor, $rowIds): void {
+            $current = DB::table('import_batches')->where('id', $batch->id)->lockForUpdate()->first(['id', 'status']);
+            abort_unless($current && in_array($current->status, self::REVIEWABLE, true), 409, 'الدفعة ليست في مرحلة المراجعة (قد يكون اعتمادها سُجّل للتو).');
+            $scope = null;
+            if ($rowIds) {
+                $families = DB::table('import_staged_rows')->where('batch_id', $batch->id)->whereIn('id', $rowIds)->whereNotNull('family_key')->pluck('family_key')->all();
+                $scope = DB::table('import_staged_rows')->where('batch_id', $batch->id)->where(fn ($q) => $q->whereIn('id', $rowIds)->orWhereIn('family_key', $families))->pluck('id')->all();
+                abort_if($scope === [], 422, 'لم يُحدد أي صف من هذه الدفعة.');
+            }
+            $retried = DB::table('import_execution_events')->where('batch_id', $batch->id)->whereIn('outcome', ['failed', 'held_for_review'])
+                ->when($scope, fn ($q) => $q->whereIn('row_id', $scope))->delete();
+            DB::table('import_batches')->where('id', $batch->id)->update(['status' => 'executing', 'approved_by' => $actor->id, 'approved_at' => now(), 'cursor' => 0,
+                'commit_scope' => $scope ? json_encode(['rows' => $scope]) : null, 'error' => null, 'updated_at' => now()]);
+            $this->audit->recordRow('orphans.import.provisional_commit', 'import_batches', $batch->id, null,
+                ['preview' => $this->summary($batch->id)['preview'], 'scoped_rows' => $scope ? count($scope) : null, 'retried' => $retried], $actor->id, request()?->ip());
+        });
         $this->inline($batch->id);
     }
 
@@ -875,8 +895,19 @@ final class ImportPipeline
         $note = 'استيراد '.$batch->reference_no.' الصف '.$row->row_no;
         $existing = $n['child_id_format'] === 'valid_format' ? Orphan::query()->whereHas('person', fn ($q) => $q->where('id_hash', Identity::hash($n['child_id'])))->lockForUpdate()->first() : null;
 
-        $mother = ($existing && DB::table('orphan_parent_links')->where('orphan_id', $existing->id)->where('relation', 'mother')->exists()) ? null : $this->parentPerson($batch, $row, $n, 'mother', $actor);
-        $father = ($existing && DB::table('orphan_parent_links')->where('orphan_id', $existing->id)->where('relation', 'father')->exists()) ? null : $this->parentPerson($batch, $row, $n, 'father', $actor);
+        $needs = [];
+        foreach (['mother', 'father'] as $who) {
+            $needs[$who] = ! ($existing && DB::table('orphan_parent_links')->where('orphan_id', $existing->id)->where('relation', $who)->exists());
+            // Checked again here, before anything of the row is written: the registry (and this family's earlier rows)
+            // may have changed since the analysis, and an accepted row is never linked to the wrong person (DB-01).
+            if ($needs[$who] && ($conflict = $this->parentIdentityConflict($n, $who))) {
+                // A new child has no file yet to link from: the reviewer skips the row and registers the child by hand.
+                return ['held_for_review', [], $conflict.($existing ? ' صحّح رقم الهوية في الصف أو اربط الوالد يدويًا من ملف اليتيم.'
+                    : ' صحّح رقم الهوية في الصف، أو تخطَّ الصف وسجّل الطفل من نموذج التسجيل ثم اربط الوالد من ملفه.')];
+            }
+        }
+        $mother = $needs['mother'] ? $this->parentPerson($batch, $row, $n, 'mother', $actor) : null;
+        $father = $needs['father'] ? $this->parentPerson($batch, $row, $n, 'father', $actor) : null;
         $household = $this->household($batch, $row, $n, $existing, $mother, $actor);
         $guardian = $this->guardianFor($batch, $row, $guardianSource, $mother ?? $this->linkedParent($existing, 'mother'), $actor);
         $kinship = $this->kinship($guardianSource['guardian_relation'] ?? '');
@@ -929,7 +960,8 @@ final class ImportPipeline
         if ($n[$who.'_full_name'] === '' && $n[$who.'_id'] === '') {
             return null;
         }
-        $person = $n[$who.'_id_format'] === 'valid_format' ? Person::query()->where('id_hash', Identity::hash($n[$who.'_id']))->first() : null;
+        // The caller has already refused a match of the wrong sex, a registered orphan child or a person linked under the other relation.
+        $person = $n[$who.'_id_format'] === 'valid_format' ? Person::query()->where('id_hash', Identity::hash($n[$who.'_id']))->orderBy('id')->first() : null;
         $key = $who.':'.($row->family_key ?? 'row:'.$row->id);
         if (! $person && $n[$who.'_id_format'] !== 'valid_format' && ($id = $this->entity($batch, $key))) {
             $person = Person::find($id);
@@ -945,7 +977,8 @@ final class ImportPipeline
         }
         $note = 'استيراد '.$batch->reference_no.' الصف '.$row->row_no;
         $deceased = $who === 'father' ? $n['father_death_date'] !== null : $n['mother_deceased'];
-        if ($deceased && in_array($person->vital_status, [null, 'unknown'], true)) {
+        // A death reported in a parent's column is never recorded on a registered orphan child (DB-01).
+        if ($deceased && in_array($person->vital_status, [null, 'unknown'], true) && ! DB::table('orphans')->where('person_id', $person->id)->exists()) {
             $cause = $n[$who.'_death_cause'] ?? '';
             $this->persons->recordStatus($person, ['status' => 'deceased', 'event_date' => $n[$who.'_death_date'], 'cause' => $cause !== '' ? $cause : null,
                 'evidence_note' => $note, 'source' => 'ملف الاستيراد', 'verification' => 'reported'], $actor->id);
@@ -964,6 +997,44 @@ final class ImportPipeline
         }
 
         return $person;
+    }
+
+    /**
+     * Why a row's father or mother identity number must not be linked automatically, or null when it may: the number is
+     * the child's own or the other parent's, or it belongs to a registered person whose sex contradicts the role, who
+     * has an orphan file, or who is already linked under the other relation. The row then waits for a person to correct
+     * it; nothing already in the registry is changed (DB-01). The database refuses the last case for new links too.
+     */
+    private function parentIdentityConflict(array $n, string $who): ?string
+    {
+        if (($n[$who.'_id_format'] ?? null) !== 'valid_format') {
+            return null;
+        }
+        $label = $who === 'father' ? 'الأب' : 'الأم';
+        $other = $who === 'father' ? 'mother' : 'father';
+        if (($n['child_id_format'] ?? null) === 'valid_format' && $n[$who.'_id'] === $n['child_id']) {
+            return "رقم هوية {$label} هو رقم هوية اليتيم نفسه.";
+        }
+        if ($who === 'mother' && ($n['father_id_format'] ?? null) === 'valid_format' && $n['mother_id'] === $n['father_id']) {
+            return 'رقم هوية الأب ورقم هوية الأم متطابقان.';
+        }
+        $people = DB::table('persons')->where('id_hash', Identity::hash($n[$who.'_id']))->get(['id', 'sex']);
+        if ($people->isEmpty()) {
+            return null;
+        }
+        $wrongSex = $who === 'father' ? 'female' : 'male';
+        if ($people->contains(fn (object $p): bool => $p->sex === $wrongSex)) {
+            return "رقم هوية {$label} مسجل في السجل ل".($wrongSex === 'female' ? 'أنثى' : 'ذكر').'.';
+        }
+        $ids = $people->pluck('id')->all();
+        if (DB::table('orphans')->whereIn('person_id', $ids)->exists()) {
+            return "رقم هوية {$label} مسجل لطفل له ملف يتيم في السجل.";
+        }
+        if (DB::table('orphan_parent_links')->whereIn('person_id', $ids)->where('relation', $other)->exists()) {
+            return "رقم هوية {$label} مربوط في السجل بصفة ".($other === 'father' ? 'أب' : 'أم').' ليتيم آخر.';
+        }
+
+        return null;
     }
 
     /** The guardian person: identity number, the mother herself, or this batch's guardian key; one guardian row per person. */

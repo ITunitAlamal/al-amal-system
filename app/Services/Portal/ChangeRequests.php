@@ -3,14 +3,17 @@
 namespace App\Services\Portal;
 
 use App\Models\Guardian;
+use App\Models\Orphan;
 use App\Models\User;
 use App\Services\AuditService;
 use App\Services\Configuration\GazaAddress;
+use App\Services\Notifications\NotificationCenter;
 use App\Services\Orphans\Identity;
 use App\Services\Orphans\OrphanAccess;
 use App\Services\Orphans\Registry;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 /**
@@ -34,6 +37,9 @@ final class ChangeRequests
 
     public const STATUS = ['submitted' => 'تم تقديم الطلب', 'under_review' => 'قيد المراجعة', 'needs_info' => 'بحاجة إلى استكمال البيانات', 'approved' => 'معتمد', 'rejected' => 'مرفوض'];
 
+    /** Statuses still open for a staff decision. */
+    private const OPEN = ['submitted', 'under_review', 'needs_info'];
+
     public function __construct(private readonly PortalScope $scope, private readonly Registry $registry, private readonly GazaAddress $geo, private readonly OrphanAccess $access,
         private readonly AuditService $audit, private readonly PortalNotifier $notifier) {}
 
@@ -55,7 +61,7 @@ final class ChangeRequests
 
         return DB::transaction(function () use ($account, $orphan, $subject, $group, $proposed, $reason, $idempotencyKey): object {
             $id = DB::table('portal_change_requests')->insertGetId([
-                'public_id' => (string) \Illuminate\Support\Str::ulid(), 'reference_no' => Registry::reference('CHG', 'portal_change_seq'), 'guardian_account_id' => $account->id,
+                'public_id' => (string) Str::ulid(), 'reference_no' => Registry::reference('CHG', 'portal_change_seq'), 'guardian_account_id' => $account->id,
                 'orphan_id' => $orphan?->id, 'subject' => $subject, 'field_group' => $group, 'proposed' => Crypt::encryptString(json_encode($proposed, JSON_UNESCAPED_UNICODE)),
                 'current_snapshot' => Crypt::encryptString(json_encode($this->current($account, $orphan, $group), JSON_UNESCAPED_UNICODE)), 'reason' => $reason,
                 'status' => 'submitted', 'idempotency_key' => $idempotencyKey, 'created_at' => now(), 'updated_at' => now(),
@@ -63,7 +69,7 @@ final class ChangeRequests
             $row = DB::table('portal_change_requests')->find($id);
             $this->notifier->notify($account->id, 'info', 'استلمنا طلب التعديل '.$row->reference_no, '/guardian/requests', null, 'chg-sent-'.$id);
             foreach ($this->access->headUserIds() as $userId) {
-                app(\App\Services\Notifications\NotificationCenter::class)->notify($userId, 'orphans_portal_change', ['title' => 'طلب تعديل بيانات جديد '.$row->reference_no,
+                app(NotificationCenter::class)->notify($userId, 'orphans_portal_change', ['title' => 'طلب تعديل بيانات جديد '.$row->reference_no,
                     'url' => '/orphans/reviews/changes', 'dedupe' => 'portal-change-'.$id.'-'.$userId]);
             }
 
@@ -76,20 +82,24 @@ final class ChangeRequests
     {
         $row = DB::table('portal_change_requests')->where('public_id', $publicId)->where('guardian_account_id', $account->id)->firstOrFail();
         abort_unless($row->status === 'needs_info', 409, 'لا يُنتظر منك استكمال لهذا الطلب.');
-        DB::table('portal_change_requests')->where('id', $row->id)->update(['status' => 'submitted',
+        // Only while staff still wait for it: a decision taken meanwhile is not reopened.
+        $updated = DB::table('portal_change_requests')->where('id', $row->id)->where('status', 'needs_info')->update(['status' => 'submitted',
             'reason' => trim(($row->reason ? $row->reason."\n— " : '').$note), 'updated_at' => now()]);
+        abort_if($updated === 0, 409, 'لا يُنتظر منك استكمال لهذا الطلب.');
     }
 
     /** Staff decision. approve applies the safe groups; reject and needs_info carry a message for the beneficiary. */
     public function decide(object $row, string $action, ?string $publicNote, ?string $internalNote, User $actor): void
     {
         $this->access->assert($actor, 'portal');
-        abort_unless(in_array($row->status, ['submitted', 'under_review', 'needs_info'], true), 409, 'تم البت في هذا الطلب.');
+        abort_unless(in_array($row->status, self::OPEN, true), 409, 'تم البت في هذا الطلب.');
         if (in_array($action, ['reject', 'needs_info', 'approve'], true) && blank($publicNote)) {
             throw ValidationException::withMessages(['public_note' => 'اكتب الرد الذي يظهر للوصي.']);
         }
         DB::transaction(function () use ($row, $action, $publicNote, $internalNote, $actor): void {
             $row = DB::table('portal_change_requests')->where('id', $row->id)->lockForUpdate()->first();
+            // Re-checked under the lock: a request already decided is never applied twice or overturned.
+            abort_unless($row && in_array($row->status, self::OPEN, true), 409, 'تم البت في هذا الطلب.');
             $update = ['internal_note' => $internalNote ?? $row->internal_note, 'updated_at' => now()];
             if ($action === 'review') {
                 $update += ['status' => 'under_review', 'assigned_to' => $row->assigned_to ?? $actor->id];
@@ -100,7 +110,8 @@ final class ChangeRequests
                 $update += ['status' => $action === 'approve' ? 'approved' : 'rejected', 'public_note' => $publicNote, 'decided_by' => $actor->id, 'decided_at' => now(),
                     'applied_at' => $applied ? now() : null];
             }
-            DB::table('portal_change_requests')->where('id', $row->id)->update($update);
+            $updated = DB::table('portal_change_requests')->where('id', $row->id)->whereIn('status', self::OPEN)->update($update);
+            abort_if($updated === 0, 409, 'تم البت في هذا الطلب.');
             $this->audit->recordRow('orphans.portal_change.'.$action, 'portal_change_requests', $row->id, null, ['reference' => $row->reference_no, 'group' => $row->field_group], $actor->id, request()?->ip());
             if ($action !== 'review') {
                 $this->notifier->notify((int) $row->guardian_account_id, $action === 'needs_info' ? 'action' : 'decision',
@@ -175,7 +186,7 @@ final class ChangeRequests
         } else {
             DB::table('education_records')->insert([...collect($proposed)->only(['school_name', 'stage_value_id', 'status_value_id', 'grade', 'academic_year'])->all(),
                 'orphan_id' => $row->orphan_id, 'source' => 'caregiver', 'created_by' => $actor->id, 'created_at' => now(), 'updated_at' => now()]);
-            $this->registry->refreshCompleteness(\App\Models\Orphan::findOrFail($row->orphan_id));
+            $this->registry->refreshCompleteness(Orphan::findOrFail($row->orphan_id));
         }
 
         return true;

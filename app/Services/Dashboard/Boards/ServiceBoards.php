@@ -9,6 +9,7 @@ use App\Services\Finance\FinanceGuard;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\Progress\TransactionTracker;
 use App\Services\Rentals\RentalsDashboard;
+use App\Support\SafeErrorMessage;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -125,14 +126,17 @@ final class ServiceBoards
         $week = now()->subDays(7);
         $failedJobs = DB::table('failed_jobs');
         $syncFailed = DB::table('attendance_sync_runs')->where('status', 'failed');
-        $imports = DB::table('import_batches')->where('status', 'failed');
+        // A failed analysis, and an approved execution stopped by an error (it stays «executing» with the error set, OB-02).
+        $imports = DB::table('import_batches')->where(fn ($q) => $q->where('status', 'failed')->orWhere(fn ($e) => $e->where('status', 'executing')->whereNotNull('error')));
         $devices = DB::table('attendance_devices')->where('is_active', true)->whereNotNull('last_error');
-        $gaps = collect(app(SystemReadiness::class)->checks())->where('ok', false);
+        // Stopped imports are listed below with their batch link, not a second time as a readiness gap.
+        $gaps = collect(app(SystemReadiness::class)->checks())->where('ok', false)->where('code', '<>', 'import_batches');
         $rows = DB::table('failed_jobs')->orderByDesc('failed_at')->limit(10)->get(['uuid', 'queue', 'failed_at', 'exception'])
             ->map(fn (object $j): array => ['cells' => ['type' => 'مهمة خلفية فاشلة', 'subject' => mb_substr(strtok((string) $j->exception, "\n"), 0, 140), 'date' => (string) $j->failed_at],
                 'status' => ['label' => 'فشل', 'tone' => 'danger'], 'url' => null, 'action' => null, 'overdue' => true])
-            ->concat((clone $imports)->orderByDesc('updated_at')->limit(10)->get(['public_id', 'reference_no', 'error', 'updated_at'])
-                ->map(fn (object $b): array => ['cells' => ['type' => 'دفعة استيراد فاشلة '.$b->reference_no, 'subject' => mb_substr((string) $b->error, 0, 140), 'date' => (string) $b->updated_at],
+            ->concat((clone $imports)->orderByDesc('updated_at')->limit(10)->get(['public_id', 'reference_no', 'status', 'error', 'updated_at'])
+                ->map(fn (object $b): array => ['cells' => ['type' => ($b->status === 'executing' ? 'دفعة استيراد متوقفة أثناء الإدراج ' : 'دفعة استيراد فاشلة ').$b->reference_no,
+                    'subject' => mb_substr((string) SafeErrorMessage::text($b->error), 0, 140), 'date' => (string) $b->updated_at],
                     'status' => ['label' => 'فشل', 'tone' => 'danger'], 'url' => '/orphans/import/'.$b->public_id, 'action' => 'فتح', 'overdue' => true]))
             ->concat((clone $devices)->get(['name', 'last_error', 'last_failure_at'])
                 ->map(fn (object $d): array => ['cells' => ['type' => 'جهاز بصمة: '.$d->name, 'subject' => mb_substr((string) $d->last_error, 0, 140), 'date' => (string) $d->last_failure_at],
@@ -144,7 +148,7 @@ final class ServiceBoards
         return [
             'key' => 'sysadmin', 'title' => 'مدير النظام', 'decision' => 'هل توجد أعطال تقنية أو نواقص إعداد تحتاج تدخلي؟', 'scope' => 'النظام (الصلاحية التقنية لا تمنح اعتمادات المدير التنفيذي)',
             'hero' => BoardKit::metric('أعطال تقنية تحتاج متابعة', (clone $failedJobs)->count() + (clone $imports)->count() + (clone $devices)->count(), 'down',
-                detail: 'مهام خلفية فاشلة '.(clone $failedJobs)->count().' · دفعات استيراد فاشلة '.(clone $imports)->count().' · أجهزة بصمة بخطأ '.(clone $devices)->count()),
+                detail: 'مهام خلفية فاشلة '.(clone $failedJobs)->count().' · دفعات استيراد فاشلة أو متوقفة '.(clone $imports)->count().' · أجهزة بصمة بخطأ '.(clone $devices)->count()),
             'kpis' => [
                 BoardKit::metric('نواقص جاهزية الإعدادات', $gaps->count(), 'down', detail: 'من '.count(app(SystemReadiness::class)->checks()).' فحصًا'),
                 BoardKit::metric('مزامنات بصمة فاشلة (7 أيام)', (clone $syncFailed)->where('created_at', '>=', $week)->count(), 'down', url: route('admin.attendance.index', [], false)),

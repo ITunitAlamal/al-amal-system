@@ -8,11 +8,13 @@ use App\Http\Middleware\NormalizeDigits;
 use App\Http\Middleware\PortalHostBoundary;
 use App\Services\Audit\AuditDenials;
 use App\Services\Validation\DatabaseConflictResponse;
+use App\Support\SafeErrorMessage;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -38,6 +40,16 @@ return Application::configure(basePath: dirname(__DIR__))
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         $exceptions->dontFlash(['national_id', 'communication_password']);
+        // A database error is logged without its bound values, PostgreSQL's DETAIL text or the trace (they carry personal
+        // data): SQLSTATE, table, constraint and column names only (OB-01). Other errors keep the default report.
+        $exceptions->report(function (Throwable $exception) {
+            if (! SafeErrorMessage::involvesDatabase($exception)) {
+                return null;
+            }
+            Log::error(SafeErrorMessage::from($exception), SafeErrorMessage::context($exception));
+
+            return false;
+        });
         // Refused requests (403, throttled sign-in) are recorded in «سجل النظام»; the response itself is unchanged.
         $exceptions->render(function (Throwable $exception, Request $request) {
             AuditDenials::capture($exception, $request);

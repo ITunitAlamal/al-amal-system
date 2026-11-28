@@ -5,6 +5,7 @@ namespace App\Services\Notifications;
 use App\Models\User;
 use App\Services\HotSmsService;
 use App\Services\Organization\EffectiveAssignments;
+use App\Support\SafeErrorMessage;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
@@ -276,7 +277,7 @@ final class NotificationCenter
                 $this->sms->send((string) $phone, $template);
                 $this->smsResult($notificationId, 'sent');
             } catch (Throwable $exception) {
-                Log::warning('Notification SMS failed', ['notification' => $notificationId, 'error' => $exception->getMessage()]);
+                Log::warning('Notification SMS failed', ['notification' => $notificationId, 'error' => SafeErrorMessage::from($exception)]);
                 $this->smsResult($notificationId, 'failed');
             }
         };

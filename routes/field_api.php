@@ -2,12 +2,14 @@
 
 use App\Http\Controllers\Field\FieldApiController as Field;
 use App\Http\Middleware\AuthenticateFieldDevice;
+use App\Http\Middleware\RequireTls;
 use Illuminate\Support\Facades\Route;
 
 /*
  * API of the Windows field-distribution client (field_client/), stateless, token + device bound. Mounted under /api.
+ * In production every route, the sign-in that carries the staff password included, answers over HTTPS only.
  */
-Route::prefix('field/v1')->name('field.')->group(function (): void {
+Route::prefix('field/v1')->name('field.')->middleware(RequireTls::class)->group(function (): void {
     Route::get('/server', [Field::class, 'server'])->middleware('throttle:30,1,field-server')->name('server');
     Route::post('/session', [Field::class, 'signIn'])->middleware('throttle:5,1,field-session')->name('session');
     Route::middleware([AuthenticateFieldDevice::class, 'throttle:120,1,field-api'])->group(function (): void {

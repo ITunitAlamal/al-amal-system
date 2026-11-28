@@ -87,6 +87,7 @@ final class WorkflowPublishingService
             }
             array_push($problems, ...$this->stepOutcomeProblems($step, $definition));
         }
+        array_push($problems, ...$this->droppedInstalledKeys($version, $steps));
 
         $stepIds = $steps->pluck('id')->map(fn ($id): int => (int) $id)->all();
         $stepsById = $steps->keyBy('id');
@@ -217,11 +218,46 @@ final class WorkflowPublishingService
         $problems[] = match (true) {
             ($definition->subject_type ?? null) !== WorkflowEngine::SUBJECT_TYPE => "الأثر في المرحلة «{$step->name}» يعمل في الطلبات العامة فقط؛ معاملات الوحدات تطبّق أثرها بنفسها.",
             ! in_array($effect, AimsRequestEffects::EFFECTS, true) => "الأثر «{$effect}» في المرحلة «{$step->name}» غير معروف.",
+            in_array($effect, AimsRequestEffects::GUARD_EFFECTS, true) => $step->step_type !== 'end' ? "الأثر «{$effect}» تحقق عند إغلاق الطلب؛ ضعه على مرحلة نهاية." : '',
             $step->step_type !== 'end' || $outcome === 'rejected' => "الأثر «{$effect}» يُنفَّذ مرة واحدة عند إنجاز الطلب؛ ضعه على مرحلة نهاية نتيجتها «مكتمل».",
             default => '',
         };
 
         return array_values(array_filter($problems));
+    }
+
+    /**
+     * Effects and stage locks are installed by migrations, not by the designer form. A draft that lost one the
+     * published version carries (an effect no stage of the draft names any more, or a stage that kept its code but
+     * lost its reopen lock) would silently stop opening the purchase in Accounts or guarding a payment, so it is
+     * refused until the key is back.
+     *
+     * @param  Collection<int, object>  $steps
+     * @return list<string>
+     */
+    private function droppedInstalledKeys(object $version, Collection $steps): array
+    {
+        $published = DB::table('workflow_versions')->where('workflow_definition_id', $version->workflow_definition_id)
+            ->where('status', 'published')->where('id', '!=', $version->id)->orderByDesc('version_number')->value('id');
+        if ($published === null) {
+            return [];
+        }
+        $draft = $steps->keyBy('code');
+        $draftEffects = $steps->map(fn (object $step): mixed => $this->assignees->config($step)['effect'] ?? null)->filter()->all();
+        $problems = [];
+        foreach (DB::table('workflow_steps')->where('workflow_version_id', $published)->orderBy('sort_order')->get() as $step) {
+            $config = $this->assignees->config($step);
+            $effect = $config['effect'] ?? null;
+            if (is_string($effect) && $effect !== '' && ! in_array($effect, $draftEffects, true)) {
+                $problems[] = "الأثر «{$effect}» المثبت في المرحلة «{$step->name}» في الإصدار المنشور لم يعد في أي مرحلة من المسودة؛ أعده إلى مرحلته قبل النشر.";
+            }
+            $same = $draft->get($step->code);
+            if (! empty($config['reopen_locked']) && $same !== null && empty($this->assignees->config($same)['reopen_locked'])) {
+                $problems[] = "المرحلة «{$same->name}» مقفلة أمام إعادة الفتح في الإصدار المنشور (صرف أو دفع مسجَّل) وفقدت هذا القفل في المسودة.";
+            }
+        }
+
+        return $problems;
     }
 
     /**

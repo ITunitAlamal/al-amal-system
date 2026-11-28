@@ -203,12 +203,49 @@ final class Aid
             if ($status === 'ended') {
                 DB::table('sponsorship_beneficiaries')->where('sponsorship_id', $current->id)->whereNull('ends_on')->update(['ends_on' => today()->toDateString(), 'ended_reason' => 'إنهاء الكفالة', 'updated_at' => now()]);
                 DB::table('sponsorship_dues')->where('sponsorship_id', $current->id)->where('status', 'planned')->where('due_on', '>', today()->toDateString())->update(['status' => 'cancelled', 'updated_at' => now()]);
+                $this->cancelReferredFutureDues($current, (string) $reason, $actor);
             }
             if ($live) {
                 $this->schedule($current);
             }
             $this->audit->recordRow('orphans.sponsorship.status', 'sponsorships', $current->id, ['status' => $expected], ['status' => $status, 'reason' => $reason], $actor->id, request()?->ip());
         });
+    }
+
+    /**
+     * Ending a sponsorship ends its obligation after today: a due already referred to Accounts for a later date with
+     * nothing collected on it (internal allocation or external receipt) is cancelled here and its receivable is
+     * cancelled in Accounts through the bridge, with the end reason. A later due that has a collection stays referred
+     * for Accounts to settle, and is named in the audit row. Runs inside setStatus' transaction, after the
+     * sponsorship lock (same lock order as refer()).
+     */
+    private function cancelReferredFutureDues(object $sponsorship, string $reason, User $actor): void
+    {
+        $dues = DB::table('sponsorship_dues')->where('sponsorship_id', $sponsorship->id)->where('status', 'referred')
+            ->where('due_on', '>', today()->toDateString())->orderBy('period_start')->lockForUpdate()->get();
+        $cancelled = [];
+        $kept = [];
+        foreach ($dues as $due) {
+            if ((float) self::collected((int) $due->finance_receivable_id, (int) $due->id) > 0) {
+                $kept[] = (int) $due->id;
+
+                continue;
+            }
+            try {
+                // Refused before any write when Accounts already allocated a collection to it: the due then stays.
+                $this->finance->cancelReceivable('sponsorships', $sponsorship->reference_no.':'.$due->period_start, 'إنهاء الكفالة '.$sponsorship->reference_no.': '.$reason, $actor->id);
+            } catch (ValidationException) {
+                $kept[] = (int) $due->id;
+
+                continue;
+            }
+            DB::table('sponsorship_dues')->where('id', $due->id)->where('status', 'referred')->update(['status' => 'cancelled', 'updated_at' => now()]);
+            $cancelled[] = (int) $due->id;
+        }
+        if ($cancelled !== [] || $kept !== []) {
+            $this->audit->recordRow('orphans.sponsorship.referred_dues_cancelled', 'sponsorships', $sponsorship->id, null,
+                ['cancelled_dues' => $cancelled, 'kept_collected_dues' => $kept, 'reason' => $reason], $actor->id, request()?->ip());
+        }
     }
 
     /** Planned dues up to 12 months ahead (or the end date) of an active, fundable sponsorship; existing periods are never rewritten. */
@@ -331,8 +368,16 @@ final class Aid
         if ($decision !== 'approved' && blank($note)) {
             throw ValidationException::withMessages(['note' => 'اذكر السبب.']);
         }
-        DB::table('assistance_requests')->where('id', $request->id)->update(['status' => $decision, 'decision_note' => $note, 'decided_by' => $actor->id, 'decided_at' => now(), 'updated_at' => now()]);
-        $this->audit->recordRow('orphans.assistance.'.$decision, 'assistance_requests', $request->id, null, ['note' => $note], $actor->id, request()?->ip());
+        // One decision only: the row is locked and re-read, and the update applies only while it is still requested,
+        // so a double click or a second decider at the same moment gets 409 instead of overwriting the first.
+        DB::transaction(function () use ($request, $decision, $note, $actor): void {
+            $current = DB::table('assistance_requests')->where('id', $request->id)->lockForUpdate()->first(['id', 'status']);
+            abort_unless($current && $current->status === 'requested', 409, 'تم البت في الطلب مسبقًا.');
+            $updated = DB::table('assistance_requests')->where('id', $request->id)->where('status', 'requested')
+                ->update(['status' => $decision, 'decision_note' => $note, 'decided_by' => $actor->id, 'decided_at' => now(), 'updated_at' => now()]);
+            abort_if($updated === 0, 409, 'تم البت في الطلب مسبقًا.');
+            $this->audit->recordRow('orphans.assistance.'.$decision, 'assistance_requests', $request->id, ['status' => 'requested'], ['status' => $decision, 'note' => $note], $actor->id, request()?->ip());
+        });
     }
 
     /**

@@ -37,7 +37,7 @@ final class SensitiveChanges
     public const LABELS = ['first_name' => 'الاسم الأول', 'father_name' => 'اسم الأب', 'grandfather_name' => 'اسم الجد', 'family_name' => 'اسم العائلة', 'extra_names' => 'أسماء إضافية',
         'full_name' => 'الاسم الكامل', 'id_type_value_id' => 'نوع الوثيقة', 'id_number' => 'رقم الهوية', 'sex' => 'الجنس', 'date_of_birth' => 'تاريخ الميلاد', 'dob_status' => 'دقة تاريخ الميلاد',
         'vital_status' => 'الحالة', 'status' => 'الحالة المبلغ عنها', 'event_date' => 'تاريخ الحدث', 'place' => 'المكان', 'cause' => 'السبب', 'evidence_note' => 'الإثبات',
-        'verification' => 'درجة التحقق', 'parent' => 'الشخص المرتبط', 'orphan_class_value_id' => 'تصنيف اليتم'];
+        'verification' => 'درجة التحقق', 'parent' => 'الشخص المرتبط', 'parent_swap' => 'تبديل الأب والأم', 'parent_swap_files' => 'ملفات الأشقاء المشمولة بالتبديل', 'orphan_class_value_id' => 'تصنيف اليتم'];
 
     private const DOB_STATUS = ['declared' => 'مُفاد', 'verified' => 'متحقق', 'estimated' => 'تقديري'];
 
@@ -132,12 +132,30 @@ final class SensitiveChanges
         $new = ! empty($data['person_id']) ? DB::table('persons')->where('id', $data['person_id'])->value('full_name')
             : (filled($data['full_name'] ?? null) ? $data['full_name'] : trim(implode(' ', array_filter([$data['first_name'] ?? null, $data['father_name'] ?? null, $data['grandfather_name'] ?? null, $data['family_name'] ?? null]))));
         $changes = ['parent' => [$current?->full_name, ($relation === 'father' ? 'الأب: ' : 'الأم: ').$new]];
+        $state = ['person_id' => $current?->person_id ? (string) $current->person_id : null];
+        // Choosing the file's other parent swaps the two links on this file and on every sibling file with the same
+        // pair (DB-01): the head sees both changes and the files before approving. A chosen person also pins the other
+        // parent and the set of files, so a request is never turned into a swap the head did not see.
+        if (! empty($data['person_id'])) {
+            $otherNow = DB::table('orphan_parent_links')->where('orphan_id', $orphan->id)->where('relation', $relation === 'father' ? 'mother' : 'father')->value('person_id');
+            $state['other_person_id'] = $otherNow ? (string) $otherNow : null;
+            $swap = $this->registry->parentSwap($orphan, $relation, (int) $data['person_id']);
+            $state['swap_files'] = Registry::swapFiles($swap);
+            if ($swap) {
+                $otherLabel = $swap[0][0]->relation === 'father' ? 'الأب: ' : 'الأم: ';
+                $changes['parent_swap'] = [$otherLabel.$new, $otherLabel.$current?->full_name];
+                $siblings = DB::table('orphans')->whereIn('id', array_diff($state['swap_files'], [(int) $orphan->id]))->orderBy('reference_no')->pluck('reference_no')->all();
+                if ($siblings !== []) {
+                    $changes['parent_swap_files'] = [null, implode('، ', $siblings)];
+                }
+            }
+        }
         if (filled($data['status'] ?? null)) {
             $changes['status'] = [null, $data['status']];
         }
 
         return $this->store('parent', 'parent:'.$orphan->id.':'.$relation, null, $orphan->id,
-            ['proposed' => $data, 'relation' => $relation, 'state' => ['person_id' => $current?->person_id ? (string) $current->person_id : null], 'changes' => $changes], $actor, 'full_name');
+            ['proposed' => $data, 'relation' => $relation, 'state' => $state, 'changes' => $changes], $actor, 'full_name');
     }
 
     public function requestClass(Orphan $orphan, ?int $classId, User $actor): object
@@ -263,9 +281,21 @@ final class SensitiveChanges
             $orphan = Orphan::query()->lockForUpdate()->findOrFail($row->orphan_id);
             $relation = (string) ($payload['relation'] ?? '');
             abort_unless(in_array($relation, ['father', 'mother'], true), 422);
-            $current = DB::table('orphan_parent_links')->where('orphan_id', $orphan->id)->where('relation', $relation)->value('person_id');
-            $this->assertCurrent(['person_id' => $current ? (string) $current : null], $payload['state'] ?? []);
-            $this->registry->linkParent($orphan, $relation, $proposed, $actor);
+            $links = DB::table('orphan_parent_links')->where('orphan_id', $orphan->id)->pluck('person_id', 'relation');
+            $current = $links[$relation] ?? null;
+            $otherNow = $links[$relation === 'father' ? 'mother' : 'father'] ?? null;
+            $state = $payload['state'] ?? [];
+            $this->assertCurrent(['person_id' => $current ? (string) $current : null, 'other_person_id' => $otherNow ? (string) $otherNow : null],
+                array_diff_key($state, ['swap_files' => true]));
+            // The swap changes exactly the files the head saw (siblings included), or the request is stale.
+            try {
+                // A request made before swap_files existed expects no swap, so it never becomes one the head did not see.
+                $expected = array_key_exists('swap_files', $state) ? (array) $state['swap_files'] : (! empty($proposed['person_id']) ? [] : null);
+                $this->registry->linkParent($orphan, $relation, $proposed, $actor, $expected);
+            } catch (ValidationException $e) {
+                // Shown on the head's decision form (a swap conflict names the files to correct first).
+                throw ValidationException::withMessages(['decision' => collect($e->errors())->flatten()->first() ?? $e->getMessage()]);
+            }
             $this->registry->refreshCompleteness($orphan);
 
             return;

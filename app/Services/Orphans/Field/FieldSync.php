@@ -11,6 +11,8 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\ValidationException;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 
 /**
  * Receives events recorded offline. Each event is the exact JSON the device signed. A retried event (same UUID)
@@ -24,9 +26,15 @@ final class FieldSync
 
     private const CLOCK_TOLERANCE_SECONDS = 600;
 
-    public function __construct(private readonly AuditService $audit, private readonly Campaigns $campaigns, private readonly FieldBatches $batches) {}
+    public function __construct(private readonly AuditService $audit, private readonly Campaigns $campaigns, private readonly FieldBatches $batches, private readonly FieldDevices $devices) {}
 
-    /** @return array{event_uuid: ?string, status: string, reason: ?string} */
+    /**
+     * One event, one outcome: whatever happens to this event, the others of the upload are still received. A delivery
+     * refused while being recorded (an HTTP refusal or a validation error from Campaigns::deliver) is kept as
+     * «معلق لتعارض» with the refusal as its reason, so it never blocks the device's queue and nothing is dropped.
+     *
+     * @return array{event_uuid: ?string, status: string, reason: ?string}
+     */
     public function receive(User $user, object $device, array $upload): array
     {
         $payload = json_decode($upload['payload'], true);
@@ -35,7 +43,7 @@ final class FieldSync
         }
         $uuid = (string) $payload['event_uuid'];
         if ($existing = DB::table('field_events')->where('event_uuid', $uuid)->first()) {
-            return ['event_uuid' => $uuid, 'status' => $existing->status, 'reason' => $existing->status_reason];
+            return $this->storedOutcome($existing, $upload, $uuid);
         }
         if (! FieldKeys::verifyDevice($upload['payload'], $upload['signature'], $device->public_key)) {
             return ['event_uuid' => $uuid, 'status' => 'rejected', 'reason' => 'توقيع الجهاز غير صحيح.'];
@@ -43,13 +51,37 @@ final class FieldSync
         try {
             return DB::transaction(fn (): array => $this->store($user, $device, $upload, $payload, $uuid));
         } catch (UniqueConstraintViolationException) {
-            $stored = DB::table('field_events')->where('event_uuid', $uuid)->first();
-
-            return ['event_uuid' => $uuid, 'status' => $stored->status ?? 'rejected', 'reason' => $stored->status_reason ?? null];
+            return $this->concurrentOutcome($upload, $uuid);
+        } catch (HttpExceptionInterface|ValidationException $refused) {
+            $reason = 'رُفض تسجيل التسليم عند تطبيقه: '.($refused instanceof ValidationException ? collect($refused->errors())->flatten()->implode(' ')
+                : ($refused->getMessage() !== '' ? $refused->getMessage() : 'رمز '.$refused->getStatusCode().'.'));
+            try {
+                return DB::transaction(fn (): array => $this->store($user, $device, $upload, $payload, $uuid, $reason));
+            } catch (UniqueConstraintViolationException) {
+                return $this->concurrentOutcome($upload, $uuid);
+            }
         }
     }
 
-    private function store(User $user, object $device, array $upload, array $payload, string $uuid): array
+    /** A retried event returns its stored outcome; the same UUID carrying another payload is refused, never merged. */
+    private function storedOutcome(object $stored, array $upload, string $uuid): array
+    {
+        if (! hash_equals((string) $stored->event_hash, hash('sha256', $upload['payload']))) {
+            return ['event_uuid' => $uuid, 'status' => 'rejected', 'reason' => 'معرّف الحدث مستخدم لحدث آخر مختلف؛ لم يُسجَّل هذا الحدث.'];
+        }
+
+        return ['event_uuid' => $uuid, 'status' => $stored->status, 'reason' => $stored->status_reason];
+    }
+
+    /** The same event received twice at once: the first one stored decides. */
+    private function concurrentOutcome(array $upload, string $uuid): array
+    {
+        $stored = DB::table('field_events')->where('event_uuid', $uuid)->first();
+
+        return $stored ? $this->storedOutcome($stored, $upload, $uuid) : ['event_uuid' => null, 'status' => 'retry', 'reason' => 'تعذر حفظ الحدث مؤقتًا؛ يُعاد إرساله في المزامنة التالية.'];
+    }
+
+    private function store(User $user, object $device, array $upload, array $payload, string $uuid, ?string $refused = null): array
     {
         $batch = DB::table('campaign_batches')->where('public_id', (string) ($payload['batch'] ?? ''))->lockForUpdate()->first();
         $slot = $batch ? DB::table('campaign_batch_entries')->where('public_id', (string) ($payload['allocation'] ?? ''))->where('batch_id', $batch->id)->first() : null;
@@ -95,6 +127,17 @@ final class FieldSync
         }
         if ($batch->status === 'revoked' || ! $slot->is_active) {
             $hold[] = 'أُلغيت الدفعة أو نُقل المستفيد منها قبل وصول الحدث.';
+        }
+        // Recorded automatically only while the campaign is open for field delivery and the distributor's assignment in
+        // THIS campaign stands; other access the user may hold never turns a field event into a delivery by itself.
+        if (! in_array($campaign->status, ['approved', 'distributing'], true)) {
+            $hold[] = 'لم تعد الحملة مفتوحة للتسليم الميداني (دخلت التسوية أو أُغلقت) عند وصول الحدث.';
+        }
+        if (! $this->devices->isDistributorOf($user, (int) $campaign->id)) {
+            $hold[] = 'سُحب تكليف الموزع بهذه الحملة أو انتهت مدته قبل وصول الحدث.';
+        }
+        if ($refused !== null) {
+            $hold[] = $refused;
         }
         // The current approved version decides: a unit removed by an approved change is held, never auto-delivered.
         $entry = DB::table('campaign_list_entries as e')->join('campaign_lists as l', 'l.id', '=', 'e.list_id')->where('l.campaign_id', $campaign->id)->where('l.status', 'approved')

@@ -10,6 +10,7 @@ use App\Models\Person;
 use App\Models\RegistryAddress;
 use App\Models\User;
 use App\Services\AuditService;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
@@ -180,21 +181,233 @@ final class Registry
         });
     }
 
-    /** Links a father or mother; an existing person is reused so siblings share one parent record. */
-    public function linkParent(Orphan $orphan, string $relation, array $data, User $actor): OrphanParentLink
+    /**
+     * Links a father or mother; an existing person is reused so siblings share one parent record. Choosing the file's
+     * own other parent (father and mother entered in the wrong columns) swaps the two links, on this file and on every
+     * sibling file that carries the same pair, in this one step (DB-01, see swapParents). $expectedSwapFiles, from an
+     * approved request, is the set of files the head saw; a different set now is refused as stale.
+     *
+     * @param  list<int>|null  $expectedSwapFiles
+     */
+    public function linkParent(Orphan $orphan, string $relation, array $data, User $actor, ?array $expectedSwapFiles = null): OrphanParentLink
     {
-        $person = ! empty($data['person_id']) ? Person::findOrFail($data['person_id']) : $this->persons->save($data, null, $actor->id, $relation.'.id_number');
-        if ($person->id === $orphan->person_id) {
-            throw ValidationException::withMessages([$relation => 'لا يمكن ربط اليتيم بنفسه.']);
+        return DB::transaction(function () use ($orphan, $relation, $data, $actor, $expectedSwapFiles): OrphanParentLink {
+            $person = ! empty($data['person_id']) ? Person::findOrFail($data['person_id']) : $this->persons->save($data, null, $actor->id, $relation.'.id_number');
+            if ($person->id === $orphan->person_id) {
+                throw ValidationException::withMessages([$relation => 'لا يمكن ربط اليتيم بنفسه.']);
+            }
+            $swap = $this->parentSwap($orphan, $relation, (int) $person->id, true);
+            if ($expectedSwapFiles !== null && self::swapFiles($swap) !== self::sortedIds($expectedSwapFiles)) {
+                throw ValidationException::withMessages(['decision' => 'تغيّرت ملفات الأشقاء المشمولة بالتبديل بعد تقديم الطلب؛ ارفضه ليُقدَّم طلب جديد على القيم الحالية.']);
+            }
+            if ($swap) {
+                $this->assertSwapAllowed($orphan, $swap, $relation, $actor);
+            }
+            if (! empty($data['status'])) {
+                $this->persons->recordStatus($person, ['status' => $data['status'], 'event_date' => $data['event_date'] ?? null, 'evidence_note' => $data['evidence_note'] ?? null, 'verification' => 'reported'], $actor->id);
+            }
+            if ($swap) {
+                return $this->swapParents($orphan, $relation, $swap, $data, $actor);
+            }
+            $this->assertOneRelation($orphan, $relation, (int) $person->id);
+            try {
+                // Own savepoint: a concurrent link refused by the one-relation trigger (000043) leaves the outer
+                // transaction usable and is returned as a readable message.
+                $link = DB::transaction(fn (): OrphanParentLink => OrphanParentLink::query()->updateOrCreate(['orphan_id' => $orphan->id, 'relation' => $relation],
+                    ['person_id' => $person->id, 'basis' => $data['basis'] ?? 'declared', 'verification' => 'reported', 'verified_by' => null, 'verified_at' => null,
+                        'evidence_note' => $data['link_note'] ?? null, 'created_by' => $actor->id]));
+            } catch (QueryException $e) {
+                if (! self::isOneRelationViolation($e)) {
+                    throw $e;
+                }
+                $this->assertOneRelation($orphan, $relation, (int) $person->id);
+
+                throw ValidationException::withMessages([$relation => 'هذا الشخص مربوط بالصفة الأخرى في ملف آخر؛ لا يُربط الشخص نفسه أبًا وأمًّا.']);
+            }
+            $this->deriveClass($orphan);
+            $this->audit->recordRow('orphans.parent.linked', 'orphan_parent_links', $link->id, null,
+                ['orphan' => $orphan->reference_no, 'relation' => $relation], $actor->id, request()?->ip());
+
+            return $link;
+        });
+    }
+
+    /**
+     * When the person chosen for $relation is this file's other parent, the swap to make: one [other link, $relation
+     * link] pair per file, this file first, then every sibling file that holds the same two persons in the same two
+     * columns (siblings share parent persons, so a swap of one file alone would always break the one-relation rule on
+     * the others). Null when it is not a swap. Refused when the file has no current $relation to move into the other
+     * column (that would leave the other parent empty; the correct parent is linked there first). With $lock, all the
+     * family's links are locked in one statement in id order, and the pairs are re-checked on the locked rows.
+     *
+     * @return list<array{0: OrphanParentLink, 1: OrphanParentLink}>|null
+     */
+    public function parentSwap(Orphan $orphan, string $relation, int $personId, bool $lock = false): ?array
+    {
+        $otherRelation = $relation === 'father' ? 'mother' : 'father';
+        $links = OrphanParentLink::query()->where('orphan_id', $orphan->id)->get()->keyBy('relation');
+        $other = $links->get($otherRelation);
+        if (! $other || (int) $other->person_id !== $personId) {
+            return null;
         }
-        if (! empty($data['status'])) {
-            $this->persons->recordStatus($person, ['status' => $data['status'], 'event_date' => $data['event_date'] ?? null, 'evidence_note' => $data['evidence_note'] ?? null, 'verification' => 'reported'], $actor->id);
+        $current = $links->get($relation);
+        if (! $current) {
+            throw ValidationException::withMessages([$relation => 'هذا الشخص مربوط بهذا الملف '.($otherRelation === 'father' ? 'أبًا' : 'أمًّا')
+                .'؛ اربط '.($otherRelation === 'father' ? 'الأب الصحيح' : 'الأم الصحيحة').' أولًا ثم اربط هذا الشخص '.($relation === 'father' ? 'أبًا' : 'أمًّا').'.']);
         }
-        $link = OrphanParentLink::query()->updateOrCreate(['orphan_id' => $orphan->id, 'relation' => $relation],
-            ['person_id' => $person->id, 'basis' => $data['basis'] ?? 'declared', 'verification' => 'reported', 'verified_by' => null, 'verified_at' => null,
-                'evidence_note' => $data['link_note'] ?? null, 'created_by' => $actor->id]);
+        if ((int) $current->person_id === $personId) {
+            return null;
+        }
+        $from = (int) $current->person_id;
+        $files = DB::table('orphan_parent_links as a')->join('orphan_parent_links as b', 'b.orphan_id', '=', 'a.orphan_id')
+            ->where('a.relation', $relation)->where('a.person_id', $from)->where('b.relation', $otherRelation)->where('b.person_id', $personId)
+            ->pluck('a.orphan_id')->map(fn ($id): int => (int) $id)->push((int) $orphan->id)->unique()->values()->all();
+        $rows = OrphanParentLink::query()->whereIn('orphan_id', $files)->orderBy('id')->when($lock, fn ($q) => $q->lockForUpdate())->get()->groupBy('orphan_id');
+        $pairs = [];
+        foreach ($rows as $orphanId => $fileLinks) {
+            $byRelation = $fileLinks->keyBy('relation');
+            if ((int) $byRelation->get($relation)?->person_id === $from && (int) $byRelation->get($otherRelation)?->person_id === $personId) {
+                $pair = [$byRelation->get($otherRelation), $byRelation->get($relation)];
+                if ((int) $orphanId === (int) $orphan->id) {
+                    array_unshift($pairs, $pair);
+                } else {
+                    $pairs[] = $pair;
+                }
+            }
+        }
+        if ($pairs === [] || (int) $pairs[0][0]->orphan_id !== (int) $orphan->id) {
+            // This file's links changed between the read and the lock.
+            throw ValidationException::withMessages([$relation => 'تغيّرت روابط الأب والأم لهذا الملف أثناء الحفظ؛ أعد فتح الملف وحاول مرة أخرى.']);
+        }
+
+        return $pairs;
+    }
+
+    /**
+     * A person already linked under the other relation on another file is refused with the file references (the
+     * rule of trigger 000043, checked first so the user reads why). Re-saving this file's link to the same person
+     * is never refused, so the existing mixed links listed for the head stay editable.
+     */
+    private function assertOneRelation(Orphan $orphan, string $relation, int $personId): void
+    {
+        $current = DB::table('orphan_parent_links')->where('orphan_id', $orphan->id)->where('relation', $relation)->value('person_id');
+        if ($current !== null && (int) $current === $personId) {
+            return;
+        }
+        $otherRelation = $relation === 'father' ? 'mother' : 'father';
+        $files = DB::table('orphan_parent_links as l')->join('orphans as o', 'o.id', '=', 'l.orphan_id')
+            ->where('l.person_id', $personId)->where('l.relation', $otherRelation)->where('l.orphan_id', '<>', $orphan->id)
+            ->orderBy('o.reference_no')->limit(5)->pluck('o.reference_no')->all();
+        if ($files !== []) {
+            throw ValidationException::withMessages([$relation => 'هذا الشخص مربوط '.($otherRelation === 'father' ? 'أبًا' : 'أمًّا')
+                .' في ملفات أخرى ('.implode('، ', $files).')؛ لا يُربط الشخص نفسه أبًا وأمًّا. صحّح الربط في تلك الملفات أولًا.']);
+        }
+    }
+
+    /** True when $e is the refusal of the one-relation trigger orphan_parent_links_one_relation (000043). */
+    private static function isOneRelationViolation(QueryException $e): bool
+    {
+        return (string) ($e->errorInfo[0] ?? $e->getCode()) === '23514'
+            && (str_contains($e->getMessage(), 'orphan_parent_links_one_relation') || str_contains($e->getMessage(), 'لا يُربط أبًا وأمًّا معًا'));
+    }
+
+    /**
+     * The sorted ids of the files a swap changes (empty when it is not a swap).
+     *
+     * @param  list<array{0: OrphanParentLink, 1: OrphanParentLink}>|null  $swap
+     * @return list<int>
+     */
+    public static function swapFiles(?array $swap): array
+    {
+        return self::sortedIds(array_map(fn (array $pair): int => (int) $pair[0]->orphan_id, $swap ?? []));
+    }
+
+    /**
+     * @param  array<int, int|string>  $ids
+     * @return list<int>
+     */
+    private static function sortedIds(array $ids): array
+    {
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+        sort($ids);
+
+        return $ids;
+    }
+
+    /**
+     * A sibling file past its final approval changes only by the head's decision (ORP-18): staff who swap from an
+     * open file are sent to request it from the approved sibling file, where the head sees the whole family change.
+     *
+     * @param  list<array{0: OrphanParentLink, 1: OrphanParentLink}>  $swap
+     */
+    private function assertSwapAllowed(Orphan $orphan, array $swap, string $relation, User $actor): void
+    {
+        if ($this->access->canDecide($actor)) {
+            return;
+        }
+        $protected = DB::table('orphans')->whereIn('id', array_diff(self::swapFiles($swap), [(int) $orphan->id]))
+            ->whereNotIn('status', SensitiveChanges::OPEN_STATUSES)->orderBy('reference_no')->pluck('reference_no')->all();
+        if ($protected !== []) {
+            throw ValidationException::withMessages([$relation => 'التبديل يشمل ملفات أشقاء معتمدة ('.implode('، ', $protected)
+                .')؛ قدّمه من أحد هذه الملفات ليعتمده رئيس القسم للعائلة كلها.']);
+        }
+    }
+
+    /**
+     * Swaps the father and mother on every file of the pair in one savepoint. The one-relation trigger (000043) is
+     * deferred for the swap and made IMMEDIATE again before the savepoint ends, so a remaining conflict (a parent
+     * linked under the other relation on a file that does not carry the same pair) is raised here, rolled back to the
+     * savepoint and returned as a validation message naming those files, never at commit as a server error.
+     *
+     * @param  list<array{0: OrphanParentLink, 1: OrphanParentLink}>  $swap
+     */
+    private function swapParents(Orphan $orphan, string $relation, array $swap, array $data, User $actor): OrphanParentLink
+    {
+        $otherRelation = $swap[0][0]->relation;
+        $chosen = (int) $swap[0][0]->person_id;
+        $previous = (int) $swap[0][1]->person_id;
+        $guarded = DB::getDriverName() === 'pgsql' && DB::table('pg_trigger')->where('tgname', 'orphan_parent_links_one_relation')->exists();
+        $references = Orphan::query()->whereIn('id', self::swapFiles($swap))->pluck('reference_no', 'id');
+        try {
+            $link = DB::transaction(function () use ($orphan, $relation, $swap, $data, $actor, $otherRelation, $chosen, $previous, $guarded, $references): OrphanParentLink {
+                if ($guarded) {
+                    DB::statement('SET CONSTRAINTS orphan_parent_links_one_relation DEFERRED');
+                }
+                $files = count($swap);
+                foreach ($swap as [$other, $current]) {
+                    $isMain = (int) $current->orphan_id === (int) $orphan->id;
+                    $reference = $references[$current->orphan_id] ?? null;
+                    $other->forceFill(['person_id' => $previous, 'verification' => 'reported', 'verified_by' => null, 'verified_at' => null])->save();
+                    $this->audit->recordRow('orphans.parent.linked', 'orphan_parent_links', $other->id, ['person_id' => $chosen],
+                        ['orphan' => $reference, 'relation' => $otherRelation, 'person_id' => $previous, 'swapped_with' => $relation, 'swap_files' => $files], $actor->id, request()?->ip());
+                    $current->forceFill(['person_id' => $chosen, 'verification' => 'reported', 'verified_by' => null, 'verified_at' => null,
+                        ...($isMain ? ['basis' => $data['basis'] ?? 'declared', 'evidence_note' => $data['link_note'] ?? null] : [])])->save();
+                    $this->audit->recordRow('orphans.parent.linked', 'orphan_parent_links', $current->id, ['person_id' => $previous],
+                        ['orphan' => $reference, 'relation' => $relation, 'person_id' => $chosen, 'swapped_with' => $otherRelation, 'swap_files' => $files], $actor->id, request()?->ip());
+                }
+                if ($guarded) {
+                    DB::statement('SET CONSTRAINTS orphan_parent_links_one_relation IMMEDIATE');
+                }
+
+                return $swap[0][1];
+            });
+        } catch (QueryException $e) {
+            if (! self::isOneRelationViolation($e)) {
+                throw $e;
+            }
+            $files = self::swapFiles($swap);
+            $conflicts = DB::table('orphan_parent_links as l')->join('orphans as o', 'o.id', '=', 'l.orphan_id')->whereNotIn('l.orphan_id', $files)
+                ->where(fn ($q) => $q->where(fn ($w) => $w->where('l.person_id', $chosen)->where('l.relation', $otherRelation))
+                    ->orWhere(fn ($w) => $w->where('l.person_id', $previous)->where('l.relation', $relation)))
+                ->orderBy('o.reference_no')->limit(5)->pluck('o.reference_no')->unique()->values()->all();
+            throw ValidationException::withMessages([$relation => 'لا يكتمل التبديل: أحد الوالدين مربوط بالصفة الأخرى في ملفات لا تحمل الأبوين أنفسهم'
+                .($conflicts !== [] ? ' ('.implode('، ', $conflicts).')' : '').'؛ صحّح ربط الوالدين في تلك الملفات أولًا. لم يتغير أي ملف.']);
+        }
+        // The swap moves a recorded death to the other relation, so each file's derived class is derived again.
+        foreach (Orphan::query()->whereIn('id', array_diff(self::swapFiles($swap), [(int) $orphan->id]))->get() as $file) {
+            $this->deriveClass($file);
+        }
         $this->deriveClass($orphan);
-        $this->audit->recordRow('orphans.parent.linked', 'orphan_parent_links', $link->id, null, ['orphan' => $orphan->reference_no, 'relation' => $relation], $actor->id, request()?->ip());
 
         return $link;
     }

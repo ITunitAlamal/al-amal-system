@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from 'vue';
 import { router, useForm } from '@inertiajs/vue3';
+import axios from 'axios';
 import FormSteps from '../FormSteps.vue';
 import FormErrorSummary from '../FormErrorSummary.vue';
 import PersonFields from '../Registry/PersonFields.vue';
@@ -71,7 +72,7 @@ async function autoSave() {
     if (stopped || !editable.value || form.processing || !form.isDirty || document.hidden) return;
     const snapshot = JSON.parse(JSON.stringify(form.data()));
     try {
-        const { data } = await window.axios.put(props.urls.save, { ...snapshot, version: version.value, last_step: step.value }, { headers: { Accept: 'application/json' } });
+        const { data } = await axios.put(props.urls.save, { ...snapshot, version: version.value, last_step: step.value }, { headers: { Accept: 'application/json' } });
         version.value = data.version;
         form.defaults(snapshot);
         autoState.value = { text: `حُفظ تلقائيًا ${new Date().toTimeString().slice(0, 5)}`, tone: 'text-emerald-700' };

@@ -17,7 +17,7 @@ use Throwable;
  */
 final class AuditDenials
 {
-    private const LOGIN_ROUTES = ['login.submit' => 'auth.lockout', 'guardian.login.store' => 'portal.auth.lockout', 'guardian.password.send' => 'portal.auth.lockout'];
+    private const LOGIN_ROUTES = ['login.submit' => 'auth.lockout', 'field.session' => 'auth.lockout', 'guardian.login.store' => 'portal.auth.lockout', 'guardian.password.send' => 'portal.auth.lockout'];
 
     private const CRITICAL_ROUTES = ['orphans.campaigns.list.action', 'orphans.campaigns.list.edit', 'finance.approvals', 'admin.employees.password.update'];
 

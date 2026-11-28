@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onUnmounted, ref, watch } from 'vue';
 import { Link, router, useForm } from '@inertiajs/vue3';
+import axios from 'axios';
 import AppLayout from '../../../Layouts/AppLayout.vue';
 import StatusBadge from '../../../Components/StatusBadge.vue';
 import StatusStepper from '../../../Components/StatusStepper.vue';
@@ -34,7 +35,7 @@ const drawerError = ref('');
 async function openRow(r) {
     drawer.value = { loading: true, row_no: r.row_no };
     drawerError.value = '';
-    try { drawer.value = (await window.axios.get(`/orphans/import/${props.batch.public_id}/rows/${r.id}`, { headers: { Accept: 'application/json' } })).data; }
+    try { drawer.value = (await axios.get(`/orphans/import/${props.batch.public_id}/rows/${r.id}`, { headers: { Accept: 'application/json' } })).data; }
     catch { drawerError.value = 'تعذر تحميل تفاصيل الصف. أعد المحاولة.'; }
 }
 const steps = computed(() => stages.map((label, i) => ({ label, state: props.batch.status === 'cancelled' ? 'cancelled' : (i < position.value ? 'done' : (i === position.value ? (props.batch.status === 'failed' ? 'rejected' : 'current') : 'upcoming')) })));

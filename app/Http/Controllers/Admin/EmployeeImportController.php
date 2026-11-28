@@ -22,7 +22,8 @@ use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 /**
  * «استيراد الموظفين»: HR management (the appointed HR head or the system administrator) only. Pay and bank values in
- * the preview are masked unless the viewer holds their confidential permission.
+ * the preview are masked unless the viewer holds their confidential permission, and a commit writes them only for
+ * a holder of that permission (EmployeeImportCommitter::withheldGroups).
  */
 class EmployeeImportController extends Controller
 {
@@ -109,7 +110,10 @@ class EmployeeImportController extends Controller
             'can' => [
                 'edit' => in_array($record->status, ['staged', 'validated', 'failed'], true),
                 'commit' => in_array($record->status, ['validated', 'failed'], true),
-                'revert' => in_array($record->status, ['committed', 'failed'], true) && DB::table('employee_import_rows')->where('batch_id', $record->id)->whereIn('result', ['inserted', 'updated'])->exists(),
+                // «reverting» is always offered, even with no row left to undo, so an undo whose run died can be resumed
+                // or finished (the committer refuses a live one).
+                'revert' => $record->status === 'reverting' || (in_array($record->status, ['committed', 'failed'], true)
+                    && DB::table('employee_import_rows')->where('batch_id', $record->id)->whereIn('result', ['inserted', 'updated'])->exists()),
                 'pay' => $this->access->canViewPay($user),
                 'bank' => $this->access->canViewBank($user),
                 'createValues' => $user->isSystemAdmin(),
@@ -191,8 +195,14 @@ class EmployeeImportController extends Controller
         $request->validate(['confirm' => ['required', 'accepted']], ['confirm.accepted' => 'أكّد مراجعة الملخص قبل التنفيذ.']);
         $summary = $committer->commit($batch, $request->user(), $request->ip());
         $results = $summary['results'];
+        // AC-08: pay and bank values the actor may not enter are left out and named here, for HR to enter by request.
+        $withheld = array_values(array_filter([
+            in_array('pay', $summary['withheld'], true) && ($summary['confidential']['pay'] ?? 0) > 0 ? 'الرواتب' : null,
+            in_array('bank', $summary['withheld'], true) && ($summary['confidential']['bank'] ?? 0) > 0 ? 'الحسابات البنكية' : null,
+        ]));
+        $note = $withheld === [] ? '' : ' لم تُكتب '.implode(' ولا ', $withheld).' لأنها بيانات سرية لا تملك صلاحيتها؛ يُدخلها رئيس الموارد البشرية بطلب تعديل الراتب.';
 
-        return back()->with('success', "نُفذت الدفعة: أُنشئ {$results['inserted']} ملفًا، وحُدّث {$results['updated']}، وتُخطي {$results['skipped']}، ورُفض {$results['rejected']}. لم تُنشأ حسابات دخول ولم تُرسل إشعارات.");
+        return back()->with('success', "نُفذت الدفعة: أُنشئ {$results['inserted']} ملفًا، وحُدّث {$results['updated']}، وتُخطي {$results['skipped']}، ورُفض {$results['rejected']}. لم تُنشأ حسابات دخول ولم تُرسل إشعارات.".$note);
     }
 
     public function revert(Request $request, int $batch, EmployeeImportCommitter $committer): RedirectResponse

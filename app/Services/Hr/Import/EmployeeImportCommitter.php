@@ -5,6 +5,7 @@ namespace App\Services\Hr\Import;
 use App\Models\Employee;
 use App\Models\User;
 use App\Services\AuditService;
+use App\Services\Hr\EmployeeAccess;
 use App\Services\Hr\EmployeePlacements;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Carbon;
@@ -36,31 +37,40 @@ final class EmployeeImportCommitter
             'job_title_id' => 'job_title_id', 'job_title_source' => 'job_title_source', 'grade_id' => 'job_grade_id', 'grade_source' => 'grade_source'],
     ];
 
+    /** Session advisory lock space of a running undo (pg_try_advisory_lock(space, batch id)). */
+    private const REVERT_LOCK_SPACE = 42023;
+
     public function __construct(
         private readonly EmployeeImportService $imports,
         private readonly EmployeePlacements $placements,
         private readonly AuditService $audit,
+        private readonly EmployeeAccess $access,
     ) {}
 
     /**
-     * @return array<string, mixed> the batch summary after the run
+     * @return array<string, mixed> the batch summary after the run, with `withheld`: the confidential groups the
+     *                              actor may not write, left out of the run
      */
     public function commit(int $batchId, User $actor, ?string $ip): array
     {
-        $options = DB::transaction(function () use ($batchId): array {
+        $withheld = $this->withheldGroups($actor);
+        $options = DB::transaction(function () use ($batchId, $withheld): array {
             $batch = DB::table('employee_import_batches')->where('id', $batchId)->lockForUpdate()->first();
             abort_unless($batch, 404);
             if (! in_array($batch->status, ['validated', 'failed'], true)) {
-                throw ValidationException::withMessages(['batch' => $batch->status === 'staged'
-                    ? 'حدد لكل عمود حقله أو اختر تجاهله صراحة قبل التنفيذ.' : 'هذه الدفعة نُفذت أو أُلغيت سابقًا.']);
+                throw ValidationException::withMessages(['batch' => match ($batch->status) {
+                    'staged' => 'حدد لكل عمود حقله أو اختر تجاهله صراحة قبل التنفيذ.',
+                    'reverting' => 'يجري التراجع عن هذه الدفعة الآن؛ لا تُنفذ أثناءه.',
+                    default => 'هذه الدفعة نُفذت أو أُلغيت سابقًا.',
+                }]);
             }
-            $this->checkReady($batch);
+            $this->checkReady($batch, $withheld);
             DB::table('employee_import_batches')->where('id', $batchId)->update(['status' => 'committing', 'failure' => null, 'updated_at' => now()]);
 
             return $this->imports->options($batch);
         });
 
-        $context = $this->context($batchId, $options);
+        $context = [...$this->context($batchId, $options), 'withheld' => $withheld];
         while (true) {
             $ids = DB::table('employee_import_rows')->where('batch_id', $batchId)->where('result', 'pending')->orderBy('row_number')->limit(self::CHUNK)->pluck('id');
             if ($ids->isEmpty()) {
@@ -88,15 +98,35 @@ final class EmployeeImportCommitter
 
         DB::table('employee_import_batches')->where('id', $batchId)->update(['status' => 'committed', 'committed_by' => $actor->id, 'committed_at' => now(), 'updated_at' => now()]);
         $summary = $this->imports->summarize($batchId);
-        $this->audit->recordRow('hr.employee_import.committed', 'employee_import_batches', $batchId, null, ['results' => $summary['results']], $actor->id, $ip);
+        $this->audit->recordRow('hr.employee_import.committed', 'employee_import_batches', $batchId, null,
+            ['results' => $summary['results'], 'withheld_groups' => $withheld], $actor->id, $ip);
 
-        return $summary;
+        return [...$summary, 'withheld' => $withheld];
     }
 
     /**
-     * Columns resolved, and the dates, currency and leave type the mapped columns need.
+     * Confidential groups the actor may not write (AC-08). A pay or bank baseline is entered only by someone who may
+     * see it and request its change (the confidential permissions, never the technical administrator's role); for
+     * anyone else the import writes the other fields and leaves these for HR to enter through «طلب تعديل الراتب».
+     *
+     * @return list<string>
      */
-    private function checkReady(object $batch): void
+    private function withheldGroups(User $actor): array
+    {
+        $request = $this->access->canRequestPayChange($actor);
+
+        return array_values(array_filter([
+            $request && $this->access->canViewPay($actor) ? null : 'pay',
+            $request && $this->access->canViewBank($actor) ? null : 'bank',
+        ]));
+    }
+
+    /**
+     * Columns resolved, and the dates, currency and leave type the mapped columns need (withheld groups need none).
+     *
+     * @param  list<string>  $withheld
+     */
+    private function checkReady(object $batch, array $withheld): void
     {
         $map = $this->imports->columnMap($batch);
         if (in_array(null, $map, true)) {
@@ -104,9 +134,9 @@ final class EmployeeImportCommitter
         }
         $options = $this->imports->options($batch);
         $fields = array_values(array_filter($map, fn (?string $field): bool => $field !== null && $field !== 'ignore'));
-        $pay = array_intersect($fields, [...EmployeeImportNormalizer::MONEY_FIELDS, ...EmployeeImportNormalizer::RATE_FIELDS]) !== [];
+        $pay = ! in_array('pay', $withheld, true) && array_intersect($fields, [...EmployeeImportNormalizer::MONEY_FIELDS, ...EmployeeImportNormalizer::RATE_FIELDS]) !== [];
         $leave = array_intersect($fields, EmployeeImportNormalizer::LEAVE_FIELDS) !== [];
-        $bank = array_intersect($fields, ['bank', 'bank_account']) !== [];
+        $bank = ! in_array('bank', $withheld, true) && array_intersect($fields, ['bank', 'bank_account']) !== [];
         if (($pay || $leave || $bank) && empty($options['as_of_date'])) {
             throw ValidationException::withMessages(['as_of_date' => 'حدد تاريخ الأساس الذي تصح عنده الرواتب والأرصدة والحسابات في الملف.']);
         }
@@ -316,6 +346,20 @@ final class EmployeeImportCommitter
         }
 
         $pay = array_intersect_key($values, array_flip([...EmployeeImportNormalizer::MONEY_FIELDS, ...EmployeeImportNormalizer::RATE_FIELDS]));
+        // Withheld confidential groups (AC-08) are noted on the row and never written.
+        $withheld = $context['withheld'] ?? ['pay', 'bank'];
+        if (in_array('pay', $withheld, true)) {
+            if (in_array('pay', $groups, true) && $pay !== []) {
+                $created['pay_note'] = 'pay_withheld_confidential';
+            }
+            $groups = array_values(array_diff($groups, ['pay']));
+        }
+        if (in_array('bank', $withheld, true)) {
+            if (in_array('bank', $groups, true) && (isset($values['bank_account']) || isset($values['bank_source']))) {
+                $created['bank_note'] = 'bank_withheld_confidential';
+            }
+            $groups = array_values(array_diff($groups, ['bank']));
+        }
         if (in_array('pay', $groups, true) && $pay !== [] && $asOf && ! empty($options['currency'])) {
             if (DB::table('employee_compensations')->where('employee_id', $employeeId)->exists()) {
                 $created['pay_note'] = 'pay_requires_request';
@@ -420,37 +464,75 @@ final class EmployeeImportCommitter
      * Compensating undo: removes what the batch created and restores what it changed, only where nothing was edited
      * or linked afterwards. Anything else stays as it is and is listed as blocked for a manual correction.
      *
+     * The batch is claimed first (CO-11): under its row lock it moves to «reverting», which a commit retry refuses,
+     * and a session advisory lock marks the run as alive. A batch left «reverting» by a run that died (its lock is
+     * gone with its connection) is claimed again and resumes; rows already undone are not touched twice. If the run
+     * fails, the batch returns to its previous status with the rows undone so far, and a new undo resumes.
+     *
      * @return array<string, mixed>
      */
     public function revert(int $batchId, User $actor, string $reason, ?string $ip): array
     {
-        $batch = DB::table('employee_import_batches')->where('id', $batchId)->first();
-        abort_unless($batch, 404);
-        if (! in_array($batch->status, ['committed', 'failed'], true)) {
-            throw ValidationException::withMessages(['reason' => 'التراجع متاح لدفعة نُفذت فقط.']);
+        if (! DB::selectOne('SELECT pg_try_advisory_lock(?::int, ?::int) AS locked', [self::REVERT_LOCK_SPACE, $batchId])->locked) {
+            throw ValidationException::withMessages(['reason' => 'يجري التراجع عن هذه الدفعة الآن من جلسة أخرى.']);
         }
-        $references = $this->employeeReferences();
-        foreach (DB::table('employee_import_rows')->where('batch_id', $batchId)->whereIn('result', ['inserted', 'updated'])->orderByDesc('row_number')->pluck('id') as $rowId) {
-            DB::transaction(function () use ($rowId, $batchId, $references, $actor, $ip): void {
-                $row = DB::table('employee_import_rows')->where('id', $rowId)->lockForUpdate()->first();
-                if (! $row || ! in_array($row->result, ['inserted', 'updated'], true)) {
-                    return;
+        try {
+            $previous = DB::transaction(function () use ($batchId, $actor, $ip): string {
+                $batch = DB::table('employee_import_batches')->where('id', $batchId)->lockForUpdate()->first();
+                abort_unless($batch, 404);
+                if (! in_array($batch->status, ['committed', 'failed', 'reverting'], true)) {
+                    throw ValidationException::withMessages(['reason' => 'التراجع متاح لدفعة نُفذت فقط.']);
                 }
-                $blocked = $row->result === 'inserted'
-                    ? $this->revertInsert($row, $batchId, $references, $actor, $ip)
-                    : $this->revertUpdate($row, $batchId, $actor, $ip);
-                $created = json_decode((string) $row->created_records, true) ?: [];
-                DB::table('employee_import_rows')->where('id', $rowId)->update([
-                    'result' => $blocked === [] ? 'reverted' : 'revert_blocked', 'employee_id' => $blocked === [] && $row->result === 'inserted' ? null : $row->employee_id,
-                    'created_records' => json_encode([...$created, 'revert_blocked_by' => $blocked]), 'updated_at' => now(),
-                ]);
-            });
-        }
-        DB::table('employee_import_batches')->where('id', $batchId)->update(['status' => 'reverted', 'reverted_by' => $actor->id, 'reverted_at' => now(), 'revert_reason' => $reason, 'updated_at' => now()]);
-        $summary = $this->imports->summarize($batchId);
-        $this->audit->recordRow('hr.employee_import.reverted', 'employee_import_batches', $batchId, null, ['reason' => $reason, 'results' => $summary['results']], $actor->id, $ip);
+                // Only a finished commit stamps committed_at, so a batch left «reverting» tells which status it had.
+                $previous = $batch->status === 'reverting' ? ($batch->committed_at !== null ? 'committed' : 'failed') : $batch->status;
+                DB::table('employee_import_batches')->where('id', $batchId)->update(['status' => 'reverting', 'updated_at' => now()]);
+                $this->audit->recordRow('hr.employee_import.revert_started', 'employee_import_batches', $batchId, ['status' => $batch->status], ['status' => 'reverting'], $actor->id, $ip);
 
-        return $summary;
+                return $previous;
+            });
+
+            try {
+                $references = $this->employeeReferences();
+                foreach (DB::table('employee_import_rows')->where('batch_id', $batchId)->whereIn('result', ['inserted', 'updated'])->orderByDesc('row_number')->pluck('id') as $rowId) {
+                    DB::transaction(function () use ($rowId, $batchId, $references, $actor, $ip): void {
+                        $row = DB::table('employee_import_rows')->where('id', $rowId)->lockForUpdate()->first();
+                        if (! $row || ! in_array($row->result, ['inserted', 'updated'], true)) {
+                            return;
+                        }
+                        $blocked = $row->result === 'inserted'
+                            ? $this->revertInsert($row, $batchId, $references, $actor, $ip)
+                            : $this->revertUpdate($row, $batchId, $actor, $ip);
+                        $created = json_decode((string) $row->created_records, true) ?: [];
+                        DB::table('employee_import_rows')->where('id', $rowId)->update([
+                            'result' => $blocked === [] ? 'reverted' : 'revert_blocked', 'employee_id' => $blocked === [] && $row->result === 'inserted' ? null : $row->employee_id,
+                            'created_records' => json_encode([...$created, 'revert_blocked_by' => $blocked]), 'updated_at' => now(),
+                        ]);
+                    });
+                }
+            } catch (Throwable $exception) {
+                DB::table('employee_import_batches')->where('id', $batchId)->where('status', 'reverting')->update(['status' => $previous, 'updated_at' => now()]);
+                $this->audit->recordRow('hr.employee_import.revert_failed', 'employee_import_batches', $batchId, null, ['status' => $previous], $actor->id, $ip);
+                if ($exception instanceof ValidationException) {
+                    throw $exception;
+                }
+                report($exception);
+
+                throw ValidationException::withMessages(['reason' => 'تعذر إكمال التراجع؛ ما تُرُوجع عنه من الصفوف يبقى كذلك، وعادت الدفعة إلى حالتها السابقة. أعد التراجع لإكمال الباقي.']);
+            }
+
+            // The final status and its audit row land together; if this fails the batch stays «reverting» and a new
+            // undo (always offered for «reverting») finishes it with no row left to touch.
+            return DB::transaction(function () use ($batchId, $actor, $reason, $ip): array {
+                DB::table('employee_import_batches')->where('id', $batchId)->where('status', 'reverting')
+                    ->update(['status' => 'reverted', 'reverted_by' => $actor->id, 'reverted_at' => now(), 'revert_reason' => $reason, 'updated_at' => now()]);
+                $summary = $this->imports->summarize($batchId);
+                $this->audit->recordRow('hr.employee_import.reverted', 'employee_import_batches', $batchId, null, ['reason' => $reason, 'results' => $summary['results']], $actor->id, $ip);
+
+                return $summary;
+            });
+        } finally {
+            DB::selectOne('SELECT pg_advisory_unlock(?::int, ?::int)', [self::REVERT_LOCK_SPACE, $batchId]);
+        }
     }
 
     /**

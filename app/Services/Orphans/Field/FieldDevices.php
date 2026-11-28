@@ -3,8 +3,10 @@
 namespace App\Services\Orphans\Field;
 
 use App\Models\User;
+use App\Services\Audit\AuthAudit;
 use App\Services\AuditService;
 use App\Services\Orphans\OrphanAccess;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
@@ -19,7 +21,7 @@ final class FieldDevices
 {
     public const STATUS_LABELS = ['pending' => 'بانتظار الاعتماد', 'approved' => 'معتمد', 'revoked' => 'ملغى', 'lost' => 'مفقود'];
 
-    public function __construct(private readonly OrphanAccess $access, private readonly AuditService $audit) {}
+    public function __construct(private readonly OrphanAccess $access, private readonly AuditService $audit, private readonly AuthAudit $authAudit) {}
 
     public static function setting(string $key, int $default): int
     {
@@ -31,6 +33,8 @@ final class FieldDevices
     {
         $user = User::where('employee_number', trim($data['employee_number']))->where('is_active', true)->first();
         if (! $user || ! Hash::check($data['password'], (string) $user->password)) {
+            // Same staff credentials as the sign-in page, so the same failed-login record in «سجل النظام».
+            $this->authAudit->staffLoginFailed(request(), (string) $data['employee_number'], 'field');
             throw ValidationException::withMessages(['employee_number' => 'الرقم الوظيفي أو كلمة المرور غير صحيحة، أو الحساب غير مفعّل.']);
         }
         if ($user->must_change_password) {
@@ -123,13 +127,26 @@ final class FieldDevices
         });
     }
 
-    /** A valid «distributor» assignment on a campaign whose list is approved and open for delivery. */
+    /** A valid «distributor» assignment on a campaign whose list is approved and open for delivery (gate of the field API). */
     public function isFieldStaff(User $user): bool
+    {
+        return $this->distributorAssignments((int) $user->id)->join('campaigns as c', 'c.id', '=', 'm.campaign_id')->whereIn('c.status', ['approved', 'distributing'])->exists();
+    }
+
+    /**
+     * A valid «distributor» assignment in THIS campaign (not withdrawn, within its dates). Required for each batch
+     * manifest and each synced event, whatever other access the user holds: the field client acts only on assignments.
+     */
+    public function isDistributorOf(User|int $user, int $campaignId): bool
+    {
+        return $this->distributorAssignments($user instanceof User ? (int) $user->id : $user)->where('m.campaign_id', $campaignId)->exists();
+    }
+
+    private function distributorAssignments(int $userId): Builder
     {
         $today = today()->toDateString();
 
-        return DB::table('campaign_members as m')->join('campaigns as c', 'c.id', '=', 'm.campaign_id')->where('m.user_id', $user->id)->where('m.role', 'distributor')->whereNull('m.revoked_at')
-            ->where(fn ($q) => $q->whereNull('m.starts_on')->orWhere('m.starts_on', '<=', $today))->where(fn ($q) => $q->whereNull('m.ends_on')->orWhere('m.ends_on', '>=', $today))
-            ->whereIn('c.status', ['approved', 'distributing'])->exists();
+        return DB::table('campaign_members as m')->where('m.user_id', $userId)->where('m.role', 'distributor')->whereNull('m.revoked_at')
+            ->where(fn ($q) => $q->whereNull('m.starts_on')->orWhere('m.starts_on', '<=', $today))->where(fn ($q) => $q->whereNull('m.ends_on')->orWhere('m.ends_on', '>=', $today));
     }
 }

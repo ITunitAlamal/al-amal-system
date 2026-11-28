@@ -76,7 +76,7 @@ final class FinanceSourceBridge
         if (! $row || $row->cancelled_at !== null) {
             return false;
         }
-        if ($this->allocatedCents((int) $row->id) > 0) {
+        if ($this->allocatedCents((int) $row->id) > 0 || ($module === 'sponsorships' && $this->sponsorshipReceiptCents($row) > 0)) {
             throw ValidationException::withMessages(['source' => 'على المستحق '.$row->reference.' قبض مخصص في الحسابات؛ يُعكس التخصيص أولًا ثم يُلغى المستحق.']);
         }
         DB::table('finance_receivables')->where('id', $row->id)->update(['cancelled_at' => now(), 'cancelled_by' => $actorId, 'cancel_reason' => $reason, 'updated_at' => now()]);
@@ -130,8 +130,34 @@ final class FinanceSourceBridge
         foreach (DB::table('finance_receivable_adjustments')->where('receivable_id', $receivable->id)->pluck('delta') as $delta) {
             $adjusted += FinanceMoney::cents((string) $delta);
         }
+        // A sponsorship due is also collected by the receipts recorded from the external accounting software
+        // (SponsorshipCollections, documentary mode), which the department counts as well (Aid::collected).
+        $external = ($receivable->source_module ?? null) === 'sponsorships' ? $this->sponsorshipReceiptCents($receivable) : 0;
 
-        return max(0, FinanceMoney::cents((string) $receivable->amount) + $adjusted - $this->allocatedCents((int) $receivable->id));
+        return max(0, FinanceMoney::cents((string) $receivable->amount) + $adjusted - $this->allocatedCents((int) $receivable->id) - $external);
+    }
+
+    /**
+     * Unreversed external receipts allocated to the sponsorship due that this receivable stands for. The due is found
+     * by its unique key (sponsorship reference_no, period_start), which Aid::refer writes as the source reference, so
+     * the lookup uses the unique indexes rather than scanning sponsorship_dues.finance_receivable_id.
+     */
+    private function sponsorshipReceiptCents(object $receivable): int
+    {
+        $reference = (string) ($receivable->source_reference ?? '');
+        $split = strrpos($reference, ':');
+        if ($split === false) {
+            return 0;
+        }
+        $cents = 0;
+        foreach (DB::table('sponsorship_receipt_allocations as x')->join('sponsorship_dues as d', 'd.id', '=', 'x.due_id')
+            ->join('sponsorships as s', 's.id', '=', 'd.sponsorship_id')
+            ->where('s.reference_no', substr($reference, 0, $split))->where('d.period_start', substr($reference, $split + 1))
+            ->where('d.finance_receivable_id', $receivable->id)->whereNull('x.reversed_at')->pluck('x.amount') as $amount) {
+            $cents += FinanceMoney::cents((string) $amount);
+        }
+
+        return $cents;
     }
 
     private function allocatedCents(int $receivableId): int

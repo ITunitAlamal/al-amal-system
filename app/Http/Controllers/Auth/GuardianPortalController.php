@@ -153,6 +153,15 @@ final class GuardianPortalController extends Controller
 
             throw ValidationException::withMessages(['phone' => 'رقم الجوال أو كلمة المرور غير صحيحة، أو الحساب موقوف.']);
         }
+        // One session never holds a staff and a beneficiary sign-in together (AC-04): a staff session open in the
+        // same browser ends here, recorded as the staff member's sign-out. Guard and origin are written explicitly
+        // (the trigger keeps them): this request's context is the portal's, the row is a staff one.
+        if ($staffId = Auth::guard('web')->id()) {
+            DB::table('audit_logs')->insert(['actor_id' => (int) $staffId, 'action' => 'auth.logout', 'subject_type' => 'users', 'subject_id' => (string) $staffId,
+                'guard' => 'web', 'origin' => 'staff', 'reason_code' => 'portal_sign_in', 'metadata' => '{}', 'ip_address' => $request->ip(),
+                'created_at' => now(), 'updated_at' => now()]);
+            Auth::guard('web')->logout();
+        }
         $request->session()->regenerate();
         $account = Auth::guard('guardian')->user();
         $account->forceFill(['last_login_at' => now()])->save();

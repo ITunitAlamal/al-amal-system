@@ -6,7 +6,6 @@ use App\Models\User;
 use App\Services\AuditService;
 use App\Services\Orphans\Campaigns\Campaigns;
 use App\Services\Orphans\OrphanAccess;
-use App\Services\Orphans\Registry;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
@@ -17,15 +16,15 @@ use Illuminate\Support\Str;
  */
 final class FieldBatches
 {
-    public function __construct(private readonly OrphanAccess $access, private readonly Campaigns $campaigns, private readonly FieldKeys $keys, private readonly AuditService $audit) {}
+    public function __construct(private readonly OrphanAccess $access, private readonly Campaigns $campaigns, private readonly FieldKeys $keys, private readonly AuditService $audit,
+        private readonly FieldDevices $devices) {}
 
     /** @param list<string> $unitKeys empty = every primary entry of the approved version not yet in a batch and not delivered */
     public function create(object $campaign, int $distributorId, int $deviceId, array $unitKeys, ?int $governorateId, User $actor): object
     {
         abort_unless($this->access->canAssign($actor) || $this->access->allows($actor, 'campaigns'), 403, 'إنشاء دفعات التوزيع لرئيس القسم أو معدّ الحملة.');
         abort_unless(in_array($campaign->status, ['approved', 'distributing'], true), 409, 'الدفعات تُنشأ لكشف معتمد فقط.');
-        abort_unless(DB::table('campaign_members')->where('campaign_id', $campaign->id)->where('user_id', $distributorId)->where('role', 'distributor')->whereNull('revoked_at')->exists(), 422,
-            'المستخدم ليس مكلفًا بالتسليم في هذه الحملة.');
+        abort_unless($this->devices->isDistributorOf($distributorId, (int) $campaign->id), 422, 'المستخدم ليس مكلفًا بالتسليم في هذه الحملة (أو انتهت مدة تكليفه).');
         abort_unless(DB::table('field_devices')->where('id', $deviceId)->where('user_id', $distributorId)->where('status', 'approved')->exists(), 422, 'الجهاز غير معتمد لهذا الموزع.');
         $list = DB::table('campaign_lists')->where('campaign_id', $campaign->id)->where('status', 'approved')->firstOrFail();
 
@@ -50,11 +49,42 @@ final class FieldBatches
     public function revoke(object $batch, User $actor): void
     {
         abort_unless($this->access->canAssign($actor), 403);
-        DB::transaction(function () use ($batch, $actor): void {
-            DB::table('campaign_batches')->where('id', $batch->id)->update(['status' => 'revoked', 'revoked_by' => $actor->id, 'revoked_at' => now(), 'updated_at' => now()]);
-            DB::table('campaign_batch_entries')->where('batch_id', $batch->id)->update(['is_active' => false, 'updated_at' => now()]);
-            $this->audit->recordRow('orphans.field.batch_revoked', 'campaign_batches', $batch->id, null, null, $actor->id, request()?->ip());
+        DB::transaction(fn () => $this->revokeRow((int) $batch->id, $actor, null));
+    }
+
+    /**
+     * Withdraws a user's assignment to a campaign. In the same transaction the user's open batches of that campaign
+     * (assigned or downloaded) are revoked, so the device can no longer download their manifest and their units are
+     * free for another distributor; events already received stay for review. Returns the number of batches revoked.
+     */
+    public function withdrawMember(object $campaign, int $memberId, User $actor): int
+    {
+        abort_unless($this->access->canAssign($actor) || $this->access->isExecutive($actor), 403, 'سحب التكليف بالحملة لرئيس القسم.');
+
+        return DB::transaction(function () use ($campaign, $memberId, $actor): int {
+            $member = DB::table('campaign_members')->where('id', $memberId)->where('campaign_id', $campaign->id)->lockForUpdate()->first();
+            abort_unless($member, 404, 'التكليف غير موجود في هذه الحملة.');
+            if ($member->revoked_at !== null) {
+                return 0; // Already withdrawn (a repeated click): same outcome, nothing applied twice.
+            }
+            DB::table('campaign_members')->where('id', $member->id)->update(['revoked_at' => now(), 'revoked_by' => $actor->id, 'updated_at' => now()]);
+            $batches = DB::table('campaign_batches')->where('campaign_id', $campaign->id)->where('distributor_user_id', $member->user_id)->whereIn('status', ['assigned', 'downloaded'])
+                ->orderBy('id')->lockForUpdate()->pluck('id');
+            foreach ($batches as $batchId) {
+                $this->revokeRow((int) $batchId, $actor, 'member_withdrawn');
+            }
+            $this->audit->recordRow('orphans.campaign.member_revoked', 'campaigns', (int) $campaign->id, ['user' => (int) $member->user_id, 'role' => $member->role],
+                ['batches_revoked' => $batches->count()], $actor->id, request()?->ip());
+
+            return $batches->count();
         });
+    }
+
+    private function revokeRow(int $batchId, User $actor, ?string $reason): void
+    {
+        DB::table('campaign_batches')->where('id', $batchId)->update(['status' => 'revoked', 'revoked_by' => $actor->id, 'revoked_at' => now(), 'updated_at' => now()]);
+        DB::table('campaign_batch_entries')->where('batch_id', $batchId)->update(['is_active' => false, 'updated_at' => now()]);
+        $this->audit->recordRow('orphans.field.batch_revoked', 'campaign_batches', $batchId, null, $reason ? ['reason' => $reason] : null, $actor->id, request()?->ip());
     }
 
     /** The signed manifest for the device (format 1, as read by field_client). */
@@ -62,7 +92,9 @@ final class FieldBatches
     {
         return DB::transaction(function () use ($user, $device, $batchPublicId): array {
             $batch = DB::table('campaign_batches')->where('public_id', $batchPublicId)->lockForUpdate()->first();
-            abort_if(! $batch || (int) $batch->distributor_user_id !== (int) $user->id || (int) $batch->device_id !== (int) $device->id, 404);
+            // Only to the batch's distributor on its device, while their assignment in THIS campaign stands.
+            abort_if(! $batch || (int) $batch->distributor_user_id !== (int) $user->id || (int) $batch->device_id !== (int) $device->id
+                || ! $this->devices->isDistributorOf($user, (int) $batch->campaign_id), 404);
             abort_unless(in_array($batch->status, ['assigned', 'downloaded'], true), 409, 'الدفعة ليست متاحة للتنزيل.');
             $campaign = DB::table('campaigns')->find($batch->campaign_id);
             abort_unless(in_array($campaign->status, ['approved', 'distributing'], true), 403, 'الحملة غير مفتوحة للتسليم.');

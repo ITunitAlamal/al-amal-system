@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { router, useForm } from '@inertiajs/vue3';
+import axios from 'axios';
 import AppLayout from '../../../Layouts/AppLayout.vue';
 import PageHeader from '../../../Components/PageHeader.vue';
 import FormErrorSummary from '../../../Components/FormErrorSummary.vue';
@@ -38,7 +39,7 @@ let timer = null;
 async function autoSave() {
     if (!editable.value || form.processing || !form.isDirty || document.hidden) return;
     try {
-        const { data } = await window.axios.put(url.value, { answers: form.answers, assessed_on: form.assessed_on, lock_version: form.lock_version }, { headers: { Accept: 'application/json' } });
+        const { data } = await axios.put(url.value, { answers: form.answers, assessed_on: form.assessed_on, lock_version: form.lock_version }, { headers: { Accept: 'application/json' } });
         form.lock_version = data.lock_version;
         form.defaults();
         autoState.value = `حُفظ تلقائيًا ${new Date().toTimeString().slice(0, 5)}`;

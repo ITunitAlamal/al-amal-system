@@ -13,19 +13,31 @@ use Symfony\Component\HttpFoundation\Response;
  * Gives every audit row of this request its context: origin (staff/portal/api), guard, route name, method and a
  * correlation id (the caller's X-Request-Id when it is a safe token, otherwise a new ULID, echoed back). It is stored
  * in the session setting `aims.audit_ctx` that the audit trigger reads; no query string, body or cookie is kept.
+ *
+ * The origin and guard follow the route, not whoever else is signed in to the same session (AC-04): a portal path
+ * (/guardian…) is the guardian's, a field API path is a device's, every other path is staff. Only a portal request
+ * carries the guardian id the trigger uses for rows written without an actor.
  */
 final class AuditContext
 {
+    /** Same portal paths as PortalHostBoundary. */
+    private const PORTAL_PATHS = ['guardian', 'guardian/*'];
+
     public function handle(Request $request, Closure $next): Response
     {
         $incoming = (string) $request->headers->get('X-Request-Id', '');
         $correlation = preg_match('/^[A-Za-z0-9\-]{8,64}$/', $incoming) ? $incoming : (string) Str::ulid();
         $request->attributes->set('correlation_id', $correlation);
-        $guardian = Auth::guard('guardian')->check() ? Auth::guard('guardian')->id() : null;
+        $portal = $request->is(...self::PORTAL_PATHS);
+        $api = $request->is('api/*');
         $context = [
-            'o' => $guardian ? 'portal' : ($request->is('api/*') ? 'api' : 'staff'),
-            'g' => $guardian ? 'guardian' : (Auth::guard('web')->check() ? 'web' : ($request->is('api/*') ? 'sanctum' : null)),
-            'gid' => $guardian,
+            'o' => $portal ? 'portal' : ($api ? 'api' : 'staff'),
+            'g' => match (true) {
+                $portal => 'guardian',
+                $api => $request->is('api/field/*') ? 'field_device' : null,
+                default => Auth::guard('web')->check() ? 'web' : null,
+            },
+            'gid' => $portal ? Auth::guard('guardian')->id() : null,
             'r' => $request->route()?->getName(),
             'm' => $request->method(),
             'c' => $correlation,

@@ -7,6 +7,7 @@ use App\Services\Audit\AuthAudit;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
 use Inertia\Inertia;
@@ -53,6 +54,16 @@ class AuthController extends Controller
             throw ValidationException::withMessages([
                 'employee_number' => 'الرقم الوظيفي أو كلمة المرور غير صحيحة، أو الحساب غير مفعّل.',
             ]);
+        }
+
+        // One session never holds a staff and a beneficiary sign-in together (AC-04): a portal session open in the
+        // same browser ends here, recorded as the guardian's sign-out. Guard and origin are written explicitly
+        // (the trigger keeps them): this request's context is staff, the row is a portal one.
+        if ($guardianId = Auth::guard('guardian')->id()) {
+            DB::table('audit_logs')->insert(['actor_id' => null, 'actor_guardian_id' => (int) $guardianId, 'action' => 'portal.auth.logout', 'subject_type' => 'guardians',
+                'subject_id' => (string) $guardianId, 'guard' => 'guardian', 'origin' => 'portal', 'reason_code' => 'staff_sign_in', 'sensitivity' => 'normal',
+                'metadata' => '{}', 'ip_address' => $request->ip(), 'created_at' => now(), 'updated_at' => now()]);
+            Auth::guard('guardian')->logout();
         }
 
         // تجديد الجلسة بعد نجاح المصادقة.

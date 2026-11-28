@@ -4,6 +4,8 @@ namespace App\Services\Portal;
 
 use App\Models\Guardian;
 use App\Services\HotSmsService;
+use App\Services\Orphans\ArabicText;
+use App\Support\SafeErrorMessage;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -39,8 +41,8 @@ final class GuardianOtp
         try {
             $this->sms->send($account->phone, $text);
         } catch (\Throwable $e) {
-            // No code or phone number in the log.
-            Log::warning('portal.otp.send_failed', ['account' => $account->id, 'purpose' => $purpose, 'error' => $e->getMessage()]);
+            // No code or phone number in the log (a gateway error can quote the request URL with both).
+            Log::warning('portal.otp.send_failed', ['account' => $account->id, 'purpose' => $purpose, 'error' => SafeErrorMessage::from($e)]);
 
             return false;
         }
@@ -57,7 +59,7 @@ final class GuardianOtp
             if (! $row || $row->attempts >= (int) config('portal.otp_attempts', 5)) {
                 return false;
             }
-            if (! hash_equals($row->code_hash, $this->hash(preg_replace('/\D/', '', \App\Services\Orphans\ArabicText::digits($code)) ?? ''))) {
+            if (! hash_equals($row->code_hash, $this->hash(preg_replace('/\D/', '', ArabicText::digits($code)) ?? ''))) {
                 DB::table('guardian_otps')->where('id', $row->id)->increment('attempts');
 
                 return false;

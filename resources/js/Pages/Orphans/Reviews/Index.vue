@@ -39,6 +39,7 @@ function assignAppeal(a, id) { router.post(`/orphans/reviews/appeals/${a.public_
             <div class="flex flex-wrap gap-4">
                 <Link href="/orphans/reviews/changes" class="inline-block text-sm font-semibold text-blue-700 hover:underline">طلبات تعديل البيانات من البوابة ←</Link>
                 <Link href="/orphans/reviews/sensitive" class="inline-block text-sm font-semibold text-blue-700 hover:underline">التعديلات الحساسة على الملفات المعتمدة<template v-if="counts.sensitive"> ({{ counts.sensitive }})</template> ←</Link>
+                <Link v-if="abilities.decide" href="/orphans/reviews/parent-links" class="inline-block text-sm font-semibold text-blue-700 hover:underline">روابط الأبوين المشكوك فيها ←</Link>
             </div>
             <div class="grid gap-3 sm:grid-cols-4">
                 <button type="button" class="card text-start" @click="go({ tab: 'applications', status: '', assigned: '' })"><p class="text-sm text-slate-600">طلبات مفتوحة</p><p class="mt-1 text-2xl font-bold text-navy-800">{{ counts.open }}</p></button>

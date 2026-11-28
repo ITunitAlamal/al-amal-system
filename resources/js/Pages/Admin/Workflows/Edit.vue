@@ -70,7 +70,8 @@ function saveStep() {
         const config = { ...data.assignment_config };
         if (data.step_type === 'end') {
             payload.assignment_type = null;
-            payload.assignment_config = { outcome: config.outcome };
+            // An end step's effect (opening the purchase in Accounts, a closure guard) is installed by a migration and kept.
+            payload.assignment_config = config.effect ? { outcome: config.outcome, effect: config.effect } : { outcome: config.outcome };
         } else {
             delete config.outcome;
             payload.assignment_config = config;
@@ -180,7 +181,7 @@ const input = 'field';
                 </button>
             </PageHeader>
 
-            <div v-if="errors.version || errors.publish" class="alert-error" role="alert">{{ errors.version || errors.publish }}</div>
+            <div v-if="errors.version || errors.publish || errors.step" class="alert-error" role="alert">{{ errors.version || errors.publish || errors.step }}</div>
 
             <section v-if="editable && problems.length" class="alert-warning">
                 <h2 class="font-bold">قبل النشر ({{ problems.length }})</h2>

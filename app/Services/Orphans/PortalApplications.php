@@ -25,6 +25,9 @@ final class PortalApplications
 
     public const CHILD_STATUS = ['pending' => 'بانتظار القرار', 'approved' => 'وصاية معتمدة', 'rejected' => 'مرفوض', 'needs_completion' => 'بانتظار استكمال'];
 
+    /** A child still open for a decision. */
+    private const UNDECIDED_CHILD = ['pending', 'needs_completion'];
+
     public function __construct(private readonly Registry $registry, private readonly Persons $persons, private readonly OrphanAccess $access,
         private readonly AuditService $audit, private readonly NotificationCenter $notifications) {}
 
@@ -107,10 +110,13 @@ final class PortalApplications
             throw ValidationException::withMessages(['starts_on' => 'حدد تاريخ بدء سريان الوصاية.']);
         }
         DB::transaction(function () use ($child, $application, $data, $actor): void {
+            // The child row is locked and re-checked before any registry write, so a double click or a second reviewer
+            // deciding at the same moment can neither create a second orphan file nor overturn the first decision.
+            $child = $this->lockUndecidedChild((int) $child->id);
             if (filled($application->form_data)) {
                 // Family request: the child's own guardian, shared parents and household come from the request snapshot.
                 [$orphan, $guardianship] = app(Registration\FamilyPromotion::class)->promote($application, $child, $data, $actor);
-                DB::table('portal_application_children')->where('id', $child->id)->update(['status' => 'approved', 'matched_orphan_id' => $orphan->id, 'guardianship_id' => $guardianship->id,
+                $this->decideChild((int) $child->id, ['status' => 'approved', 'matched_orphan_id' => $orphan->id, 'guardianship_id' => $guardianship->id,
                     'decided_by' => $actor->id, 'decided_at' => now(), 'decision_note' => $data['note'] ?? null, 'updated_at' => now()]);
                 $this->event($application->id, 'child_approved', $actor->id, $data['note'] ?? null, $child->id);
                 $this->settle($application->id);
@@ -139,7 +145,7 @@ final class PortalApplications
                 $guardianship = OrphanGuardianship::query()->where('orphan_id', $orphan->id)->where('guardian_id', $guardian->id)->firstOrFail();
             }
             $this->registry->refreshCompleteness($orphan);
-            DB::table('portal_application_children')->where('id', $child->id)->update(['status' => 'approved', 'matched_orphan_id' => $orphan->id, 'guardianship_id' => $guardianship->id,
+            $this->decideChild((int) $child->id, ['status' => 'approved', 'matched_orphan_id' => $orphan->id, 'guardianship_id' => $guardianship->id,
                 'decided_by' => $actor->id, 'decided_at' => now(), 'decision_note' => $data['note'] ?? null, 'updated_at' => now()]);
             $this->event($application->id, 'child_approved', $actor->id, $data['note'] ?? null, $child->id);
             $this->settle($application->id);
@@ -155,10 +161,31 @@ final class PortalApplications
         $this->assertReviewer($application, $actor);
         abort_unless(in_array($child->status, ['pending', 'needs_completion'], true), 409, 'تم البت في هذا الطفل مسبقًا.');
         DB::transaction(function () use ($child, $application, $note, $actor): void {
-            DB::table('portal_application_children')->where('id', $child->id)->update(['status' => 'rejected', 'decided_by' => $actor->id, 'decided_at' => now(), 'decision_note' => $note, 'updated_at' => now()]);
+            $child = $this->lockUndecidedChild((int) $child->id);
+            $this->decideChild((int) $child->id, ['status' => 'rejected', 'decided_by' => $actor->id, 'decided_at' => now(), 'decision_note' => $note, 'updated_at' => now()]);
             $this->event($application->id, 'child_rejected', $actor->id, $note, $child->id);
             $this->settle($application->id);
         });
+    }
+
+    /** The child row under a lock, refused with 409 once it is decided (approve and reject alike). */
+    private function lockUndecidedChild(int $childId): object
+    {
+        $child = DB::table('portal_application_children')->where('id', $childId)->lockForUpdate()->first();
+        abort_unless($child && in_array($child->status, self::UNDECIDED_CHILD, true), 409, 'تم البت في هذا الطفل مسبقًا.');
+
+        return $child;
+    }
+
+    /**
+     * The decision is written only while the child is still undecided; otherwise the whole decision is undone.
+     *
+     * @param  array<string, mixed>  $values
+     */
+    private function decideChild(int $childId, array $values): void
+    {
+        $updated = DB::table('portal_application_children')->where('id', $childId)->whereIn('status', self::UNDECIDED_CHILD)->update($values);
+        abort_if($updated === 0, 409, 'تم البت في هذا الطفل مسبقًا.');
     }
 
     /** One editable message to the applicant; approved decisions stay as they are. */

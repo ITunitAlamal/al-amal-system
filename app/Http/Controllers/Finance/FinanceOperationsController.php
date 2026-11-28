@@ -83,12 +83,16 @@ class FinanceOperationsController extends Controller
     {
         $this->guard->assert($request->user(), 'finance.procurement.manage');
         $documentary = $this->guard->documentaryMode();
-        $data = $request->validate(['department_id' => 'required|exists:departments,id', 'budget_line_id' => $documentary ? 'prohibited' : 'required|exists:finance_budget_lines,id', 'currency' => 'required|exists:currencies,code', 'purpose' => 'required|string|max:5000', 'source_module' => 'nullable|string|max:55', 'source_id' => 'nullable|string|max:140', 'items' => 'required|array|min:1', 'items.*.item_name' => 'required|string|max:255', 'items.*.quantity' => 'required|regex:/^\d{1,9}(\.\d{1,3})?$/', 'items.*.unit' => 'required|string|max:40', 'items.*.unit_price' => 'required|regex:/^\d{1,9}(\.\d{1,4})?$/']);
+        // A purchase request entered by hand has no source record. The link to a «طلب شراء» is made only by the
+        // workflow when procurement accepts it (AimsRequestEffects); a typed link would put that request's requester
+        // in the creator's place in the separation-of-duties checks (FinanceOperations::requesterOf).
+        $data = $request->validate(['department_id' => 'required|exists:departments,id', 'budget_line_id' => $documentary ? 'prohibited' : 'required|exists:finance_budget_lines,id', 'currency' => 'required|exists:currencies,code', 'purpose' => 'required|string|max:5000', 'source_module' => 'prohibited', 'source_id' => 'prohibited', 'items' => 'required|array|min:1', 'items.*.item_name' => 'required|string|max:255', 'items.*.quantity' => 'required|regex:/^\d{1,9}(\.\d{1,3})?$/', 'items.*.unit' => 'required|string|max:40', 'items.*.unit_price' => 'required|regex:/^\d{1,9}(\.\d{1,4})?$/'],
+            ['source_module.prohibited' => 'ربط طلب الشراء بطلب من «طلباتي» يتم تلقائيًا عند استلام المشتريات للطلب، ولا يُدخل يدويًا.', 'source_id.prohibited' => 'ربط طلب الشراء بطلب من «طلباتي» يتم تلقائيًا عند استلام المشتريات للطلب، ولا يُدخل يدويًا.']);
         $id = DB::transaction(function () use ($data, $request) {
             $id = DB::table('finance_purchase_requests')->insertGetId([
                 'number' => 'PR-'.strtoupper(bin2hex(random_bytes(8))), 'department_id' => $data['department_id'],
                 'budget_line_id' => $data['budget_line_id'] ?? null, 'currency' => $data['currency'],
-                'purpose' => $data['purpose'], 'source_module' => $data['source_module'] ?? null, 'source_id' => $data['source_id'] ?? null,
+                'purpose' => $data['purpose'], 'source_module' => null, 'source_id' => null,
                 'created_by' => $request->user()->id, 'created_at' => now(), 'updated_at' => now(),
             ]);
             foreach ($data['items'] as $i) {

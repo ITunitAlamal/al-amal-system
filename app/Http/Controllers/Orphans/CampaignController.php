@@ -258,10 +258,9 @@ final class CampaignController extends Controller
 
     public function revokeMember(Request $request, string $publicId, int $member): RedirectResponse
     {
-        abort_unless($this->access->canAssign($request->user()) || $this->access->isExecutive($request->user()), 403);
-        DB::table('campaign_members')->where('id', $member)->where('campaign_id', $this->find($publicId)->id)->whereNull('revoked_at')->update(['revoked_at' => now(), 'revoked_by' => $request->user()->id, 'updated_at' => now()]);
+        $revoked = app(FieldBatches::class)->withdrawMember($this->find($publicId), $member, $request->user());
 
-        return back()->with('success', 'سُحب التكليف.');
+        return back()->with('success', 'سُحب التكليف.'.($revoked > 0 ? ' وأُلغيت دفعات التوزيع المفتوحة له في هذه الحملة ('.$revoked.')؛ الأحداث المستلمة منها محفوظة للمراجعة.' : ''));
     }
 
     public function stock(Request $request, string $publicId): RedirectResponse

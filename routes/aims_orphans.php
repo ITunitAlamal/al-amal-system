@@ -5,6 +5,7 @@ use App\Http\Controllers\Orphans\CampaignController as Campaign;
 use App\Http\Controllers\Orphans\CaseStudyController as CaseStudy;
 use App\Http\Controllers\Orphans\HomeController;
 use App\Http\Controllers\Orphans\ImportController as Import;
+use App\Http\Controllers\Orphans\ParentLinksController as ParentLinks;
 use App\Http\Controllers\Orphans\RegistrationsController as Registrations;
 use App\Http\Controllers\Orphans\RegistryController as Registry;
 use App\Http\Controllers\Orphans\ReportsController as Reports;
@@ -78,6 +79,9 @@ Route::middleware(['auth', ProtectOrphanResponses::class])->prefix('orphans')->n
         Route::delete('/{publicId}/documents/{document}', 'removeDocument')->name('documents.remove');
         Route::post('/{publicId}/discard', 'discard')->name('discard');
     });
+
+    // Read-only list for the head (DB-01); registered before reviews/{publicId} so the path is not taken as an id.
+    Route::get('/reviews/parent-links', ParentLinks::class)->name('reviews.parent-links');
 
     Route::prefix('reviews')->name('reviews.')->controller(Reviews::class)->group(function (): void {
         Route::get('/', 'index')->name('index');

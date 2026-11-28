@@ -16,7 +16,13 @@ use Illuminate\Validation\ValidationException;
  */
 final class AimsRequestEffects
 {
-    public const EFFECTS = ['finance_purchase_draft', MaintenanceAddenda::CLOSURE_EFFECT];
+    public const EFFECTS = ['finance_purchase_draft', MaintenanceAddenda::CLOSURE_EFFECT, self::PURCHASE_CLOSED_GUARD];
+
+    /** «طلب شراء» may not close another way (issued from stock, rejected) while its purchase request in Accounts is live. */
+    public const PURCHASE_CLOSED_GUARD = 'finance_purchase_closed_guard';
+
+    /** Effects that only check and write nothing, so they may also sit on an end step whose outcome is «مرفوض». */
+    public const GUARD_EFFECTS = [self::PURCHASE_CLOSED_GUARD];
 
     public function __construct(private readonly CustomFieldService $fields, private readonly FinanceGuard $guard) {}
 
@@ -24,6 +30,7 @@ final class AimsRequestEffects
     {
         match ($effect) {
             'finance_purchase_draft' => $this->financePurchaseDraft($instance, $actorId),
+            self::PURCHASE_CLOSED_GUARD => $this->assertNoLivePurchase($instance),
             // «طلب صيانة» closes only when no required addendum is open without a separation decision.
             MaintenanceAddenda::CLOSURE_EFFECT => app(MaintenanceAddenda::class)->assertClosable($instance),
             default => throw ValidationException::withMessages(['transition' => 'إجراء غير معروف في إعداد المسار.']),
@@ -50,6 +57,12 @@ final class AimsRequestEffects
             if (in_array($existing->state, ['rejected', 'cancelled'], true)) {
                 throw ValidationException::withMessages(['transition' => 'طلب الشراء المرتبط بهذا الطلب في الحسابات مرفوض أو ملغى، فلا يمكن تسليمه مرة أخرى. يُرجى تقديم طلب شراء جديد.']);
             }
+            // Only the purchase request this effect opened for the request is reused, never one that merely names it.
+            $opened = DB::table('finance_audit_events')->where('entity_type', 'purchase')->where('entity_id', (string) $existing->id)
+                ->where('action', 'create_from_request')->exists();
+            if (! $opened) {
+                throw ValidationException::withMessages(['transition' => 'طلب الشراء المرتبط بهذا الطلب في الحسابات لم يُنشأ من هذا الطلب. يُرجى مراجعة الحسابات قبل التسليم.']);
+            }
             $this->guard->audit('purchase', (int) $existing->id, $actorId, 'relinked_from_reopened_request', ['request' => $instance->reference_no, 'state' => $existing->state]);
 
             return;
@@ -70,6 +83,20 @@ final class AimsRequestEffects
             'created_by' => $actorId, 'created_at' => now(), 'updated_at' => now(),
         ]);
         $this->guard->audit('purchase', $id, $actorId, 'create_from_request', ['request' => $instance->reference_no]);
+    }
+
+    /**
+     * A «طلب شراء» reopened after procurement accepted it may end issued from stock or rejected only once Accounts or
+     * the executive director rejected or cancelled the purchase request it opened; otherwise the goods would be both
+     * issued and bought. The row is locked so a purchase decision taken at the same moment is seen.
+     */
+    private function assertNoLivePurchase(object $instance): void
+    {
+        $live = DB::table('finance_purchase_requests')->where('source_module', 'aims_request')->where('source_id', (string) $instance->subject_id)
+            ->whereNotIn('state', ['rejected', 'cancelled'])->lockForUpdate()->first(['id', 'number']);
+        if ($live !== null) {
+            throw ValidationException::withMessages(['transition' => 'لهذا الطلب طلب شراء قائم في الحسابات (رقم '.$live->number.')، فلا يُغلق بالصرف من المخزن أو بالرفض قبل رفضه أو إلغائه في الحسابات.']);
+        }
     }
 
     /**

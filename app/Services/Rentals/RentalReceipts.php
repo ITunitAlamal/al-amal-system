@@ -13,7 +13,8 @@ use Illuminate\Validation\ValidationException;
  * Collections made in the external accounting software, recorded by Accounts against rent and service dues
  * (owner decision 2026-10-23: AIMS keeps the reference, not the books). One voucher may cover several dues;
  * the same voucher cannot count twice on a due (partial unique index), a resubmitted form is recognised by its
- * request key, and an allocation is reversed, never deleted. No amount may exceed what remains on a due: an
+ * request key (bound to the form's data: the same key with another voucher or allocation is refused), and an
+ * allocation is reversed, never deleted. No amount may exceed what remains on a due: an
  * overpayment stays as the tenant's credit in the accounting software until a due or an approved settlement uses it.
  */
 final class RentalReceipts
@@ -28,8 +29,20 @@ final class RentalReceipts
     {
         $this->guard->assert($actor, 'finance.rentals.record');
 
-        return DB::transaction(function () use ($actor, $data): int {
-            if (DB::table('aims_rental_receipt_allocations')->where('request_key', $data['request_key'])->exists()) {
+        $hash = self::requestHash($data);
+
+        return DB::transaction(function () use ($actor, $data, $hash): int {
+            // One holder of a request key at a time: a concurrent resubmission waits here, then finds the first record.
+            DB::select('select pg_advisory_xact_lock(hashtext(?))', ['rental-receipt:'.$data['request_key']]);
+            if ($existing = DB::table('aims_rental_receipt_allocations')->where('request_key', $data['request_key'])->first()) {
+                // The key sits on the form's first allocation; rows from before request_hash are compared on it.
+                $same = $existing->request_hash !== null ? hash_equals($existing->request_hash, $hash)
+                    : mb_strtolower(trim((string) $existing->accounting_reference)) === mb_strtolower(trim((string) $data['reference']))
+                        && (int) $existing->due_id === (int) ($data['allocations'][0]['due_id'] ?? 0);
+                if (! $same) {
+                    throw ValidationException::withMessages(['reference' => 'هذا النموذج سُجّل من قبل ببيانات أخرى (السند أو الاستحقاقات أو المبالغ)؛ لم يُسجَّل شيء جديد. أعد تحميل الصفحة وراجع القبض المسجل.']);
+                }
+
                 return 0;
             }
             $dueIds = collect($data['allocations'])->pluck('due_id')->map(fn ($id): int => (int) $id)->sort()->values();
@@ -65,7 +78,7 @@ final class RentalReceipts
                         'due_id' => $due->id, 'accounting_reference' => $data['reference'], 'amount' => number_format($amount / 100, 2, '.', ''),
                         'currency_code' => $due->currency_code, 'accounting_posted_at' => $data['posted_on'].' 00:00:00', 'recorded_by' => $actor->id,
                         'external_system' => $system, 'payment_method_value_id' => $data['payment_method_value_id'] ?? null, 'note' => $data['note'] ?? null,
-                        'request_key' => $first ? $data['request_key'] : null, 'created_at' => now(), 'updated_at' => now(),
+                        'request_key' => $first ? $data['request_key'] : null, 'request_hash' => $first ? $hash : null, 'created_at' => now(), 'updated_at' => now(),
                     ]);
                 } catch (UniqueConstraintViolationException) {
                     throw ValidationException::withMessages(['reference' => 'السند '.$data['reference'].' مسجل مسبقًا على أحد هذه الاستحقاقات.']);
@@ -79,6 +92,26 @@ final class RentalReceipts
 
             return count($data['allocations']);
         });
+    }
+
+    /**
+     * What a request key stands for: the voucher (reference, date, total) and every due with its amount, in due order.
+     *
+     * @param  array<string, mixed>  $data
+     */
+    private static function requestHash(array $data): string
+    {
+        $money = static function (mixed $value): string {
+            try {
+                return (string) MoneyRules::toMinor(trim((string) $value));
+            } catch (\InvalidArgumentException) {
+                return trim((string) $value);
+            }
+        };
+        $rows = collect($data['allocations'] ?? [])->map(fn (array $row): array => [(int) ($row['due_id'] ?? 0), $money($row['amount'] ?? '')])->sortBy(fn (array $row): string => sprintf('%012d|%s', $row[0], $row[1]))->values()->all();
+
+        return hash('sha256', json_encode([mb_strtolower(trim((string) ($data['reference'] ?? ''))), (string) ($data['posted_on'] ?? ''), $money($data['voucher_amount'] ?? ''), $rows],
+            JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
     }
 
     /**

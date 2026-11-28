@@ -12,6 +12,7 @@ use App\Services\Finance\FinanceApprovalQueue;
 use App\Services\Hr\HrServicesDashboard;
 use App\Services\Rentals\RentalsDashboard;
 use App\Services\Workflow\ApprovalDelegations;
+use App\Support\SafeErrorMessage;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -95,7 +96,7 @@ final class RoleBoards
                     default => $this->services->employee($user),
                 } + ['updated_at' => now()->toIso8601String()];
             } catch (\Throwable $e) {
-                Log::warning('Role board failed', ['board' => $kind, 'user' => $user->id, 'error' => $e->getMessage()]);
+                Log::warning('Role board failed', ['board' => $kind, 'user' => $user->id, 'error' => SafeErrorMessage::from($e)]);
                 $boards[] = ['key' => $kind.($arg && is_string($arg) ? '-'.$arg : ''), 'title' => 'لوحة غير متاحة الآن', 'error' => 'تعذر تحميل هذه اللوحة. أعد المحاولة بعد قليل؛ بقية الصفحة تعمل.'];
             }
         }

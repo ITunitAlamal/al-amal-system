@@ -163,13 +163,12 @@ final class AttendancePermissionService
      */
     public function submit(User $requester, Employee $employee, array $input, ?UploadedFile $file): object
     {
-        $period = $this->validate($employee, $input, false, $file);
         $departmentId = (int) ($employee->department_id ?: $requester->department_id);
         if ($departmentId <= 0) {
             throw ValidationException::withMessages(['work_date' => 'يجب ربط ملف الموظف بقسم قبل تقديم طلب إذن؛ راجع الموارد البشرية.']);
         }
 
-        return $this->store($requester, $employee, $input, $period, $file, function (int $id) use ($requester, $departmentId): array {
+        return $this->store($requester, $employee, $input, fn (): array => $this->validate($employee, $input, false, $file), $file, function (int $id) use ($requester, $departmentId): array {
             $instance = app(WorkflowEngine::class)->startForSubject($requester, 'ATTENDANCE_PERMISSION', AttendancePermissionWorkflow::SUBJECT_TYPE, $id, $departmentId);
 
             return ['status' => 'submitted', 'source' => 'employee', 'workflow_instance_id' => $instance->id];
@@ -184,24 +183,29 @@ final class AttendancePermissionService
      */
     public function registerByHr(User $hr, Employee $employee, array $input, string $justification, ?UploadedFile $file): object
     {
-        $period = $this->validate($employee, $input, true, $file);
-        $row = $this->store($hr, $employee, $input, $period, $file, fn (): array => ['status' => 'approved', 'source' => 'hr', 'approved_minutes' => $period['minutes'],
-            'decided_by' => $hr->id, 'decided_at' => now(), 'decision_note' => $justification]);
+        $row = $this->store($hr, $employee, $input, fn (): array => $this->validate($employee, $input, true, $file), $file,
+            fn (int $id, array $period): array => ['status' => 'approved', 'source' => 'hr', 'approved_minutes' => $period['minutes'],
+                'decided_by' => $hr->id, 'decided_at' => now(), 'decision_note' => $justification]);
         $this->afterDecision($row, 'approved', $hr->id, $justification);
 
         return $row;
     }
 
     /**
+     * The overlap and monthly-cap checks run under the employee row lock, as leave submission does
+     * (LeaveSubmissionRules), so two requests sent at the same moment cannot both pass them.
+     *
      * @param  array<string, mixed>  $input
-     * @param  array{type: array<string, mixed>, starts_at: CarbonImmutable, ends_at: CarbonImmutable, minutes: int}  $period
-     * @param  callable(int): array<string, mixed>  $finish  columns written after the row exists (status, workflow)
+     * @param  callable(): array{type: array<string, mixed>, starts_at: CarbonImmutable, ends_at: CarbonImmutable, minutes: int}  $validate
+     * @param  callable(int, array<string, mixed>): array<string, mixed>  $finish  columns written after the row exists (status, workflow)
      */
-    private function store(User $actor, Employee $employee, array $input, array $period, ?UploadedFile $file, callable $finish): object
+    private function store(User $actor, Employee $employee, array $input, callable $validate, ?UploadedFile $file, callable $finish): object
     {
         $stored = null;
         try {
-            return DB::transaction(function () use ($actor, $employee, $input, $period, $file, $finish, &$stored): object {
+            return DB::transaction(function () use ($actor, $employee, $input, $validate, $file, $finish, &$stored): object {
+                Employee::query()->whereKey($employee->id)->lockForUpdate()->first();
+                $period = $validate();
                 $id = DB::table('attendance_permission_requests')->insertGetId([
                     'employee_id' => $employee->id, 'requested_by' => $actor->id, 'type_value_id' => $period['type']['id'], 'work_date' => $input['work_date'],
                     'starts_at' => $period['starts_at']->format('Y-m-d H:i:sP'), 'ends_at' => $period['ends_at']->format('Y-m-d H:i:sP'),
@@ -213,7 +217,7 @@ final class AttendancePermissionService
                     DB::table('attendance_permission_requests')->where('id', $id)->update(['attachment_path' => $stored,
                         'attachment_name' => mb_substr($file->getClientOriginalName(), 0, 255), 'attachment_mime' => $file->getMimeType(), 'attachment_size' => $file->getSize()]);
                 }
-                $columns = $finish($id);
+                $columns = $finish($id, $period);
                 DB::table('attendance_permission_requests')->where('id', $id)->update($columns + ['updated_at' => now()]);
                 AttendanceAudit::record($actor->id, 'permission', $id, $columns['status'] === 'approved' ? 'registered_by_hr' : 'submitted', [
                     'employee_id' => $employee->id, 'type' => $period['type']['code'], 'work_date' => $input['work_date'], 'minutes' => $period['minutes'],

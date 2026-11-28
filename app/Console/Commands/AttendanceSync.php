@@ -6,6 +6,7 @@ use App\Services\Attendance\AttendanceDailyService;
 use App\Services\Attendance\AttendanceDeviceBackoff;
 use App\Services\Attendance\AttendanceDeviceReader;
 use App\Services\Attendance\AttendanceRawImporter;
+use App\Support\SafeErrorMessage;
 use Carbon\CarbonImmutable;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
@@ -165,7 +166,7 @@ final class AttendanceSync extends Command
             try {
                 $daily->recalculate((int) $employeeId, $date);
             } catch (Throwable $exception) {
-                Log::warning('Attendance day recalculation after import failed', ['employee_id' => (int) $employeeId, 'date' => $date, 'reason' => $exception->getMessage()]);
+                Log::warning('Attendance day recalculation after import failed', ['employee_id' => (int) $employeeId, 'date' => $date, 'reason' => SafeErrorMessage::from($exception)]);
             }
         }
 

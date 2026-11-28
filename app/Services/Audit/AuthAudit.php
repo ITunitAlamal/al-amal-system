@@ -20,12 +20,13 @@ final class AuthAudit
         return substr(hash_hmac('sha256', mb_strtolower(trim($login)), (string) config('app.key')), 0, 16);
     }
 
-    public function staffLoginFailed(Request $request, string $employeeNumber): void
+    /** @param  string  $channel  'web' (the staff sign-in page) or 'field' (the field client's sign-in, same credentials) */
+    public function staffLoginFailed(Request $request, string $employeeNumber, string $channel = 'web'): void
     {
         $userId = DB::table('users')->where('employee_number', trim($employeeNumber))->value('id');
         $this->audit->event('auth.login_failed', ['actor_id' => null, 'subject_type' => $userId ? 'users' : null, 'subject_id' => $userId,
             'outcome' => 'failure', 'reason_code' => $userId ? 'bad_credentials_or_inactive' : 'unknown_account',
-            'metadata' => ['login_fingerprint' => self::fingerprint($employeeNumber)], 'ip' => $request->ip()]);
+            'metadata' => array_filter(['login_fingerprint' => self::fingerprint($employeeNumber), 'channel' => $channel === 'web' ? null : $channel]), 'ip' => $request->ip()]);
     }
 
     public function staffPasswordChanged(Request $request, int $userId, string $how): void

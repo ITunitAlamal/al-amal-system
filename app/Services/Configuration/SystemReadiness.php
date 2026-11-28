@@ -55,6 +55,8 @@ final class SystemReadiness
                 'admin.audit-logs.index', 'سجل النظام'),
             $this->check('audit_seal', 'آخر تحقق من سلسلة ختم «سجل النظام» سليم', $this->auditSealProblems(),
                 'admin.audit-logs.index', 'سجل النظام'),
+            $this->check('import_batches', 'لا توجد دفعة استيراد متوقفة بخطأ', $this->stoppedImports(),
+                'orphans.import.index', 'الاستيراد الذكي'),
             $this->check('security_settings', 'إعدادات أمان الاتصال مكتملة (HTTPS وعناوين البوابة)', $this->securitySettingGaps(),
                 null, null),
         ];
@@ -353,6 +355,21 @@ final class SystemReadiness
         }
 
         return ['سُجل انقطاع في سلسلة الختم بتاريخ '.substr((string) $broken, 0, 16).' ولم يتبعه تحقق سليم؛ راجع «سجل النظام».'];
+    }
+
+    /**
+     * Smart-import batches stopped by an error: a failed analysis, or an approved execution that keeps failing (it
+     * stays «executing» with its error while orphans:import-process backs off, OB-02). References only, no error text.
+     *
+     * @return list<string>
+     */
+    private function stoppedImports(): array
+    {
+        return DB::table('import_batches')
+            ->where(fn ($q) => $q->where('status', 'failed')->orWhere(fn ($e) => $e->where('status', 'executing')->whereNotNull('error')))
+            ->orderBy('id')->get(['reference_no', 'status', 'updated_at'])
+            ->map(fn (object $b): string => $b->reference_no.' — '.($b->status === 'executing' ? 'توقف الإدراج في السجل' : 'فشل الفحص').' (آخر محاولة '.substr((string) $b->updated_at, 0, 16).')')
+            ->all();
     }
 
     /**

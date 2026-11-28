@@ -10,6 +10,7 @@ use App\Services\Orphans\Field\FieldSync;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /** JSON API of the Windows field client (prefix /api/field/v1). Contract unchanged from field_client format 1. */
 final class FieldApiController extends Controller
@@ -61,7 +62,14 @@ final class FieldApiController extends Controller
             'events.*.signature_image' => 'nullable|string|max:700000']);
         $acks = [];
         foreach ($data['events'] as $event) {
-            $acks[] = $sync->receive($user, $device, $event);
+            try {
+                $acks[] = $sync->receive($user, $device, $event);
+            } catch (Throwable $e) {
+                // An unexpected failure on one event never fails the others. Without an event_uuid the client keeps
+                // this event and sends it again with the next sync.
+                report($e);
+                $acks[] = ['event_uuid' => null, 'status' => 'retry', 'reason' => 'تعذر حفظ الحدث مؤقتًا؛ يُعاد إرساله في المزامنة التالية.'];
+            }
         }
 
         return response()->json(['acks' => $acks, 'server_time' => now()->utc()->toIso8601ZuluString()]);

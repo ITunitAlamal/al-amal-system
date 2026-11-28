@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Services\AuditService;
+use App\Services\Workflow\AimsRequestEffects;
 use App\Services\Workflow\ApprovalDelegations;
 use App\Services\Workflow\AssigneeResolver;
 use App\Services\Workflow\ConditionEvaluator;
@@ -25,6 +26,9 @@ use Inertia\Response;
 class WorkflowDesignerController extends Controller
 {
     private const STEP_TYPES = ['start' => 'بداية', 'task' => 'مهمة', 'decision' => 'قرار', 'end' => 'نهاية'];
+
+    /** assignment_config keys installed by migrations that the step form does not manage (WF-01). */
+    private const INSTALLED_KEYS = ['effect', 'reopen_locked', 'subject_status', 'supervisor_department_id', 'assignable', 'field_work'];
 
     public function __construct(
         private readonly WorkflowPublishingService $publishing,
@@ -168,8 +172,12 @@ class WorkflowDesignerController extends Controller
 
         DB::transaction(function () use ($request, $version, $step, $data): void {
             $this->lockDraft($version);
-            $before = DB::table('workflow_steps')->where('id', $step)->where('workflow_version_id', $version)->first();
+            $before = DB::table('workflow_steps')->where('id', $step)->where('workflow_version_id', $version)->lockForUpdate()->first();
             abort_unless($before, 404);
+            // Keys installed by migrations and not shown on the form survive any save of the step unless it sends them.
+            $stored = json_decode((string) $before->assignment_config, true);
+            $kept = array_intersect_key(is_array($stored) ? $stored : [], array_flip(self::INSTALLED_KEYS));
+            $data['assignment_config'] = [...$kept, ...array_filter($data['assignment_config'] ?? [], fn ($value): bool => $value !== null && $value !== '')];
             DB::table('workflow_steps')->where('id', $step)->update([...$this->stepRow($data), 'updated_at' => now()]);
             $this->audit->recordRow('workflow.step.updated', 'workflow_steps', $step, (array) $before, $data, $request->user()->id, $request->ip());
         });
@@ -183,8 +191,14 @@ class WorkflowDesignerController extends Controller
 
         DB::transaction(function () use ($request, $version, $step): void {
             $this->lockDraft($version);
-            $before = DB::table('workflow_steps')->where('id', $step)->where('workflow_version_id', $version)->first();
+            $before = DB::table('workflow_steps')->where('id', $step)->where('workflow_version_id', $version)->lockForUpdate()->first();
             abort_unless($before, 404);
+            // A stage carrying a migration-installed effect or reopen lock cannot be rebuilt from the form, so deleting
+            // it would leave a draft that can never be published (droppedInstalledKeys) and block every later change.
+            $config = json_decode((string) $before->assignment_config, true);
+            if (is_array($config) && (! empty($config['effect']) || ! empty($config['reopen_locked']))) {
+                throw ValidationException::withMessages(['step' => 'هذه المرحلة مثبتة بترحيل (أثر تلقائي أو قفل إعادة فتح) ولا تُحذف من المسودة. عدّل اسمها أو إجراءاتها بدلًا من حذفها.']);
+            }
             DB::table('workflow_transitions')->where('workflow_version_id', $version)
                 ->where(fn ($query) => $query->where('from_step_id', $step)->orWhere('to_step_id', $step))->delete();
             DB::table('workflow_steps')->where('id', $step)->delete();
@@ -305,6 +319,8 @@ class WorkflowDesignerController extends Controller
             'assignment_config.delegation_scope' => ['nullable', Rule::in(array_keys(ApprovalDelegations::SCOPES))],
             // A stage that records a stock issue or a payment; a reopened request never returns before it (WorkflowEngine::reopenTargets).
             'assignment_config.reopen_locked' => ['nullable', 'boolean'],
+            // A step effect (open the purchase in Accounts, a closure guard) is installed by a migration.
+            'assignment_config.effect' => ['nullable', Rule::in(AimsRequestEffects::EFFECTS)],
             'sla_hours' => ['nullable', 'integer', 'min:1', 'max:8760'],
         ];
     }
